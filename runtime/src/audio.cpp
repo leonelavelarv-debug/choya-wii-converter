@@ -28,27 +28,91 @@ size_t dsp_decode(const uint8_t* src, size_t src_bytes, size_t samples, DspState
     return n;
 }
 
-bool PcmStream::open(const Pack& pack, const PackEntry& e) {
-    if (e.kind != uint8_t(Kind::Audio) || e.format != 1 || e.count == 0) return false;
-    pcm_ = reinterpret_cast<const int16_t*>(pack.data(e));
+bool AudioStream::open(const Pack& pack, const PackEntry& e) {
+    if (e.kind != uint8_t(Kind::Audio) || e.count == 0 || e.count > MAX_CH) return false;
+    format_ = e.format;
     channels_ = e.count;
     frames_ = e.extra2;
     rate_ = e.extra0;
     loops_ = (e.flags & AUDIOFLAG_LOOP) != 0 && e.extra1 < frames_;
     loop_start_ = loops_ ? e.extra1 : 0;
-    pos_ = 0;
-    return frames_ * size_t(channels_) * 2 <= e.data_size;
+    const uint8_t* p = pack.data(e);
+    if (format_ == AUDIO_PCM16) {
+        pcm_ = reinterpret_cast<const int16_t*>(p);
+        pos_ = 0;
+        return frames_ * size_t(channels_) * 2 <= e.data_size;
+    }
+    if (format_ != AUDIO_DSPADPCM) return false;
+    // Por canal: int16 coefs[16]; int16 hist1, hist2, loop_hist1, loop_hist2; u8 loop_ps; pad[3]; u32 bytes; datos.
+    size_t off = 0;
+    for (int c = 0; c < channels_; ++c) {
+        if (off + 48 > e.data_size) return false;
+        const uint8_t* h = p + off;
+        AdpcmCh& ch = ch_[c];
+        std::memcpy(ch.st.coefs, h, 32);
+        std::memcpy(&ch.start_h1, h + 32, 2);
+        std::memcpy(&ch.start_h2, h + 34, 2);
+        std::memcpy(&ch.loop_h1, h + 36, 2);
+        std::memcpy(&ch.loop_h2, h + 38, 2);
+        uint32_t bytes = 0;
+        std::memcpy(&bytes, h + 44, 4);
+        ch.data = h + 48;
+        ch.bytes = bytes;
+        off += 48 + bytes;
+        off = (off + 15) & ~size_t(15);
+        if (off > e.data_size + 15) return false;
+    }
+    rewind();
+    return true;
 }
 
-size_t PcmStream::read(int16_t* out, size_t frames, int out_channels) {
+void AudioStream::rewind() { seek(0, false); }
+
+void AudioStream::seek(size_t sample, bool loop) {
+    pos_ = sample;
+    buf_frame_ = SIZE_MAX;
+    if (format_ != AUDIO_DSPADPCM) return;
+    for (int c = 0; c < channels_; ++c) {
+        // El historial guardado corresponde al inicio del archivo o al punto de bucle.
+        ch_[c].st.hist1 = loop ? ch_[c].loop_h1 : ch_[c].start_h1;
+        ch_[c].st.hist2 = loop ? ch_[c].loop_h2 : ch_[c].start_h2;
+    }
+    // Si el bucle no cae al inicio de una trama, se decodifica desde su trama (aproximación habitual).
+}
+
+bool AudioStream::decode_frame() {
+    const size_t frame = pos_ / 14;
+    if (frame == buf_frame_) return true;
+    for (int c = 0; c < channels_; ++c) {
+        AdpcmCh& ch = ch_[c];
+        const size_t byte = frame * 8;
+        if (byte + 8 > ch.bytes) return false;
+        int16_t tmp[14] = {};
+        dsp_decode(ch.data + byte, 8, 14, ch.st, tmp);
+        for (int i = 0; i < 14; ++i) buf_[i * channels_ + c] = tmp[i];
+    }
+    buf_frame_ = frame;
+    return true;
+}
+
+size_t AudioStream::read(int16_t* out, size_t frames, int out_channels) {
     size_t written = 0;
     while (written < frames) {
         if (pos_ >= frames_) {
             if (!loops_) break;
-            pos_ = loop_start_;
+            seek(loop_start_, true);
         }
-        const size_t n = std::min(frames - written, frames_ - pos_);
-        const int16_t* src = pcm_ + pos_ * size_t(channels_);
+        const int16_t* src;
+        size_t n;
+        if (format_ == AUDIO_PCM16) {
+            n = std::min(frames - written, frames_ - pos_);
+            src = pcm_ + pos_ * size_t(channels_);
+        } else {
+            if (!decode_frame()) break;
+            const size_t in_frame = pos_ % 14;
+            n = std::min({frames - written, frames_ - pos_, size_t(14) - in_frame});
+            src = buf_ + in_frame * size_t(channels_);
+        }
         int16_t* dst = out + written * size_t(out_channels);
         for (size_t i = 0; i < n; ++i) {
             if (channels_ == out_channels) {

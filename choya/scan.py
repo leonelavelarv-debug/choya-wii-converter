@@ -39,6 +39,37 @@ def find_files_root(path: str) -> str:
     return path
 
 
+OGWS_SHA1 = "8bb422971b88b5551a37de98db69557df7b46637"   # Wii Sports US Rev 1 (doldecomp/ogws)
+
+
+def _sys_dir(path: str) -> str | None:
+    for cand in (os.path.join(path, "sys"), os.path.join(path, "DATA", "sys"), os.path.join(path, "..", "sys")):
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
+def disc_info(path: str) -> dict:
+    """ID, revisión y SHA-1 de main.dol; dice si coincide con la versión que soporta ogws."""
+    import hashlib
+    info = {"game_id": None, "revision": None, "dol_sha1": None, "ogws_match": False}
+    sysd = _sys_dir(path)
+    if not sysd:
+        return info
+    boot = os.path.join(sysd, "boot.bin")
+    if os.path.isfile(boot):
+        with open(boot, "rb") as f:
+            b = f.read(8)
+        info["game_id"] = b[:6].decode("ascii", errors="replace")
+        info["revision"] = b[7] if len(b) > 7 else None
+    dol = os.path.join(sysd, "main.dol")
+    if os.path.isfile(dol):
+        with open(dol, "rb") as f:
+            info["dol_sha1"] = hashlib.sha1(f.read()).hexdigest()
+        info["ogws_match"] = info["dol_sha1"] == OGWS_SHA1
+    return info
+
+
 def game_id(path: str) -> str | None:
     """Lee el ID del juego (p. ej. RSPE01) desde sys/boot.bin si existe."""
     for cand in (os.path.join(path, "sys", "boot.bin"), os.path.join(path, "DATA", "sys", "boot.bin")):

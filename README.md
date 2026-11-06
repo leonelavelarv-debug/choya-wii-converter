@@ -42,7 +42,7 @@ python -m choya convert C:\wii\RSPE01 C:\wii\salida --preview
 
 | Perfil | Texturas 3D | Interfaz | Formatos | Audio |
 | --- | --- | --- | --- | --- |
-| `rg35xxh` (predeterminado) | 256 px | 512 px | ETC2 / EAC | 32 kHz, efectos en mono |
+| `rg35xxh` (predeterminado) | 256 px | 512 px | ETC2 / EAC | música en DSP-ADPCM original, efectos cortos a PCM mono de 32 kHz |
 | `ligero` | 128 px | 256 px | ETC2 / EAC | 22 kHz |
 | `calidad` | 512 px | 1024 px | ETC2 / EAC | 32 kHz estéreo |
 | `gles2` | 256 px | 512 px | RGB565 / RGBA4444 / RGBA5551 / LA8 | 32 kHz |
@@ -55,6 +55,8 @@ python -m choya convert C:\wii\RSPE01 C:\wii\salida --preview
 | las mismas | con alfa | ETC2_RGBA8_EAC | 8 |
 | I4, I8 | intensidad en RGBA | R11_EAC + swizzle RRRR | 4 |
 | IA4, IA8 | intensidad + alfa | RG11_EAC + swizzle RRRG | 8 |
+
+**Respaldo por calidad.** Después de comprimir, mide la calidad (PSNR). Si queda por debajo de 28 dB en 3D o de 32 dB en menús, usa RGB565 o RGBA8 sin pérdida de bloques. Las texturas de 16×16 px o menos (tablas de color, puntos de UI) siempre quedan en RGBA8, porque comprimirlas no ahorra casi nada. El reporte lista cada caso en "Sin compresión por calidad".
 
 Las texturas de interfaz (rutas con `timg/`, `lyt`, `layout`, `menu`) se reducen menos, porque la pantalla es de 640×480 igual que la Wii. Los mips se regeneran desde la imagen reducida, y el alfa se reduce premultiplicado para evitar halos.
 
@@ -100,7 +102,7 @@ else
 
 La clave es `crc32(nivel 0 GX) | ancho | alto | formato`, igual en Python (`pack.texture_key`) y en C++ (`wl::texture_key`). Si el juego reutiliza la misma dirección para otra textura, la caché lo detecta y vuelve a buscar.
 
-Para audio: `pack.find_audio("Sound/strm/bgm.brstm")` devuelve el PCM ya convertido, y `wl::dsp_decode` decodifica DSP-ADPCM para lo que siga en BRSAR.
+Para audio: `pack.find_audio("Sound/strm/bgm.brstm")` y `wl::AudioStream` dan PCM16 listo para SDL. La música se guarda en su DSP-ADPCM original (3.5 veces más chica que PCM16) y se decodifica al vuelo, con bucle. `wl::dsp_decode` sirve también para lo que siga en BRSAR.
 
 ## Formato `.wlpk`
 
@@ -112,7 +114,7 @@ Little-endian, alineado a 16 bytes: cabecera de 64 bytes, tabla de entradas de 4
 python -m unittest discover tests
 ```
 
-19 pruebas con datos sintéticos: Yaz0/LZ77, U8, BRRES, TPL, los 11 formatos GX, ETC2/EAC (calidad y que nunca desborde el modo diferencial), DSP-ADPCM, BRSTM con bloques entrelazados, conversión de punta a punta, y una prueba cruzada donde el runtime C++ lee el paquete de Python (claves, caché y audio idénticos).
+24 pruebas con datos sintéticos: Yaz0/LZ77, U8, BRRES, TPL, los 11 formatos GX, ETC2/EAC (calidad y que nunca desborde el modo diferencial), DSP-ADPCM, BRSTM con bloques entrelazados, respaldo por calidad, audio ADPCM con bucle decodificado en C++, conversión de punta a punta, y una prueba cruzada donde el runtime C++ lee el paquete de Python (claves, caché y audio idénticos).
 
 ## Pendiente
 

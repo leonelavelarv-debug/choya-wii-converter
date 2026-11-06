@@ -15,6 +15,10 @@ class Profile:
     audio_rate: int
     audio_mono_sfx: bool        # convertir a mono los sonidos cortos (no la música)
     music_min_seconds: float    # duración a partir de la cual un audio se trata como música
+    min_psnr_3d: float = 28.0   # por debajo, la textura 3D usa un formato sin pérdida de bloques
+    min_psnr_ui: float = 32.0   # umbral más exigente para menús y texto
+    small_lossless: int = 256   # texturas de hasta 16x16 px (área) quedan en RGBA8 sin comprimir
+    keep_adpcm: bool = True     # guarda la música DSP-ADPCM tal cual (3.5 veces más chica que PCM16)
 
     def to_dict(self):
         return asdict(self)

@@ -54,6 +54,36 @@ class TestRuntime(unittest.TestCase):
                 py = audio.read_dsp(fh.read()).samples[:, 0]
             self.assertTrue(np.array_equal(cpp, py))
             self.assertTrue(np.array_equal(cpp, sim))
+            # El .dsp mono se guardó como DSP-ADPCM y el runtime lo decodifica igual que Python.
+            r = subprocess.run([os.path.join(BUILD, "wl_info"), "--pcm", pack, "Sound/golpe.dsp", pcm_path],
+                               capture_output=True, text=True)
+            self.assertIn("formato 2", r.stdout)
+            self.assertTrue(np.array_equal(np.fromfile(pcm_path, "<i2"), sim))
+
+    def test_adpcm_stereo_loop(self):
+        import dataclasses
+        with tempfile.TemporaryDirectory() as tmp:
+            files = os.path.join(tmp, "disc", "files", "Sound")
+            os.makedirs(files)
+            t = np.arange(560)
+            l = (np.sin(t / 7) * 9000).astype(np.int16)
+            r = (np.cos(t / 11) * 9000).astype(np.int16)
+            blob, sims = fx.build_brstm([l, r], 32000, block_size=0x40, loop=True)
+            with open(os.path.join(files, "bgm.brstm"), "wb") as f:
+                f.write(blob)
+            prof = dataclasses.replace(profiles.get("rg35xxh"), music_min_seconds=0.001)
+            out = os.path.join(tmp, "out")
+            rep = engine.run(os.path.join(tmp, "disc"), out, prof, jobs=1, log=lambda *_: None)
+            self.assertEqual(rep["summary"]["audio_adpcm"], 1)
+            pcm_path = os.path.join(tmp, "pcm.raw")
+            res = subprocess.run([os.path.join(BUILD, "wl_info"), "--pcm", os.path.join(out, "assets.wlpk"),
+                                  "sound/BGM.brstm", pcm_path, "100"], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            got = np.fromfile(pcm_path, "<i2").reshape(-1, 2)
+            want = np.stack(sims, 1)
+            self.assertEqual(got.shape[0], 660)            # 560 + 100 tras volver al inicio del bucle
+            self.assertTrue(np.array_equal(got[:560], want))
+            self.assertTrue(np.array_equal(got[560:], want[:100]))
 
 
 if __name__ == "__main__":

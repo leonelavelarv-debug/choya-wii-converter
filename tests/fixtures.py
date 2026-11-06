@@ -210,7 +210,7 @@ def build_dsp(pcm: np.ndarray, rate: int) -> tuple[bytes, np.ndarray]:
     return hdr + data, sim
 
 
-def build_brstm(channels: list[np.ndarray], rate: int, block_size: int = 0x2000) -> tuple[bytes, list[np.ndarray]]:
+def build_brstm(channels: list[np.ndarray], rate: int, block_size: int = 0x2000, loop: bool = False) -> tuple[bytes, list[np.ndarray]]:
     """BRSTM DSP-ADPCM con varios canales y bloques entrelazados."""
     enc = [dsp_encode(c) for c in channels]
     total = len(channels[0])
@@ -226,7 +226,7 @@ def build_brstm(channels: list[np.ndarray], rate: int, block_size: int = 0x2000)
     refs_pos = len(head)
     head += b"\x00" * 24
     si = len(head) - base
-    head += struct.pack(">BBBBHHIIIIIIIIIII", 2, 0, nch, 0, rate, 0, 0, total, 0, blocks, block_size,
+    head += struct.pack(">BBBBHHIIIIIIIIIII", 2, int(loop), nch, 0, rate, 0, 0, total, 0, blocks, block_size,
                         block_size // 8 * 14, last, last // 8 * 14, last_pad, 0, 0)
     ti = len(head) - base
     head += struct.pack(">BBH", 1, 0, 0) + b"\x00" * 8

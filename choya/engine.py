@@ -7,11 +7,10 @@ import time
 import zlib
 from concurrent.futures import ProcessPoolExecutor
 
-import numpy as np
 from PIL import Image
 
-from . import __version__, audio as au, etc, optimize as opt, pack, scan as sc
-from .gxtex import FORMAT_NAMES, INTENSITY_FORMATS, GXTexture, I4, I8, level_size
+from . import __version__, audio as au, optimize as opt, pack, scan as sc
+from .gxtex import FORMAT_NAMES, GXTexture, level_size
 from .profiles import Profile
 
 
@@ -28,43 +27,18 @@ def _convert_audio(args):
     try:
         dec = au.read_brstm(item.data) if item.kind == "brstm" else au.read_dsp(item.data)
         before = dec.samples.shape[0] * dec.samples.shape[1] * 2
+        if profile.keep_adpcm and au.can_keep_adpcm(dec, profile.audio_mono_sfx, profile.music_min_seconds):
+            return item, dec, None, before, None
         res = au.optimize(dec, profile.audio_rate, profile.audio_mono_sfx, profile.music_min_seconds)
         return item, dec, res, before, None
     except Exception as e:  # noqa: BLE001
         return item, None, None, 0, f"{item.path}: {type(e).__name__}: {e}"
 
 
-def preview_png(conv: opt.ConvertedTexture) -> Image.Image | None:
-    """Decodifica el nivel 0 convertido para revisarlo en la PC."""
-    w, h, d = conv.width, conv.height, conv.data[:opt.out_level_size(conv.fmt, conv.width, conv.height)]
-    f = conv.fmt
-    if f == opt.OUT_ETC2_RGB8:
-        return Image.fromarray(etc.decode_etc2_rgb(d, w, h), "RGB")
-    if f == opt.OUT_ETC2_RGBA8:
-        return Image.fromarray(etc.decode_etc2_rgba(d, w, h), "RGBA")
-    if f == opt.OUT_R11_EAC:
-        return Image.fromarray(etc.decode_eac(d, w, h), "L")
-    if f == opt.OUT_RG11_EAC:
-        i = etc.decode_eac(d, w, h, 2, 0)
-        a = etc.decode_eac(d, w, h, 2, 1)
-        return Image.fromarray(np.stack([i, a], -1), "LA")
-    if f == opt.OUT_L8:
-        return Image.frombytes("L", (w, h), d)
-    if f == opt.OUT_LA8:
-        return Image.frombytes("LA", (w, h), d)
-    if f == opt.OUT_RGBA8:
-        return Image.frombytes("RGBA", (w, h), d)
-    v = np.frombuffer(d, "<u2").reshape(h, w).astype(np.uint32)
-    if f == opt.OUT_RGB565:
-        rgb = np.stack([(v >> 11) << 3, ((v >> 5) & 63) << 2, (v & 31) << 3], -1)
-        return Image.fromarray(rgb.astype(np.uint8), "RGB")
-    if f == opt.OUT_RGBA4444:
-        rgba = np.stack([(v >> 12) * 17, ((v >> 8) & 15) * 17, ((v >> 4) & 15) * 17, (v & 15) * 17], -1)
-        return Image.fromarray(rgba.astype(np.uint8), "RGBA")
-    if f == opt.OUT_RGBA5551:
-        rgba = np.stack([(v >> 11) << 3, ((v >> 6) & 31) << 3, ((v >> 1) & 31) << 3, (v & 1) * 255], -1)
-        return Image.fromarray(rgba.astype(np.uint8), "RGBA")
-    return None
+def preview_png(conv: opt.ConvertedTexture) -> Image.Image:
+    """El nivel 0 tal como lo verá la GPU, para revisarlo en la PC."""
+    d = conv.data[:opt.out_level_size(conv.fmt, conv.width, conv.height)]
+    return Image.fromarray(opt.decode_out(conv.fmt, d, conv.width, conv.height), "RGBA")
 
 
 def _safe(name: str) -> str:
@@ -75,7 +49,8 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
         measure: bool = True, log=print) -> dict:
     t0 = time.time()
     os.makedirs(out_dir, exist_ok=True)
-    gid = sc.game_id(src)
+    disc = sc.disc_info(src)
+    gid = disc["game_id"]
     log(f"Escaneando {src} ...")
     res = sc.scan(src)
     log(f"  {res.files} archivos, {len(res.textures)} texturas, {len(res.audio)} audios")
@@ -113,9 +88,7 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
             continue
         lvl0 = tex.data[:level_size(tex.fmt, tex.width, tex.height)]
         key = pack.texture_key(lvl0, tex.width, tex.height, tex.fmt)
-        flags = 0
-        if tex.fmt in INTENSITY_FORMATS:
-            flags = pack.TEXFLAG_SWIZZLE_I if tex.fmt in (I4, I8) else pack.TEXFLAG_SWIZZLE_IA
+        flags = {opt.OUT_R11_EAC: pack.TEXFLAG_SWIZZLE_I, opt.OUT_RG11_EAC: pack.TEXFLAG_SWIZZLE_IA}.get(conv.fmt, 0)
         writer.add(pack.Entry(kind=pack.KIND_TEXTURE, fmt=conv.fmt, count=conv.mips, flags=flags, key=key,
                               name=tex.name, data=conv.data, width=conv.width, height=conv.height,
                               extra0=tex.fmt, extra1=zlib.crc32(lvl0) & 0xFFFFFFFF, extra2=len(lvl0)))
@@ -124,11 +97,9 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
             out=f"{opt.OUT_NAMES[conv.fmt]} {conv.width}x{conv.height} m{conv.mips}",
             gx_bytes=len(tex.data), naive_vram=opt.gx_vram_bytes(tex), out_bytes=len(conv.data),
             alpha=conv.alpha, psnr=None if conv.psnr is None or conv.psnr == float("inf") else round(conv.psnr, 2),
-            uses=refs.get(key, 1), notes=tex.notes))
+            uses=refs.get(key, 1), notes=tex.notes, fallback=conv.fallback))
         if preview:
-            img = preview_png(conv)
-            if img is not None:
-                img.save(os.path.join(prev_dir, "texturas", f"{_safe(tex.name)}.png"))
+            preview_png(conv).save(os.path.join(prev_dir, "texturas", f"{_safe(tex.name)}.png"))
         if done % 50 == 0:
             log(f"    {done}/{len(work)} texturas")
 
@@ -137,20 +108,25 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
         if err:
             errors.append(err)
             continue
-        pcm = conv.samples.astype("<i2").tobytes()
-        loop = 0xFFFFFFFF if conv.loop_start is None else conv.loop_start
-        writer.add(pack.Entry(kind=pack.KIND_AUDIO, fmt=pack.AUDIO_PCM16, count=conv.samples.shape[1],
-                              flags=pack.AUDIOFLAG_LOOP if conv.loop_start is not None else 0,
-                              key=pack.path_key(item.path), name=item.path, data=pcm,
-                              extra0=conv.rate, extra1=loop, extra2=conv.samples.shape[0]))
+        if conv is None:   # DSP-ADPCM tal cual: el runtime lo decodifica al vuelo
+            payload = au.adpcm_payload(dec)
+            n, ch, rate, loop_start, fmt, kind = (dec.samples.shape[0], dec.samples.shape[1], dec.rate,
+                                                  dec.loop_start, pack.AUDIO_DSPADPCM, "DSP-ADPCM")
+        else:
+            payload = conv.samples.astype("<i2").tobytes()
+            n, ch, rate, loop_start, fmt, kind = (conv.samples.shape[0], conv.samples.shape[1], conv.rate,
+                                                  conv.loop_start, pack.AUDIO_PCM16, "PCM16")
+        writer.add(pack.Entry(kind=pack.KIND_AUDIO, fmt=fmt, count=ch,
+                              flags=pack.AUDIOFLAG_LOOP if loop_start is not None else 0,
+                              key=pack.path_key(item.path), name=item.path, data=payload,
+                              extra0=rate, extra1=0xFFFFFFFF if loop_start is None else loop_start, extra2=n))
         audio_report.append(dict(
             path=item.path, src=f"{dec.codec} {dec.rate} Hz {dec.samples.shape[1]} can.",
-            out=f"PCM16 {conv.rate} Hz {conv.samples.shape[1]} can.",
-            seconds=round(dec.samples.shape[0] / dec.rate, 1), disc_bytes=len(item.data),
-            pcm_before=before, out_bytes=len(pcm)))
+            out=f"{kind} {rate} Hz {ch} can.", seconds=round(dec.samples.shape[0] / dec.rate, 1),
+            disc_bytes=len(item.data), pcm_before=before, out_bytes=len(payload)))
         if preview:
             with open(os.path.join(prev_dir, "audio", _safe(item.path) + ".wav"), "wb") as f:
-                f.write(au.wav_bytes(conv))
+                f.write(au.wav_bytes(conv or dec))
 
     tex_report.sort(key=lambda r: -r["naive_vram"])
     summary = dict(
@@ -162,13 +138,16 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
         audio_pcm_before=sum(r["pcm_before"] for r in audio_report),
         audio_out=sum(r["out_bytes"] for r in audio_report),
         formats={},
+        fallbacks=[r for r in tex_report if r["fallback"]],
+        audio_adpcm=sum(1 for r in audio_report if r["out"].startswith("DSP")),
         worst_psnr=sorted((r for r in tex_report if r["psnr"] is not None), key=lambda r: r["psnr"])[:10],
     )
     for r in tex_report:
         f = r["out"].split()[0]
         summary["formats"][f] = summary["formats"].get(f, 0) + 1
 
-    manifest = dict(tool="choya-wii-converter", version=__version__, game_id=gid, profile=profile.to_dict(),
+    manifest = dict(tool="choya-wii-converter", version=__version__, game_id=gid, revision=disc["revision"],
+                    dol_sha1=disc["dol_sha1"], profile=profile.to_dict(),
                     textures=summary["textures"], audio=summary["audio"])
     pack_path = os.path.join(out_dir, "assets.wlpk")
     size = writer.write(pack_path, manifest)
@@ -183,6 +162,19 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
     return report
 
 
+def _version_line(m: dict) -> str:
+    from .scan import OGWS_SHA1
+    rev = m.get("revision")
+    sha = m.get("dol_sha1")
+    head = f"Disco **{m.get('game_id') or '?'}**, revisión **{rev if rev is not None else '?'}**"
+    if not sha:
+        return head + ". No se encontró sys/main.dol, así que no se pudo comparar con ogws."
+    if sha == OGWS_SHA1:
+        return head + f". main.dol SHA-1 `{sha}`: **coincide con ogws** (Wii Sports US Rev 1)."
+    return (head + f". main.dol SHA-1 `{sha}`: **no coincide con ogws**, que necesita "
+            f"`{OGWS_SHA1}` (Wii Sports US Rev 1).")
+
+
 def _mb(n: int) -> str:
     return f"{n / 1048576:.2f} MiB"
 
@@ -193,14 +185,17 @@ def render_markdown(r: dict) -> str:
     lines = [
         f"# Reporte de Choya Wii Converter — {m.get('game_id') or 'juego sin ID'}",
         "",
-        f"Perfil **{m['profile']['name']}**: {m['profile']['description']}",
+        f"Choya Wii Converter {m.get('version')}. Perfil **{m['profile']['name']}**: {m['profile']['description']}",
+        "",
+        _version_line(m),
         "",
         "| Medida | Antes | Después |",
         "| --- | --- | --- |",
         f"| Texturas únicas | {s['textures']} ({s['texture_refs']} referencias) | {s['textures']} |",
         f"| Memoria de GPU (RGBA8 sin convertir vs. paquete) | {_mb(s['naive_vram'])} | {_mb(s['out_bytes'])} |",
         f"| Datos GX en el disco | {_mb(s['gx_bytes'])} | — |",
-        f"| Audio PCM decodificado | {_mb(s['audio_pcm_before'])} | {_mb(s['audio_out'])} |",
+        f"| Audio (PCM decodificado vs. paquete) | {_mb(s['audio_pcm_before'])} | {_mb(s['audio_out'])} "
+        f"({s['audio_adpcm']} de {s['audio']} en DSP-ADPCM) |",
         f"| Paquete .wlpk | — | {_mb(r['pack_bytes'])} |",
         "",
     ]
@@ -213,6 +208,12 @@ def render_markdown(r: dict) -> str:
         lines += ["", "## Texturas con menor calidad (PSNR)", "", "| Textura | Origen | Salida | PSNR dB |",
                   "| --- | --- | --- | --- |"]
         lines += [f"| {t['name']} | {t['src']} | {t['out']} | {t['psnr']} |" for t in s["worst_psnr"]]
+    if s["fallbacks"]:
+        fb = s["fallbacks"]
+        extra = sum(r["out_bytes"] for r in fb)
+        lines += ["", f"## Sin compresión por calidad ({len(fb)} texturas, {_mb(extra)})", "",
+                  "| Textura | Origen | Salida | Motivo |", "| --- | --- | --- | --- |"]
+        lines += [f"| {t['name']} | {t['src']} | {t['out']} | {t['fallback']} |" for t in fb[:30]]
     lines += ["", "## Contenido del disco", "", "| Tipo | Cantidad |", "| --- | --- |"]
     lines += [f"| {k} | {v} |" for k, v in sorted(r["counts"].items())]
     if r["pending"]:

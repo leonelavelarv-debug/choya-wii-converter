@@ -139,6 +139,40 @@ class TestOptimize(unittest.TestCase):
         self.assertEqual(len(c.data), 32 * 32 * 2)
 
 
+class TestQualityFallback(unittest.TestCase):
+    def tex(self, fmt, img, source):
+        return gxtex.GXTexture("t", fmt, img.shape[1], img.shape[0], 1, fx.encode_gx(fmt, img), source=source)
+
+    def test_tiny_color_table_stays_lossless(self):
+        rng = np.random.default_rng(5)
+        img = rng.integers(0, 256, (4, 4, 4), dtype=np.uint8)
+        img[..., 3] = 255
+        c = optimize.convert(self.tex(gxtex.RGBA8, img, "files/a.brres"), profiles.get("rg35xxh"))
+        self.assertEqual(c.fmt, optimize.OUT_RGBA8)
+        self.assertTrue(np.array_equal(np.frombuffer(c.data, np.uint8).reshape(4, 4, 4), img))
+        self.assertIn("diminuta", c.fallback)
+
+    def test_sharp_ui_falls_back(self):
+        rng = np.random.default_rng(6)
+        img = rng.integers(0, 256, (32, 24, 4), dtype=np.uint8)
+        img[..., 3] = np.where(img[..., 3] > 128, 255, 0)
+        c = optimize.convert(self.tex(gxtex.RGBA8, img, "files/x.arc/timg/count.tpl"), profiles.get("rg35xxh"))
+        self.assertEqual(c.fmt, optimize.OUT_RGBA8)
+        self.assertGreaterEqual(c.psnr, 32)
+
+    def test_noisy_3d_uses_rgb565(self):
+        rng = np.random.default_rng(7)
+        img = rng.integers(0, 256, (64, 64, 4), dtype=np.uint8)
+        img[..., 3] = 255
+        c = optimize.convert(self.tex(gxtex.RGBA8, img, "files/a.brres"), profiles.get("rg35xxh"))
+        self.assertEqual(c.fmt, optimize.OUT_RGB565)
+
+    def test_smooth_texture_stays_etc2(self):
+        c = optimize.convert(self.tex(gxtex.RGBA8, fx.gradient(64, 64), "files/a.brres"), profiles.get("rg35xxh"))
+        self.assertEqual(c.fmt, optimize.OUT_ETC2_RGB8)
+        self.assertIsNone(c.fallback)
+
+
 class TestContainers(unittest.TestCase):
     def test_tpl(self):
         img = fx.gradient(16, 16)
@@ -192,7 +226,9 @@ class TestEndToEnd(unittest.TestCase):
             os.makedirs(os.path.join(files, "Sound"))
             os.makedirs(os.path.join(root, "sys"))
             with open(os.path.join(root, "sys", "boot.bin"), "wb") as f:
-                f.write(b"TEST01" + b"\x00" * 26)
+                f.write(b"TEST01\x00\x01" + b"\x00" * 24)
+            with open(os.path.join(root, "sys", "main.dol"), "wb") as f:
+                f.write(b"no es un dol real")
             img = fx.gradient(128, 128)
             brres = fx.build_brres([("suelo", gxtex.RGB565, 128, 128, fx.encode_gx(gxtex.RGB565, img), 1)])
             tpl = containers.build_tpl([(gxtex.RGB5A3, 32, 32,
@@ -208,6 +244,9 @@ class TestEndToEnd(unittest.TestCase):
             rep = engine.run(os.path.join(tmp, "disc"), out, profiles.get("rg35xxh"), jobs=1, preview=True,
                              log=lambda *_: None)
             self.assertEqual(rep["manifest"]["game_id"], "TEST01")
+            self.assertEqual(rep["manifest"]["revision"], 1)
+            with open(os.path.join(out, "report.md"), encoding="utf-8") as fh:
+                self.assertIn("no coincide con ogws", fh.read())
             self.assertEqual(rep["summary"]["textures"], 2)        # el BRRES duplicado se deduplica
             self.assertEqual(rep["summary"]["texture_refs"], 3)
             self.assertEqual(rep["summary"]["audio"], 1)

@@ -59,6 +59,7 @@ class ConvertedTexture:
     data: bytes
     alpha: str          # "none" | "binary" | "full"
     psnr: float | None
+    fallback: str | None = None   # por qué no se usó el formato comprimido
 
 
 def classify_alpha(a: np.ndarray) -> str:
@@ -144,18 +145,47 @@ def encode_level(img: np.ndarray, fmt: int) -> bytes:
     raise ValueError(fmt)
 
 
-def _measure(img: np.ndarray, fmt: int, data: bytes) -> float | None:
-    h, w = img.shape[:2]
-    try:
-        if fmt == OUT_ETC2_RGB8:
-            return etc.psnr(etc.decode_etc2_rgb(data, w, h), img[..., :3])
-        if fmt == OUT_ETC2_RGBA8:
-            return etc.psnr(etc.decode_etc2_rgba(data, w, h), img)
+def decode_out(fmt: int, data: bytes, w: int, h: int) -> np.ndarray:
+    """Decodifica un nivel de salida a RGBA8 (h, w, 4), como lo verá la GPU."""
+    if fmt == OUT_ETC2_RGB8:
+        rgb = etc.decode_etc2_rgb(data, w, h)
+        return np.concatenate([rgb, np.full((h, w, 1), 255, np.uint8)], 2)
+    if fmt == OUT_ETC2_RGBA8:
+        return etc.decode_etc2_rgba(data, w, h)
+    if fmt in (OUT_R11_EAC, OUT_RG11_EAC):
         if fmt == OUT_R11_EAC:
-            return etc.psnr(etc.decode_eac(data, w, h), img[..., 0])
-    except ValueError:
-        return None
-    return None
+            i = etc.decode_eac(data, w, h)
+            a = i
+        else:
+            i = etc.decode_eac(data, w, h, 2, 0)
+            a = etc.decode_eac(data, w, h, 2, 1)
+        return np.stack([i, i, i, a], -1)
+    if fmt == OUT_L8:
+        i = np.frombuffer(data, np.uint8).reshape(h, w)
+        return np.stack([i, i, i, np.full_like(i, 255)], -1)
+    if fmt == OUT_LA8:
+        la = np.frombuffer(data, np.uint8).reshape(h, w, 2)
+        return np.stack([la[..., 0]] * 3 + [la[..., 1]], -1)
+    if fmt == OUT_RGBA8:
+        return np.frombuffer(data, np.uint8).reshape(h, w, 4).copy()
+    v = np.frombuffer(data, "<u2").reshape(h, w).astype(np.uint32)
+    if fmt == OUT_RGB565:
+        return np.stack([((v >> 11) & 31) * 255 // 31, ((v >> 5) & 63) * 255 // 63, (v & 31) * 255 // 31,
+                         np.full_like(v, 255)], -1).astype(np.uint8)
+    if fmt == OUT_RGBA4444:
+        return np.stack([(v >> 12) * 17, ((v >> 8) & 15) * 17, ((v >> 4) & 15) * 17, (v & 15) * 17],
+                        -1).astype(np.uint8)
+    if fmt == OUT_RGBA5551:
+        return np.stack([((v >> 11) & 31) * 255 // 31, ((v >> 6) & 31) * 255 // 31, ((v >> 1) & 31) * 255 // 31,
+                         (v & 1) * 255], -1).astype(np.uint8)
+    raise ValueError(fmt)
+
+
+def _measure(img: np.ndarray, fmt: int, data: bytes, alpha: str) -> float:
+    h, w = img.shape[:2]
+    dec = decode_out(fmt, data, w, h)
+    ch = 4 if alpha != "none" else 3
+    return etc.psnr(dec[..., :ch], img[..., :ch])
 
 
 def is_ui_texture(path: str) -> bool:
@@ -181,9 +211,34 @@ def convert(tex: GXTexture, profile: Profile, measure: bool = True) -> Converted
     if profile.keep_mips and tex.mips > 1:
         n_mips = max(1, min(tex.mips, max(w, h).bit_length()))
     chain = _mip_chain(img, n_mips)
+    ui = is_ui_texture(tex.source)
+    threshold = profile.min_psnr_ui if ui else profile.min_psnr_3d
+
+    fallback = None
+    q = None
+    if w * h <= profile.small_lossless:
+        # Texturas diminutas (tablas de color, puntos de UI): comprimir no ahorra casi nada y las arruina.
+        fmt, fallback = OUT_RGBA8, f"diminuta ({w}x{h})"
+    else:
+        lvl0 = encode_level(img, fmt)
+        if measure:
+            q = _measure(img, fmt, lvl0, alpha)
+            if q < threshold:
+                bad = round(q, 1)
+                # I4/I8 llevan la intensidad también en el alfa: RGB565 la perdería.
+                lossy_ok = alpha == "none" and tex.fmt not in INTENSITY_FORMATS and profile.gles3
+                options = [OUT_RGB565, OUT_RGBA8] if lossy_ok else [OUT_RGBA8]
+                for alt in options:
+                    q2 = _measure(img, alt, encode_level(img, alt), alpha)
+                    if q2 >= threshold or alt == OUT_RGBA8:
+                        fmt, q = alt, q2
+                        fallback = f"{OUT_NAMES[choose_format(tex.fmt, alpha, profile)]} daba {bad} dB"
+                        break
     data = b"".join(encode_level(m, fmt) for m in chain)
-    q = _measure(img, fmt, data[:out_level_size(fmt, w, h)]) if measure else None
-    return ConvertedTexture(fmt=fmt, width=w, height=h, mips=len(chain), data=data, alpha=alpha, psnr=q)
+    if measure and q is None:
+        q = _measure(img, fmt, data[:out_level_size(fmt, w, h)], alpha)
+    return ConvertedTexture(fmt=fmt, width=w, height=h, mips=len(chain), data=data, alpha=alpha, psnr=q,
+                            fallback=fallback)
 
 
 def describe(tex: GXTexture) -> str:

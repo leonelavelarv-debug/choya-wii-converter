@@ -21,7 +21,11 @@ def cmd_convert(a):
 def cmd_scan(a):
     res = sc.scan(a.src)
     print(f"Raíz de archivos: {res.root}")
-    print(f"ID del juego: {sc.game_id(a.src) or 'desconocido'}")
+    d = sc.disc_info(a.src)
+    print(f"ID del juego: {d['game_id'] or 'desconocido'}  revisión: {d['revision']}")
+    if d["dol_sha1"]:
+        estado = "coincide con ogws (US Rev 1)" if d["ogws_match"] else "NO coincide con ogws (necesita US Rev 1)"
+        print(f"main.dol SHA-1: {d['dol_sha1']}  -> {estado}")
     print(f"{res.files} archivos, {res.disc_bytes / 1048576:.1f} MiB")
     for k, v in sorted(res.counts.items()):
         print(f"  {k:28s} {v}")
@@ -41,7 +45,8 @@ def cmd_info(a):
                 print(f"TEX {e['key']:016x} {OUT_NAMES.get(e['fmt'], e['fmt']):14s} "
                       f"{e['width']}x{e['height']} m{e['count']} {e['size']:8d} B  {e['name']}")
             else:
-                print(f"AUD {e['key']:016x} PCM16 {e['extra0']} Hz {e['count']} can. "
+                kind = "DSP-ADPCM" if e["fmt"] == pack.AUDIO_DSPADPCM else "PCM16"
+                print(f"AUD {e['key']:016x} {kind} {e['extra0']} Hz {e['count']} can. "
                       f"{e['size']:8d} B  {e['name']}")
 
 

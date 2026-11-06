@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
     const wl::PackEntry* a = pack.find_audio(argv[6]);
     CHECK(a != nullptr);
     if (a) {
-        wl::PcmStream s;
+        wl::AudioStream s;
         CHECK(s.open(pack, *a));
         std::vector<int16_t> buf(size_t(a->extra2) * 2 + 64);
         const size_t n = s.read(buf.data(), buf.size() / 2, 2);

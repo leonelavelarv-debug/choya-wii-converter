@@ -28,6 +28,7 @@ KIND_TEXTURE = 1
 KIND_AUDIO = 2
 
 AUDIO_PCM16 = 1
+AUDIO_DSPADPCM = 2   # ver audio.adpcm_payload; el runtime lo decodifica al vuelo
 
 TEXFLAG_SWIZZLE_I = 1     # R -> RGBA (I4/I8)
 TEXFLAG_SWIZZLE_IA = 2    # R -> RGB, G -> A (IA4/IA8)

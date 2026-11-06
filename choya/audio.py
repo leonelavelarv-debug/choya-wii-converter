@@ -13,6 +13,9 @@ class DspChannel:
     ps: int = 0               # predictor/escala inicial
     hist1: int = 0
     hist2: int = 0
+    loop_ps: int = 0
+    loop_hist1: int = 0
+    loop_hist2: int = 0
 
 
 @dataclass
@@ -21,6 +24,8 @@ class DecodedAudio:
     rate: int
     loop_start: int | None    # en muestras, o None si no hace bucle
     codec: str
+    adpcm: list[bytes] | None = None          # datos DSP-ADPCM crudos por canal (para guardarlos sin recodificar)
+    adpcm_channels: list[DspChannel] | None = None
 
 
 def decode_dsp_adpcm(data: bytes, num_samples: int, ch: DspChannel) -> np.ndarray:
@@ -67,13 +72,13 @@ def read_dsp(data: bytes) -> DecodedAudio:
     num_samples, _nibbles, rate, loop, fmt, loop_start, _loop_end, _cur = struct.unpack_from(">IIIHHIII", data, 0)
     if fmt != 0:
         raise ValueError("DSP con formato distinto de ADPCM")
-    ch = DspChannel(_coefs(data, 0x1C), *struct.unpack_from(">Hhh", data, 0x3E))
+    ch = DspChannel(_coefs(data, 0x1C), *struct.unpack_from(">Hhhhhh", data, 0x3E))
     pcm = decode_dsp_adpcm(data[0x60:], num_samples, ch)
     loop_sample = None
     if loop:
         frame, nib = divmod(loop_start, 16)
         loop_sample = frame * 14 + max(0, nib - 2)
-    return DecodedAudio(pcm[:, None], rate, loop_sample, "dsp-adpcm")
+    return DecodedAudio(pcm[:, None], rate, loop_sample, "dsp-adpcm", [bytes(data[0x60:])], [ch])
 
 
 def is_brstm(data: bytes) -> bool:
@@ -98,8 +103,8 @@ def read_brstm(data: bytes) -> DecodedAudio:
         entry = base + struct.unpack_from(">II", data, ci + 4 + c * 8)[1]
         info = base + struct.unpack_from(">II", data, entry)[1]
         if codec == 2:
-            ps, h1, h2 = struct.unpack_from(">Hhh", data, info + 0x22)
-            chans.append(DspChannel(_coefs(data, info), ps, h1, h2))
+            ps, h1, h2, lps, lh1, lh2 = struct.unpack_from(">Hhhhhh", data, info + 0x22)
+            chans.append(DspChannel(_coefs(data, info), ps, h1, h2, lps, lh1, lh2))
         else:
             chans.append(DspChannel([0] * 16))
     channels = min(channels, nch) or nch
@@ -126,7 +131,11 @@ def read_brstm(data: bytes) -> DecodedAudio:
     n = min(len(c) for c in cols)
     pcm = np.stack([c[:n] for c in cols], axis=1)
     names = {0: "pcm8", 1: "pcm16", 2: "dsp-adpcm"}
-    return DecodedAudio(pcm, rate, loop_start if loop_flag else None, names[codec])
+    res = DecodedAudio(pcm, rate, loop_start if loop_flag else None, names[codec])
+    if codec == 2:
+        res.adpcm = [bytes(b) for b in per_ch]
+        res.adpcm_channels = chans[:channels]
+    return res
 
 
 def resample(pcm: np.ndarray, src: int, dst: int) -> np.ndarray:
@@ -143,6 +152,28 @@ def resample(pcm: np.ndarray, src: int, dst: int) -> np.ndarray:
         x_new = np.linspace(0, pcm.shape[0] - 1, n_out)
         out = np.stack([np.interp(x_new, x_old, pcm[:, c]) for c in range(pcm.shape[1])], 1)
     return np.clip(np.rint(out), -32768, 32767).astype(np.int16)
+
+
+def adpcm_payload(audio: DecodedAudio) -> bytes:
+    """Datos para una entrada AUDIO_DSPADPCM del paquete (little-endian).
+    Por canal: cabecera de 48 bytes {int16 coefs[16]; int16 hist1, hist2, loop_hist1, loop_hist2;
+    uint8 loop_ps, pad[3]; uint32 bytes} seguida de los datos ADPCM, alineado a 16."""
+    out = bytearray()
+    for raw, ch in zip(audio.adpcm, audio.adpcm_channels):
+        out += struct.pack("<16hhhhhB3xI", *ch.coefs, ch.hist1, ch.hist2, ch.loop_hist1, ch.loop_hist2,
+                           ch.loop_ps & 0xFF, len(raw))
+        out += raw
+        out += b"\x00" * ((-len(out)) % 16)
+    return bytes(out)
+
+
+def can_keep_adpcm(audio: DecodedAudio, mono_sfx: bool, music_min_seconds: float) -> bool:
+    """Se guarda sin recodificar si es ADPCM y no hay que cambiar el número de canales."""
+    if audio.adpcm is None or audio.samples.shape[1] > 2:
+        return False
+    seconds = audio.samples.shape[0] / max(1, audio.rate)
+    downmix = mono_sfx and seconds < music_min_seconds and audio.samples.shape[1] > 1
+    return not downmix
 
 
 def optimize(audio: DecodedAudio, rate: int, mono_sfx: bool, music_min_seconds: float) -> DecodedAudio:

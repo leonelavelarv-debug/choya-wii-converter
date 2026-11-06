@@ -3,6 +3,7 @@
 //   wl_info assets.wlpk -l         lista de entradas
 //   wl_info --dsp archivo.dsp out.raw   decodifica un .dsp a PCM16 (para pruebas)
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -30,8 +31,28 @@ static int decode_dsp_file(const char* in, const char* out) {
     return 0;
 }
 
+// Vuelca a PCM16 un audio del paquete (PCM16 o DSP-ADPCM), con 'extra' cuadros de más para probar el bucle.
+static int dump_audio(const char* pack_path, const char* disc_path, const char* out, size_t extra) {
+    wl::Pack pack;
+    if (!pack.open(pack_path)) return 1;
+    const wl::PackEntry* e = pack.find_audio(disc_path);
+    wl::AudioStream s;
+    if (!e || !s.open(pack, *e)) {
+        std::fprintf(stderr, "audio no encontrado o dañado: %s\n", disc_path);
+        return 1;
+    }
+    std::vector<int16_t> buf((s.frames() + extra) * size_t(s.channels()));
+    const size_t n = s.read(buf.data(), s.frames() + extra, s.channels());
+    std::ofstream o(out, std::ios::binary);
+    o.write(reinterpret_cast<const char*>(buf.data()), std::streamsize(n * size_t(s.channels()) * 2));
+    std::printf("%zu cuadros, %d canales, formato %u\n", n, s.channels(), e->format);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc >= 4 && std::strcmp(argv[1], "--dsp") == 0) return decode_dsp_file(argv[2], argv[3]);
+    if (argc >= 5 && std::strcmp(argv[1], "--pcm") == 0)
+        return dump_audio(argv[2], argv[3], argv[4], argc > 5 ? size_t(std::atol(argv[5])) : 0);
     if (argc < 2) {
         std::fprintf(stderr, "uso: wl_info assets.wlpk [-l]\n");
         return 2;
@@ -66,7 +87,8 @@ int main(int argc, char** argv) {
             ++audio;
             audio_bytes += e.data_size;
             if (list)
-                std::printf("AUD %016llx PCM16 %u Hz %u can. %.1f s  %s\n", (unsigned long long)e.key, e.extra0,
+                std::printf("AUD %016llx %-9s %u Hz %u can. %.1f s  %s\n", (unsigned long long)e.key,
+                            e.format == wl::AUDIO_DSPADPCM ? "DSP-ADPCM" : "PCM16", e.extra0,
                             e.count, double(e.extra2) / e.extra0, pack.name(e));
         }
     }
