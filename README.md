@@ -68,7 +68,7 @@ En WSL2 (Ubuntu) con Docker Desktop encendido:
 ./scripts/build-aarch64.sh
 ```
 
-Usa Debian 11 (glibc 2.31) para que el binario funcione en KNULLI. Salen `wl_view`, `wl_info` y `wl_selftest` en `runtime/build-aarch64/`.
+Usa Debian 12 (glibc 2.36). Si en la consola aparece `GLIBC_2.3x not found`, revisa la versión de KNULLI con `ldd --version`. Salen `wl_view`, `wl_info` y `wl_selftest` en `runtime/build-aarch64/`.
 
 Para probar en la PC sin GPU: `cmake -S runtime -B runtime/build -DWL_WITH_GL=OFF && cmake --build runtime/build`.
 
