@@ -46,8 +46,9 @@ pm_platform_helper "$GAMEDIR/__BIN__"
 pm_finish
 """
 
-GPTK = """back = \\"
-start = \\"
+# gptokeyb: Select y Start envían Escape (el visor sale con Escape o con Start).
+GPTK = """back = esc
+start = esc
 """
 
 

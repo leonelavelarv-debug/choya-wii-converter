@@ -102,8 +102,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     SDL_GL_SetSwapInterval(1);
+    // En PortMaster, gptokeyb también convierte la cruceta en flechas del teclado. Si hay mando,
+    // se ignoran las teclas (salvo Escape) para que cada pulsación avance una sola textura.
+    int pads = 0;
     for (int i = 0; i < SDL_NumJoysticks(); ++i)
-        if (SDL_IsGameController(i)) SDL_GameControllerOpen(i);
+        if (SDL_IsGameController(i) && SDL_GameControllerOpen(i)) ++pads;
 
     int sw = 640, sh = 480;
     SDL_GL_GetDrawableSize(win, &sw, &sh);
@@ -139,7 +142,7 @@ int main(int argc, char** argv) {
         while (SDL_PollEvent(&ev)) {
             int step = 0;
             if (ev.type == SDL_QUIT) running = false;
-            if (ev.type == SDL_KEYDOWN) {
+            if (ev.type == SDL_KEYDOWN && (pads == 0 || ev.key.keysym.sym == SDLK_ESCAPE)) {
                 switch (ev.key.keysym.sym) {
                     case SDLK_ESCAPE: running = false; break;
                     case SDLK_RIGHT: step = 1; break;
