@@ -29,6 +29,9 @@ export NSMBW_LOG_FPS=1
 export WIICOMPILED_NO_POPUP=1
 # Perfil: a los 20 s empieza a tomar muestras durante 35 s y deja perfil.txt (en la PC: choya perfil perfil.txt).
 export CHOYA_PERFIL=20,35
+# Motor de Choya, paso 1: pantalla GLES propia sobre el framebuffer de la Mali (anota choya-gles.txt).
+export CHOYA_GLES=1
+rm -f "$DIR/choya-gles.txt"
 rm -f "$DIR/perfil.txt"
 
 CPUF=/sys/devices/system/cpu/cpu0/cpufreq
@@ -63,6 +66,8 @@ STATUS=$?
   echo "codigo de salida: $STATUS (124 = siguio corriendo hasta el limite de 90 s)"
   [ -f "$DIR/perfil.txt" ] && echo "perfil.txt: $(head -2 "$DIR/perfil.txt" | tail -1)" || echo "perfil.txt: no se escribio"
   cat "$DIR/cpu.txt"
+  echo "--- pantalla GLES de Choya"
+  [ -f "$DIR/choya-gles.txt" ] && cat "$DIR/choya-gles.txt" || echo "choya-gles.txt no se escribio"
   echo "--- cuadros por segundo"
   grep -E "\[vi\] fps" "$DIR/run.log" | tail -15
   echo "--- errores"

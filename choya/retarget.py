@@ -31,6 +31,7 @@ MISSING_PREFIX = "choya_ausente_"
 MISSING_FILE = "src/choya_ausentes.cpp"
 HLE_FILE = "src/choya_wiisports_hle.cpp"
 PERFIL_FILE = "src/choya_perfil.cpp"  # perfilador por muestreo (solo con CHOYA_PERFIL)
+GLES_FILE = "src/choya_gles.cpp"  # pantalla GLES propia de Choya (solo con CHOYA_GLES=1)
 
 # Funciones nativas propias de Choya para lo que Wii Sports usa y los juegos de WiiCompiled no.
 # Cada una: (función de Wii Sports, cuerpo en C++ con {addr} para la dirección).
@@ -822,6 +823,15 @@ EDITS = [
      'static constexpr std::array<std::string_view, 3> values{"auto", "vulkan", "null"};  // choya',
      "gráficos null en Linux"),
     # Compilado en la PC para la consola: -mcpu=native describiría la PC. La RG35XX H es Cortex-A53 (ARMv8.0).
+    # Motor de Choya, paso 1: después de cada cuadro de aurora, la pantalla GLES propia presenta el suyo
+    # (choya_gles.cpp; solo hace algo con CHOYA_GLES=1).
+    ("src/hle/vi.cpp", '#include "guest_code_patch.h"\n',
+     '#include "guest_code_patch.h"\nextern "C" void choya_gles_frame();  // choya: pantalla GLES propia\n',
+     "pantalla GLES de Choya (declaración)"),
+    ("src/hle/vi.cpp", "    aurora_end_frame();\n    const Clock::time_point paceStart = Clock::now();\n",
+     "    aurora_end_frame();\n    choya_gles_frame();  // choya: pantalla GLES propia\n"
+     "    const Clock::time_point paceStart = Clock::now();\n",
+     "pantalla GLES de Choya (cada cuadro)"),
     # Clang no tiene __builtin_setjmp/__builtin_longjmp en aarch64. Solo los usan los save states: en ARM el cambio de
     # hilo va directo y los save states quedan apagados. En la PC (x86-64) todo sigue igual.
     ("src/save_states.cpp", "    __builtin_longjmp(slot.jmp, 1);\n",
@@ -1013,6 +1023,7 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
     with open(os.path.join(out, HLE_FILE), "w", encoding="utf-8", newline="\n") as f:
         f.write(choya_natives(res.ws, registered, result.changes))
     shutil.copyfile(os.path.join(os.path.dirname(__file__), "data", "choya_perfil.cpp"), os.path.join(out, PERFIL_FILE))
+    shutil.copyfile(os.path.join(os.path.dirname(__file__), "data", "choya_gles.cpp"), os.path.join(out, GLES_FILE))
     return result
 
 
