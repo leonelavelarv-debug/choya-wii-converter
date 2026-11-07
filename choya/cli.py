@@ -58,10 +58,14 @@ def cmd_modelo(a):
     print_ = (lambda *x: print(*x, file=out))
     res = sc.scan(a.src)
     seen = 0
+    wanted = [t.strip().lower() for t in a.texto.split(",") if t.strip()]
+    per_text = {t: 0 for t in wanted}
     for item in res.models:
         full = f"{item.path}/{item.name}"
-        if a.texto.lower() not in full.lower():
+        hit = next((t for t in wanted if t in full.lower() and per_text[t] < a.max), None)
+        if hit is None:
             continue
+        per_text[hit] += 1
         seen += 1
         print_(f"=== {full}")
         try:
@@ -75,8 +79,6 @@ def cmd_modelo(a):
               f"caja ({lo[0]:.2f},{lo[1]:.2f},{lo[2]:.2f})-({hi[0]:.2f},{hi[1]:.2f},{hi[2]:.2f})")
         for w in m.warnings[:10]:
             print_("  aviso:", w)
-        if seen >= a.max:
-            break
     if not seen:
         print_("ningún modelo contiene ese texto")
     if a.archivo:
@@ -130,8 +132,8 @@ def main(argv=None):
 
     mo = sub.add_parser("modelo", help="diagnóstico de los modelos cuyo nombre contenga un texto")
     mo.add_argument("src")
-    mo.add_argument("texto")
-    mo.add_argument("--max", type=int, default=2)
+    mo.add_argument("texto", help="texto a buscar en el nombre; varios separados por comas")
+    mo.add_argument("--max", type=int, default=1, help="modelos por cada texto")
     mo.add_argument("--items", type=int, default=12, help="huesos y objetos a mostrar por modelo")
     mo.add_argument("-a", "--archivo", help="guardar el diagnóstico en este archivo (UTF-8)")
     mo.set_defaults(fn=cmd_modelo)

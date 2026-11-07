@@ -586,4 +586,33 @@ def describe(d: bytes, mdl0: int, name: str, max_items: int = 12) -> str:
             out.append("    primitivas: NO encontradas")
     if len(sec["objs"]) > max_items:
         out.append(f"  ... {len(sec['objs']) - max_items} objetos más")
+
+    # Materiales y shaders (TEV)
+    from . import tev
+    try:
+        model = read_mdl0(d, mdl0, name)
+        mats = {m.offset: m for m in model.materials}
+    except Exception:  # noqa: BLE001
+        mats = {}
+    shader_offs = {off for _, off in sec["shaders"]}
+    for mname, m in sec["mats"][:max_items]:
+        size = _u32(d, m)
+        mat = mats.get(m)
+        sh_rel = _s32(d, m + 0x28)
+        out.append(f"  material {mname}: tamaño 0x{size:X} idx={_s32(d, m + 0x0C)} flags=0x{_u32(d, m + 0x10):X} "
+                   f"texgens={d[m + 0x14]} canales={d[m + 0x15]} etapas={d[m + 0x16]} ind={d[m + 0x17]} "
+                   f"cull={_u32(d, m + 0x18)} shader(+0x28)->{'shader OK' if m + sh_rel in shader_offs else hex(sh_rel)}")
+        out.append(f"    cabecera: {hexs(m, 0x48)}")
+        if mat:
+            for i, lay in enumerate(mat.layers):
+                out.append(f"    capa {i}: textura '{lay.texture}' wrap {lay.wrap_s}/{lay.wrap_t}")
+        cfg = tev.decode(tev.scan_commands(d, m + 0x40, m + size))
+        out += tev.format_config(cfg)
+    for sname, sh in sec["shaders"][:max_items]:
+        size = _u32(d, sh)
+        users = [n for n, m in sec["mats"] if m + _s32(d, m + 0x28) == sh]
+        out.append(f"  shader {sname}: tamaño 0x{size:X} etapas={d[sh + 0x0C]} usado por {users[:4]}")
+        out.append(f"    cabecera: {hexs(sh, 0x20)}")
+        cfg = tev.decode(tev.scan_commands(d, sh + 0x10, sh + size))
+        out += tev.format_config(cfg, active=d[sh + 0x0C] or None)
     return "\n".join(out)
