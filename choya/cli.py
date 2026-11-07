@@ -53,7 +53,9 @@ def cmd_info(a):
 
 
 def cmd_modelo(a):
-    from . import containers, mdl0
+    from . import mdl0
+    out = open(a.archivo, "w", encoding="utf-8") if a.archivo else sys.stdout
+    print_ = (lambda *x: print(*x, file=out))
     res = sc.scan(a.src)
     seen = 0
     for item in res.models:
@@ -61,18 +63,25 @@ def cmd_modelo(a):
         if a.texto.lower() not in full.lower():
             continue
         seen += 1
-        print(f"=== {full}")
-        print(mdl0.describe(item.brres, item.offset, item.name))
-        m = mdl0.read_mdl0(item.brres, item.offset, item.name)
+        print_(f"=== {full}")
+        try:
+            print_(mdl0.describe(item.brres, item.offset, item.name, max_items=a.items))
+            m = mdl0.read_mdl0(item.brres, item.offset, item.name)
+        except Exception as e:  # noqa: BLE001 - el diagnóstico debe llegar al archivo aunque algo falle
+            print_(f"  ERROR: {type(e).__name__}: {e}")
+            continue
         lo, hi = m.positions.min(0), m.positions.max(0)
-        print(f"  resultado: {len(m.positions)} vértices, {m.stats['triangulos']} triángulos, "
+        print_(f"  resultado: {len(m.positions)} vértices, {m.stats['triangulos']} triángulos, "
               f"caja ({lo[0]:.2f},{lo[1]:.2f},{lo[2]:.2f})-({hi[0]:.2f},{hi[1]:.2f},{hi[2]:.2f})")
         for w in m.warnings[:10]:
-            print("  aviso:", w)
+            print_("  aviso:", w)
         if seen >= a.max:
             break
     if not seen:
-        print("ningún modelo contiene ese texto")
+        print_("ningún modelo contiene ese texto")
+    if a.archivo:
+        out.close()
+        print(f"Diagnóstico guardado en {a.archivo}")
 
 
 def cmd_package(a):
@@ -123,11 +132,19 @@ def main(argv=None):
     mo.add_argument("src")
     mo.add_argument("texto")
     mo.add_argument("--max", type=int, default=2)
+    mo.add_argument("--items", type=int, default=12, help="huesos y objetos a mostrar por modelo")
+    mo.add_argument("-a", "--archivo", help="guardar el diagnóstico en este archivo (UTF-8)")
     mo.set_defaults(fn=cmd_modelo)
 
     pr = sub.add_parser("profiles", help="lista los perfiles de optimización")
     pr.set_defaults(fn=cmd_profiles)
 
+    # Nombres japoneses (Shift-JIS) en modelos y archivos: la consola de Windows no siempre los acepta.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     a = ap.parse_args(argv)
     a.fn(a)
 
