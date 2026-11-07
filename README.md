@@ -209,6 +209,20 @@ bash scripts/run-wiisports-wsl.sh /mnt/c/wii/RSPE01/DATA
 python3 -m choya donde 0x80009D90      # qué función de Wii Sports hay en una dirección
 ```
 
+### Wii Sports en la RG35XX H (en progreso)
+
+El driver de la Mali-G31 de KNULLI solo ofrece Vulkan 1.0 y Dawn (los gráficos de WiiCompiled) pide 1.1, así que la primera prueba en la consola usa el modo de gráficos **null**: el juego corre completo sin imagen (con sonido) y el log dice cuántos cuadros por segundo da el procesador.
+
+```sh
+bash scripts/build-wiisports-wsl.sh /mnt/c/wii/RSPE01/DATA/sys/main.dol ~/BrawlRecompiled/wiicompiled   # una vez
+bash scripts/build-wiisports-arm64.sh ~/BrawlRecompiled/wiicompiled
+```
+
+Compila con Docker (Ubuntu 24.04, glibc 2.39, Clang 21, `-mcpu=cortex-a53`, libstdc++ estática) y deja `C:\Users\Public\choya-port\`: `Wii Sports (Choya).sh` y la carpeta `wiisports-choya` van a la carpeta `ports` de la microSD, y la carpeta `DATA` del disco extraído va en `wiisports-choya/game/`. Al abrirlo desde Ports corre 90 segundos y escribe `run.log` y `resumen.txt`.
+
+`scripts/knulli/Choya-Info.sh` (desde Ports) escribe `choya-info.txt` con el sistema, la GPU, Vulkan/GLES y el espacio libre.
+
+
 Lo que genera el traductor (`generated\`, `build-wiisports\`) contiene código del juego: no lo subas a ningún repositorio.
 
 ## Formato `.wlpk`

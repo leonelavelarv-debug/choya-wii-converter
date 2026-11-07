@@ -808,6 +808,22 @@ EDITS = [
     ("src/settings_overlay.cpp", 'Outlined("SUPER SMASH BROS. BRAWL",', 'Outlined("WII SPORTS",', "pantalla de inicio"),
     ("src/settings_overlay.cpp", 'Outlined("Made by JosiahG",', 'Outlined("Choya Wii Converter",',
      "pantalla de inicio"),
+    # Modo de gráficos "null" en Linux: el juego corre completo sin dibujar. Sirve para medir en la consola
+    # cuánto rinde el procesador antes de tener gráficos (el driver de la Mali solo da Vulkan 1.0).
+    ("src/main.cpp",
+     'std::array<GraphicsBackendEntry, 2> kGraphicsBackends{{\n'
+     '            {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN},\n        }};',
+     'std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{\n'
+     '            {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN}, {"null", BACKEND_NULL},  // choya\n        }};',
+     "gráficos null en Linux"),
+    ("include/runtime_config.h",
+     'static constexpr std::array<std::string_view, 2> values{"auto", "vulkan"};',
+     'static constexpr std::array<std::string_view, 3> values{"auto", "vulkan", "null"};  // choya',
+     "gráficos null en Linux"),
+    # Compilado en la PC para la consola: -mcpu=native describiría la PC. La RG35XX H es Cortex-A53 (ARMv8.0).
+    ("cmake/PublicProducts.cmake", "    set(MKW_BASELINE_ARCH_FLAG -mcpu=native)",
+     "    set(MKW_BASELINE_ARCH_FLAG -mcpu=cortex-a53)  # choya: RG35XX H (Allwinner H700, Cortex-A53)",
+     "procesador de la consola"),
 ]
 
 
@@ -876,6 +892,16 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
     res.sda = {"r13": game.sda, "r2": game.sda2}
     result.game = game
     result.structs = struct_checks(res.ws)
+    # Cambios de código fuera de src/ e include/ (CMake).
+    for rel in sorted({e[0] for e in EDITS if not e[0].startswith(("src/", "include/"))}):
+        path = os.path.join(out, rel)
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
+                text = f.read()
+            new = apply_edits(text, rel, result.changes)
+            if new != text:
+                with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+                    f.write(new)
     # Primero se reactivan los registros apagados solo porque otro juego no tenía la función.
     for sub in ("src", "include"):
         for path in source_files(os.path.join(out, sub)):
