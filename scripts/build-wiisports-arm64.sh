@@ -62,7 +62,10 @@ docker run --rm -u "$(id -u):$(id -g)" -v "$WC":"$WC" -v "$PORT":"$PORT" "$IMG" 
   aarch64-linux-gnu-readelf -d '$B/WiiCompiled' | grep NEEDED &&
   aarch64-linux-gnu-readelf -V '$B/WiiCompiled' | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1" \
   | tee "$PORT/wiisports-choya/necesita.txt" | tee -a "$LOG"
-find "$B" -maxdepth 3 -name "*.so*" -type f -not -path "*/CMakeFiles/*" -exec cp -L {} "$PORT/wiisports-choya/lib/" \;
+# La SD de KNULLI no guarda enlaces simbólicos: cada .so se copia con el nombre que pide el ejecutable (libpng16.so.16).
+find "$B" -maxdepth 3 -name "*.so*" -type f -not -path "*/CMakeFiles/*" | while read -r f; do
+  cp -L "$f" "$PORT/wiisports-choya/lib/$(basename "$f" | sed -E 's/(\.so\.[0-9]+)\..*/\1/')"
+done
 for f in dsp_coef.bin initial_pipeline_cache.db cacert.pem; do [ -f "$B/$f" ] && cp "$B/$f" "$PORT/wiisports-choya/"; done
 [ -d "$B/wii_bootstrap" ] && cp -r "$B/wii_bootstrap" "$PORT/wiisports-choya/"
 cp "$CHOYA/scripts/knulli/Wii Sports (Choya).sh" "$PORT/"
