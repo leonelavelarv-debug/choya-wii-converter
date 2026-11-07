@@ -5,6 +5,7 @@
 #
 # Por defecto usa /mnt/c/wii/RSPE01/DATA/sys/main.dol y ~/BrawlRecompiled/wiicompiled.
 # Todo queda en ~/choya-build.log; al final imprime un resumen de los errores de compilación.
+# RAPIDO=1 bash scripts/build-wiisports-wsl.sh  → no vuelve a traducir (solo runtime y enlace).
 # Nada de lo que se genera se sube a GitHub: contiene código del juego.
 set -uo pipefail
 
@@ -31,7 +32,7 @@ echo "clang $(clang --version | head -1 | grep -o '[0-9]*\.[0-9]*\.[0-9]*' | hea
 paso "2/7 Preparar el proyecto (recomp-prep + recomp-native)"
 cd "$CHOYA"
 corre python3 -m choya recomp-prep "$DOL" "$WC" || falla "recomp-prep"
-python3 -m choya recomp-native "$WC" 2>&1 | tee -a "$LOG" | grep -E "AVISO|Entrada|Estructuras|Sin resolver" || true
+python3 -m choya recomp-native "$WC" 2>&1 | tee -a "$LOG" | grep -E "AVISO|Entrada|Estructuras|otros juegos|Sin resolver" || true
 # recomp-prep otra vez para que recomp.yml apunte ya a runtime-wiisports
 corre python3 -m choya recomp-prep "$DOL" "$WC" || falla "recomp-prep"
 
@@ -39,6 +40,10 @@ cd "$WC"
 TR="dotnet translator/src/Translator.Cli/bin/Release/net8.0/Translator.Cli.dll"
 YML=projects/wiisports/recomp.yml
 
+RAPIDO="${RAPIDO:-0}"
+if [ "$RAPIDO" = "1" ] && [ -f generated/base_translation_output.json ] && [ -f "translator/src/Translator.Cli/bin/Release/net8.0/Translator.Cli.dll" ]; then
+  paso "3-4/7 Modo rápido: se reutiliza la traducción anterior"
+else
 paso "3/7 Compilar el traductor"
 corre dotnet build translator/src/Translator.Cli/Translator.Cli.csproj -c Release || falla "dotnet build"
 
@@ -48,9 +53,10 @@ mkdir -p generated/functions generated/build_shards build/base
 corre $TR translate-recursive 0x80006124 --project "$YML" --outdir generated/functions \
   --output-metadata generated/base_translation_output.json --threads "$(nproc)" || falla "translate-recursive"
 grep -E "Recursively translated|DEVELOPER OUTPUT" "$LOG" | tail -2
-
-paso "5/7 Datos del juego y grafo de compilación"
 corre $TR generate-data-init --project "$YML" || falla "generate-data-init"
+fi
+
+paso "5/7 Grafo de compilación"
 corre $TR emit-build-shards --project "$YML" --base-metadata generated/base_translation_output.json \
   --base-functions-dir generated/functions --native-source-dir runtime-wiisports/src \
   --out generated/build_shards || falla "emit-build-shards"

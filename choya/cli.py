@@ -132,6 +132,7 @@ def cmd_recomp_native(a):
     print(f"Desfases SDA movidos:       {r.count('sda')}")
     print(f"Deducidas por vecinas:      {r.count('vecinos')}")
     print(f"Parches revisados a mano:   {r.count('parche')}")
+    print(f"Funciones de otros juegos:  {r.count('ausente')} (stub en {retarget.MISSING_FILE})")
     bad = [c for c in r.changes if c.kind == "parche_fallido"]
     for c in bad:
         print(f"AVISO: parche no aplicado: {c.name} ({c.file}): {c.text}")

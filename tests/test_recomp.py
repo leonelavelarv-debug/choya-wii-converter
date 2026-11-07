@@ -140,6 +140,7 @@ constexpr uint32_t kHorW = 0x804de644;    // HorVer.DispSizeX
 constexpr uint32_t kHorY = 0x804de65c;    // HorVer+0x1C (PanSizeY)
 constexpr uint32_t kDup = 0x805A0000u;    // Dup
 constexpr uint32_t kRaro = 0x80123456u;
+void g(CpuContext* c) { func_80777777(c); }
 void f() { Memory::Write32(0x804DE6E4, 0); InvokeIndirectCpu(0x801E9A2Cu, c); }  // VISetNextFrameBuffer's blr
 """
 
@@ -178,6 +179,9 @@ void f() { Memory::Write32(0x804DE6E4, 0); InvokeIndirectCpu(0x801E9A2Cu, c); } 
             self.assertIn("Write32(0x80412E54", out)                                    # dentro de FifoObj (+4)
             self.assertIn("InvokeIndirectCpu(0x801E9A2Cu", out)                         # sin pista segura
             self.assertTrue(os.path.exists(os.path.join(t, "runtime-wiisports", R.MARKER)))
+            self.assertIn("choya_ausente_80777777(c)", out)                             # función de otro juego
+            stubs = open(os.path.join(t, "runtime-wiisports", R.MISSING_FILE)).read()
+            self.assertIn('void choya_ausente_80777777(CpuContext*)', stubs)
             self.assertEqual(r.count("duplicado"), 1)
             self.assertEqual(r.count("desactivado"), 1)
             unresolved = {c.old for c in r.changes if c.kind == "sin_resolver"}

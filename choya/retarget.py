@@ -27,6 +27,8 @@ from . import recomp
 BUNDLED_SYMBOLS = os.path.join(recomp.DATA, "RSPE01_01.symbols.gz")
 MARKER = ".choya-generado"
 OUT_DIR = "runtime-wiisports"
+MISSING_PREFIX = "choya_ausente_"
+MISSING_FILE = "src/choya_ausentes.cpp"
 
 LOW_MEM_END = 0x80004000      # 0x80000000-0x80003FFF: globales del sistema, iguales en todos los juegos
 GUEST_END = 0x81800000
@@ -222,6 +224,7 @@ class _Resolver:
         self.func_at: dict[int, str] = {}
         self.sda: dict[str, int | None] = {"r13": None, "r2": None}
         self.sda_seen: dict[tuple, str] = {}
+        self.missing: set[int] = set()
         self.anchors: dict[str, int] = {}               # símbolo → dirección vieja, de los comentarios de todo el runtime
 
     def neighbors(self, addr: int) -> tuple[str, int] | None:
@@ -396,8 +399,11 @@ def retarget_text(text: str, rel: str, res: _Resolver, registered: dict[int, str
                 name, new = hit
                 changes.append(Change(rel, i, kind, old, new, name, s[:140]))
                 return "func_" + _fmt(m.group("addr"), new)
-            changes.append(Change(rel, i, "sin_resolver", old, None, _suggest(old, res), s[:140]))
-            return m.group(0)
+            # Función de otro juego sin equivalente: se renombra para que nunca se enlace con una función
+            # de Wii Sports que caiga en la misma dirección; el stub de choya_ausentes.cpp avisa si se llama.
+            changes.append(Change(rel, i, "ausente", old, None, _suggest(old, res), s[:140]))
+            res.missing.add(old)
+            return f"{MISSING_PREFIX}{old:08X}"
 
         def sub_hex(m, i=i, s=s, comment=comment, single=len(lits) == 1):
             old = int(m.group("addr"), 16)
@@ -727,7 +733,24 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
             if new != text:
                 with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
                     f.write(new)
+    with open(os.path.join(out, MISSING_FILE), "w", encoding="utf-8", newline="\n") as f:
+        f.write(missing_stubs(sorted(res.missing)))
     return result
+
+
+def missing_stubs(addresses: list[int]) -> str:
+    """Definiciones para las funciones de otros juegos que el runtime nombra pero Wii Sports no tiene.
+    Solo las usan funciones nativas desactivadas; si alguna se llamara, el programa se detiene diciendo cuál."""
+    lines = ["// Generado por choya recomp-native. No editar: se rehace cada vez.",
+             "// Funciones de otros juegos (Brawl, NSMBW, MKW, SPM) que Wii Sports no tiene.",
+             "#include <cstdio>", "#include <cstdlib>", "", "struct CpuContext;", "",
+             "[[noreturn]] static void choya_ausente(unsigned address) {",
+             "    std::fprintf(stderr, \"[choya] se llamo a func_%08X, que es de otro juego y Wii Sports no tiene\\n\", address);",
+             "    std::abort();", "}", "", 'extern "C" {']
+    for a in addresses:
+        lines.append(f"void {MISSING_PREFIX}{a:08X}(CpuContext*) {{ choya_ausente(0x{a:08X}u); }}")
+    lines += ["}", ""]
+    return "\n".join(lines)
 
 
 def update_manifest(yml_path: str) -> bool:
@@ -765,6 +788,7 @@ def report_markdown(r: RetargetResult) -> str:
          f"| Funciones deducidas por sus vecinas | {r.count('vecinos')} |",
          f"| Parches revisados a mano aplicados | {r.count('parche')} |",
          f"| **Parches que no se pudieron aplicar** | {r.count('parche_fallido')} |",
+         f"| Funciones de otros juegos sin equivalente (stub en {MISSING_FILE}) | {r.count('ausente')} |",
          f"| **Direcciones sin resolver (revisar a mano)** | {r.count('sin_resolver')} |", ""]
     g = r.game
     if g is not None:
@@ -787,6 +811,13 @@ def report_markdown(r: RetargetResult) -> str:
     if by["parche_fallido"]:
         L += ["## Parches no aplicados", "", "| Archivo | Parche | Motivo |", "|---|---|---|"]
         L += [f"| {c.file} | {c.name} | {c.text} |" for c in by["parche_fallido"]]
+        L.append("")
+    if by["ausente"]:
+        L += ["## Funciones de otros juegos sin equivalente", "",
+              "Se renombraron a `choya_ausente_XXXXXXXX` para que no se enlacen con otra función de Wii Sports.", "",
+              "| Archivo:línea | Dirección | En otros juegos | Código |", "|---|---|---|---|"]
+        for c in sorted(by["ausente"], key=lambda c: (c.file, c.line)):
+            L.append(f"| {c.file}:{c.line} | {c.old:08X} | {c.name} | `{c.text.replace('|', '¦')}` |")
         L.append("")
     files = Counter(c.file for c in by["sin_resolver"])
     if files:
