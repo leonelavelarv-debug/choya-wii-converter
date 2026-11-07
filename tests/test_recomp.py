@@ -355,6 +355,23 @@ class TestChoyaNatives(unittest.TestCase):
 
 
 class TestEdits(unittest.TestCase):
+    def test_aurora_offscreen(self):
+        import os, shutil, tempfile
+        from choya import retarget as R
+        real = "/home/claude/ext/brawlrecomp/wiicompiled/aurora-main/lib/dawn/BackendBinding.cpp"
+        if not os.path.exists(real):
+            self.skipTest("sin aurora")
+        with tempfile.TemporaryDirectory() as d:
+            dst = os.path.join(d, "aurora-main/lib/dawn")
+            os.makedirs(dst)
+            shutil.copy(real, dst)
+            for _ in range(2):  # la segunda vez no debe duplicar nada
+                changes = []
+                R.patch_aurora(d, changes)
+                self.assertEqual([c.kind for c in changes], ["edicion"])
+            text = open(os.path.join(dst, "BackendBinding.cpp")).read()
+            self.assertEqual(text.count("choyaDisplay;"), 1)
+
     def test_save_states_arm(self):
         from choya import retarget as R
         real = "/home/claude/ext/brawlrecomp/wiicompiled/runtime/src/save_states.cpp"

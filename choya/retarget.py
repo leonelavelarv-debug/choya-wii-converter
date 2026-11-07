@@ -841,6 +841,53 @@ EDITS = [
 ]
 
 
+# Cambios en aurora-main (fuera del runtime): se aplican en su lugar y solo una vez (llevan "choya:").
+# Sin X11 ni Wayland en KNULLI, SDL abre la ventana "offscreen", que Dawn no sabe usar. Para el backend Null basta una
+# superficie Wayland ficticia: Dawn solo revisa que los punteros no sean nulos y el backend Null nunca los toca.
+# En la PC (x11/wayland) este camino no se usa.
+AURORA_EDITS = [
+    ("lib/dawn/BackendBinding.cpp",
+     "    desc->window = SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);\n"
+     "    return std::move(desc);\n  }\n",
+     "    desc->window = SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);\n"
+     "    return std::move(desc);\n  }\n"
+     "  // choya: ventana offscreen (KNULLI) + backend Null: superficie Wayland ficticia que Dawn Null no usa.\n"
+     "  if (SDL_strcmp(driver, \"offscreen\") == 0 &&\n"
+     "      (SDL_GetWindowFlags(window) & (SDL_WINDOW_VULKAN | SDL_WINDOW_OPENGL)) == 0) {\n"
+     "    static char choyaDisplay, choyaSurface;\n"
+     "    std::shared_ptr<wgpu::SurfaceSourceWaylandSurface> desc = std::make_shared<wgpu::SurfaceSourceWaylandSurface>();\n"
+     "    desc->display = &choyaDisplay;\n"
+     "    desc->surface = &choyaSurface;\n"
+     "    return std::move(desc);\n"
+     "  }\n",
+     "superficie ficticia para Dawn Null (ventana offscreen)"),
+]
+
+
+def patch_aurora(wiicompiled: str, changes: list[Change]) -> None:
+    base = os.path.join(wiicompiled, "aurora-main")
+    if not os.path.isdir(base):  # p. ej. un runtime ya compilado como paquete
+        return
+    for rel, old, new, label in AURORA_EDITS:
+        path = os.path.join(base, rel)
+        shown = "aurora-main/" + rel
+        if not os.path.isfile(path):
+            changes.append(Change(shown, 0, "parche_fallido", 0, None, label, "no encontré el archivo"))
+            continue
+        with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
+            text = f.read()
+        if new in text:
+            changes.append(Change(shown, _line_of(text, text.index(new)), "edicion", 0, None, label, label + " (ya estaba)"))
+            continue
+        if text.count(old) != 1:
+            changes.append(Change(shown, 0, "parche_fallido", 0, None, label, "texto no encontrado (¿cambió aurora?)"))
+            continue
+        line = _line_of(text, text.index(old))
+        with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            f.write(text.replace(old, new, 1))
+        changes.append(Change(shown, line, "edicion", 0, None, label, label))
+
+
 def apply_edits(text: str, rel: str, changes: list[Change]) -> str:
     for file, old, new, label in EDITS:
         if file != rel:
@@ -906,6 +953,7 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
     res.sda = {"r13": game.sda, "r2": game.sda2}
     result.game = game
     result.structs = struct_checks(res.ws)
+    patch_aurora(wiicompiled, result.changes)
     # Cambios de código fuera de src/ e include/ (CMake).
     for rel in sorted({e[0] for e in EDITS if not e[0].startswith(("src/", "include/"))}):
         path = os.path.join(out, rel)
