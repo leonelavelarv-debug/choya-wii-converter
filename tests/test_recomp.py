@@ -358,19 +358,21 @@ class TestEdits(unittest.TestCase):
     def test_aurora_offscreen(self):
         import os, shutil, tempfile
         from choya import retarget as R
-        real = "/home/claude/ext/brawlrecomp/wiicompiled/aurora-main/lib/dawn/BackendBinding.cpp"
+        real = "/home/claude/ext/brawlrecomp/wiicompiled/aurora-main"
         if not os.path.exists(real):
             self.skipTest("sin aurora")
         with tempfile.TemporaryDirectory() as d:
-            dst = os.path.join(d, "aurora-main/lib/dawn")
-            os.makedirs(dst)
-            shutil.copy(real, dst)
+            for rel in ("lib/dawn/BackendBinding.cpp", "lib/webgpu/gpu.cpp"):
+                os.makedirs(os.path.dirname(os.path.join(d, "aurora-main", rel)), exist_ok=True)
+                shutil.copy(os.path.join(real, rel), os.path.join(d, "aurora-main", rel))
             for _ in range(2):  # la segunda vez no debe duplicar nada
                 changes = []
                 R.patch_aurora(d, changes)
-                self.assertEqual([c.kind for c in changes], ["edicion"])
-            text = open(os.path.join(dst, "BackendBinding.cpp")).read()
+                self.assertEqual([c.kind for c in changes], ["edicion"] * len(R.AURORA_EDITS))
+            text = open(os.path.join(d, "aurora-main/lib/dawn/BackendBinding.cpp")).read()
             self.assertEqual(text.count("choyaDisplay;"), 1)
+            gpu = open(os.path.join(d, "aurora-main/lib/webgpu/gpu.cpp")).read()
+            self.assertEqual(gpu.count("Null solo admite RenderAttachment"), 1)
 
     def test_save_states_arm(self):
         from choya import retarget as R

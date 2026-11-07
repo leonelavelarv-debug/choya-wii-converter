@@ -861,6 +861,14 @@ AURORA_EDITS = [
      "    return std::move(desc);\n"
      "  }\n",
      "superficie ficticia para Dawn Null (ventana offscreen)"),
+    # La superficie del backend Null solo admite RenderAttachment: con CopySrc la configuración falla y aurora
+    # intenta "recuperar" la superficie en cada cuadro.
+    ("lib/webgpu/gpu.cpp",
+     "              .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,\n",
+     "              .usage = g_backendType == wgpu::BackendType::Null  // choya: Null solo admite RenderAttachment\n"
+     "                           ? wgpu::TextureUsage::RenderAttachment\n"
+     "                           : wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,\n",
+     "superficie Null sin CopySrc"),
 ]
 
 

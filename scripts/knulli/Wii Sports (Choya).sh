@@ -28,10 +28,37 @@ export SDL_AUDIO_DRIVER=alsa
 export NSMBW_LOG_FPS=1
 export WIICOMPILED_NO_POPUP=1
 
-timeout 90 ./WiiCompiled > "$DIR/run.log" 2>&1
+CPUF=/sys/devices/system/cpu/cpu0/cpufreq
+{
+  echo "--- procesador"
+  echo "gobernador: $(cat $CPUF/scaling_governor 2>/dev/null)  MHz actual/max: $(( $(cat $CPUF/scaling_cur_freq 2>/dev/null || echo 0) / 1000 ))/$(( $(cat $CPUF/cpuinfo_max_freq 2>/dev/null || echo 0) / 1000 ))"
+} > "$DIR/cpu.txt" 2>&1
+
+timeout 90 ./WiiCompiled > "$DIR/run.log" 2>&1 &
+TPID=$!
+# A los 60 s: cuánto procesador gastó cada hilo (100 ticks = 1 s) y a qué frecuencia iba el procesador.
+sleep 60
+PID=""
+for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = "WiiCompiled" ] && PID="${p#/proc/}"; done
+{
+  echo "MHz a los 60 s: $(( $(cat $CPUF/scaling_cur_freq 2>/dev/null || echo 0) / 1000 ))"
+  echo "--- hilos (ticks de CPU en 60 s; 6000 = un nucleo al 100%)"
+  if [ -n "$PID" ]; then
+    for t in /proc/$PID/task/*; do
+      s=$(cat "$t/stat" 2>/dev/null) || continue
+      set -- ${s##*) }
+      echo "$(( ${12} + ${13} )) $(cat "$t/comm" 2>/dev/null)"
+    done | sort -nr | head -12
+    echo "memoria: $(grep -E 'VmRSS' /proc/$PID/status 2>/dev/null)"
+  else
+    echo "WiiCompiled ya no estaba corriendo"
+  fi
+} >> "$DIR/cpu.txt" 2>&1
+wait $TPID
 STATUS=$?
 {
   echo "codigo de salida: $STATUS (124 = siguio corriendo hasta el limite de 90 s)"
+  cat "$DIR/cpu.txt"
   echo "--- cuadros por segundo"
   grep -E "\[vi\] fps" "$DIR/run.log" | tail -15
   echo "--- errores"
