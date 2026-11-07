@@ -214,3 +214,84 @@ void f() { Memory::Write32(0x804DE6E4, 0); InvokeIndirectCpu(0x801E9A2Cu, c); } 
         self.assertEqual(s.get("GXInit"), 0x800DB234)
         self.assertEqual(s.get("FifoObj"), 0x80412E50)
         self.assertNotIn("pad_00_80004188_init", s.funcs)
+
+
+class TestRetargetWiiSports(unittest.TestCase):
+    """Parches revisados a mano, desfases SDA y funciones deducidas por sus vecinas."""
+    SYMS = "\n".join([
+        "OSGetCurrentContext = .text:0x800EE974; // type:function size:0x10 scope:global",
+        "OSSaveContext = .text:0x800EE9DC; // type:function size:0x80 scope:global",
+        "OSLoadContext = .text:0x800EEA5C; // type:function size:0x100 scope:global",
+        "OSInitContext = .text:0x800EEBC0; // type:function size:0x100 scope:global",
+        "GXCPInterruptHandler = .text:0x800DC048; // type:function size:0x160 scope:global",
+        "AlarmQueue = .sbss:0x804BEF50; // type:object size:0x8 scope:local",
+        "PowerCallback = .sbss:0x804BEFD8; // type:object size:0x4 scope:local",
+        "axDspSlaveLength = .sdata:0x804BD8A4; // type:object size:0x2 scope:global",
+        "DefaultThread = .bss:0x804201F8; // type:object size:0x318 scope:local",
+    ]) + "\n"
+    FILES = {
+        "include/system_bridge.h": "inline constexpr uint32_t kDefaultEntryAddress = 0x8000403Cu;\n",
+        "src/system_bridge.cpp": (
+            "    constexpr uint32_t kMem1ArenaLoDefault = 0x805B5160u;\n"
+            "    uint32_t mem1ArenaHiDefault = 0x817DA5A0u;  // MEM1 end - Brawl FST\n"
+            '    entries.push_back({0x80000000u, 0x52534245u, "Disc game code"}); // SMNE\n'),
+        "src/hle/gx/gx_init.cpp": "    constexpr uint32_t kCpInterruptHandlerAddr = 0x801ee720u;\n",
+        "src/hle/os/os_internal.h": "constexpr uint32_t kAlarmQueueOffsetFromR13 = 0x3DA8u;   // SPM AlarmQueue = 0x8056DB30\n",
+        "src/hle/os/os_misc.cpp": (
+            "PPC_NATIVE_OVERRIDE_VOID(801D7FCC, OSGetCurrentContext_801a0000, (), ());\n"   # dos vecinas con el
+            "PPC_NATIVE_OVERRIDE_VOID(801D80B4, OSLoadContext_801a0100, (), ());\n"         # mismo desfase
+            "extern \"C\" void func_801D8034(CpuContext* ctx);\n"
+            "const uint32_t a = r13 - 0x3d00u;    // PowerCallback (SPM)\n"
+            "Memory::Write32(ctx->gpr[13] - 0x3d00u, 0);\n"
+            "Memory::Read16(r13 - 0x5904u) /* axDspSlaveLength */;\n"),
+    }
+
+    def build(self, t):
+        for rel, body in self.FILES.items():
+            path = os.path.join(t, "wc", "runtime", rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", newline="\n") as f:
+                f.write(body)
+        sym = os.path.join(t, "symbols.txt")
+        with open(sym, "w") as f:
+            f.write(self.SYMS)
+        sysd = os.path.join(t, "disco", "sys")
+        os.makedirs(sysd)
+        init = [fx.ppc_lis(1, 0x804D), fx.ppc_ori(1, 1, 0x9C10),       # pila 0x804D9C10 → arena 0x804D9C20
+                fx.ppc_lis(2, 0x804C), fx.ppc_ori(2, 2, 0x7A20),
+                fx.ppc_lis(13, 0x804C), fx.ppc_ori(13, 13, 0x5380)]
+        with open(os.path.join(sysd, "main.dol"), "wb") as f:
+            f.write(boot_dol(init))
+        with open(os.path.join(sysd, "boot.bin"), "wb") as f:
+            f.write(b"RSPE01\x00\x01" + bytes(0x438))
+        with open(os.path.join(sysd, "fst.bin"), "wb") as f:
+            f.write(bytes(0x1A2B4))
+        recomp.prep(os.path.join(t, "disco"), os.path.join(t, "wc"), simbolos=sym)
+        return sym
+
+    def test_wiisports_layer(self):
+        from choya import retarget as R
+        with tempfile.TemporaryDirectory() as t:
+            sym = self.build(t)
+            r = R.retarget(os.path.join(t, "wc"), simbolos=sym)
+            out = lambda rel: open(os.path.join(t, "wc", "runtime-wiisports", rel)).read()
+            self.assertIn("kDefaultEntryAddress = 0x80006124u;  // choya:", out("include/system_bridge.h"))
+            sb = out("src/system_bridge.cpp")
+            self.assertIn("kMem1ArenaLoDefault = 0x804D9C20u", sb)
+            self.assertIn("mem1ArenaHiDefault = 0x817E5D40u", sb)             # 0x81800000 - align32(0x1A2B4)
+            self.assertIn("{0x80000000u, 0x52535045u", sb)                    # "RSPE"
+            self.assertIn("kCpInterruptHandlerAddr = 0x800dc048u", out("src/hle/gx/gx_init.cpp"))
+            # r13 = 0x804C5380: AlarmQueue 0x804BEF50 → 0x6430, PowerCallback → 0x63A8, axDspSlaveLength → 0x7ADC
+            self.assertIn("kAlarmQueueOffsetFromR13 = 0x6430u", out("src/hle/os/os_internal.h"))
+            misc = out("src/hle/os/os_misc.cpp")
+            self.assertIn("r13 - 0x63a8u;    // PowerCallback", misc)
+            self.assertIn("gpr[13] - 0x63a8u, 0)", misc)                      # mismo desfase sin comentario
+            self.assertIn("r13 - 0x7adcu) /* axDspSlaveLength */", misc)
+            self.assertIn("func_800EE9DC", misc)                               # vecinos → OSSaveContext
+            failed = {c.name for c in r.changes if c.kind == "parche_fallido"}
+            # solo fallan los parches cuyo código no está en estos archivos de prueba
+            self.assertEqual(failed, {"fabricante y revision (boot.bin)", "ID del juego para OSGetAppGamename",
+                                      "GXTokenInterruptHandler", "__savedGXdata", "OldCPUFifo"})
+            self.assertEqual(r.count("vecinos"), 1)
+            self.assertEqual(r.count("sda"), 4)
+            self.assertIn("✓", R.report_markdown(r))

@@ -129,6 +129,20 @@ def cmd_recomp_native(a):
     print(f"Repetidas desactivadas:     {r.count('duplicado')}")
     print(f"Llamadas movidas:           {r.count('funcion')}")
     print(f"Variables movidas:          {r.count('dato')}")
+    print(f"Desfases SDA movidos:       {r.count('sda')}")
+    print(f"Deducidas por vecinas:      {r.count('vecinos')}")
+    print(f"Parches revisados a mano:   {r.count('parche')}")
+    bad = [c for c in r.changes if c.kind == "parche_fallido"]
+    for c in bad:
+        print(f"AVISO: parche no aplicado: {c.name} ({c.file}): {c.text}")
+    g = r.game
+    if g is not None and g.entry is not None:
+        lo, hi = g.arena_lo, g.arena_hi
+        print(f"Entrada {g.entry:08X} · SDA {g.sda or 0:08X}/{g.sda2 or 0:08X} · MEM1 arena "
+              f"{'?' if lo is None else f'{lo:08X}'}-{'?' if hi is None else f'{hi:08X}'}")
+    wrong = [s for s in r.structs if s[2] != s[1]]
+    print("Estructuras del SDK: " + ("iguales a las que espera el runtime" if not wrong else
+                                     "REVISAR " + ", ".join(s[0] for s in wrong)))
     print(f"Sin resolver (a mano):      {r.count('sin_resolver')}")
     print(f"Informe:                    {rep}")
     if os.path.isfile(yml) and retarget.update_manifest(yml):

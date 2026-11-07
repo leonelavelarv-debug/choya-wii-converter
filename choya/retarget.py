@@ -39,6 +39,12 @@ _FUNC_REF = re.compile(r"\bfunc_(?P<addr>8[0-9A-Fa-f]{7})\b")
 _HEX = re.compile(r"\b0x(?P<addr>8[01][0-9A-Fa-f]{6})(?P<suf>[uU]?)\b")
 # Referencia en un comentario: "Nombre", "Nombre + 0x14", "Nombre.Campo" o "Nombre's" (dentro de una función)
 _CREF = re.compile(r"^\s*(?P<name>[A-Za-z_]\w*)(?:(?P<poss>'s)|\s*\+\s*0x(?P<off>[0-9A-Fa-f]+)|\.(?P<field>[A-Za-z_]\w*))?")
+# Etiquetas de juego que preceden al nombre en los comentarios: "// SPM AlarmQueue", "// (NSMBW) FifoObj"
+_TAGS = re.compile(r"^(?:\s*(?:(?:SPM|NSMBW|MKW|Brawl|BRAWL|RSBE01|SMNE01|R8PE01|RMCP01)\b|[(),:]))*")
+# Desplazamientos desde las bases SDA: "r13 - 0x3d00u", "ctx->gpr[13] - 0x6F24u", "RuntimeConfig::SDA1_BASE - k"
+_SDA_EXPR = re.compile(r"(?P<reg>\br13\b|gpr\[13\]|SDA1_BASE|\br2\b|gpr\[2\]|SDA2_BASE)\s*-\s*0x(?P<off>[0-9A-Fa-f]+)(?P<suf>[uU]?)")
+_SDA_CONST = re.compile(r"\b(?P<name>k\w*FromR13)\s*=\s*0x(?P<off>[0-9A-Fa-f]+)(?P<suf>[uU]?)")
+_INLINE_COMMENT = re.compile(r"^[)\s]*/\*\s*([A-Za-z_]\w*)\s*\*/")
 _GENERIC = re.compile(r"^(?:fn|func|sub|lbl|FUN|zz|gap|jumptable|switch)_[0-9A-Fa-f]")
 _SOURCE_EXT = (".cpp", ".h", ".hpp", ".inc", ".c")
 _CATALOG = "MKW_KNOWN_TYPED_NATIVE"   # catálogo de llamadas tipadas: se mueve pero no registra
@@ -200,6 +206,8 @@ class RetargetResult:
     out_dir: str
     source_game: str | None
     changes: list[Change] = field(default_factory=list)
+    game: "GameInfo | None" = None
+    structs: list = field(default_factory=list)
 
     def count(self, kind: str) -> int:
         return sum(1 for c in self.changes if c.kind == kind)
@@ -210,13 +218,38 @@ class _Resolver:
         self.ws = ws
         self.maps = list(maps.values())
         self.moved: dict[int, tuple[str, int]] = {}    # dirección vieja → (nombre, nueva), de los registros
+        self._pairs: list[tuple[int, int]] = []
+        self.func_at: dict[int, str] = {}
+        self.sda: dict[str, int | None] = {"r13": None, "r2": None}
+        self.sda_seen: dict[tuple, str] = {}
         self.anchors: dict[str, int] = {}               # símbolo → dirección vieja, de los comentarios de todo el runtime
+
+    def neighbors(self, addr: int) -> tuple[str, int] | None:
+        """Dirección sin nombre entre dos funciones nativas ya movidas con el mismo desfase: si al
+        aplicar ese desfase cae justo en el inicio de una función de Wii Sports, es esa función
+        (el SDK se enlaza en el mismo orden en todos los juegos)."""
+        import bisect
+        pairs = self._pairs
+        i = bisect.bisect_left(pairs, (addr, 0))
+        if i == 0 or i >= len(pairs) or pairs[i][0] == addr:
+            return None
+        (lo_old, lo_new), (hi_old, hi_new) = pairs[i - 1], pairs[i]
+        delta = lo_old - lo_new
+        if delta != hi_old - hi_new:
+            return None
+        name = self.func_at.get(addr - delta)
+        return (name, addr - delta) if name else None
+
+    def set_moved(self, moved: dict[int, tuple[str, int]]) -> None:
+        self.moved = moved
+        self._pairs = sorted((old, new) for old, (_n, new) in moved.items())
+        self.func_at = {a: n for n, a in self.ws.funcs.items() if n not in self.ws.ambiguous}
 
     def function(self, addr: int, symbol: str = "", comment: str = "") -> tuple[str, int] | None:
         """El nombre del símbolo manda (lo puso quien escribió la función nativa); después el
         comentario de la línea; al final los mapas de los otros juegos."""
         cands = base_names(symbol) if symbol else []
-        m = _CREF.match(comment)
+        m = _CREF.match(_strip_tags(comment))
         if m and not (m.group("poss") or m.group("off") or m.group("field")):
             cands.append(m.group("name"))
         cands += [mp[addr] for mp in self.maps if addr in mp]
@@ -227,8 +260,12 @@ class _Resolver:
         return None
 
 
+def _strip_tags(comment: str) -> str:
+    return comment[_TAGS.match(comment).end():] if comment else comment
+
+
 def _comment_ref(comment: str):
-    m = _CREF.match(comment)
+    m = _CREF.match(_strip_tags(comment))
     if not m:
         return None
     if m.group("poss"):
@@ -291,6 +328,9 @@ def _resolve_literal(old: int, comment: str, single: bool, anchors: dict[str, in
     if len(hits) == 1:
         name, new, off = hits[0]
         return "dato", name if off == 0 else f"{name}+0x{off:X}", new
+    near = res.neighbors(old)
+    if near:
+        return "vecinos", near[0], near[1]
     return None
 
 
@@ -340,16 +380,21 @@ def retarget_text(text: str, rel: str, res: _Resolver, registered: dict[int, str
     anchors = _anchors(lines, dead)
     for i, raw in enumerate(lines, 1):
         s = raw.strip()
-        if i in dead or s.startswith(("//", "*", "/*", "#")) or _STATEMENTS.search(raw):
+        if i in dead or s.startswith(("//", "*", "/*", "#")) or _STATEMENTS.search(raw) or "choya:" in raw:
             continue
         code, sep, comment = raw.partition("//")
+        code = _sda_line(code, comment, rel, i, s, res, changes)
         lits = _literals(code)
 
         def sub_func(m, i=i, s=s):
             old = int(m.group("addr"), 16)
-            if old in res.moved:
-                name, new = res.moved[old]
-                changes.append(Change(rel, i, "funcion", old, new, name, s[:140]))
+            hit = res.moved.get(old)
+            kind = "funcion"
+            if hit is None:
+                hit, kind = res.neighbors(old), "vecinos"
+            if hit:
+                name, new = hit
+                changes.append(Change(rel, i, kind, old, new, name, s[:140]))
                 return "func_" + _fmt(m.group("addr"), new)
             changes.append(Change(rel, i, "sin_resolver", old, None, _suggest(old, res), s[:140]))
             return m.group(0)
@@ -369,6 +414,47 @@ def retarget_text(text: str, rel: str, res: _Resolver, registered: dict[int, str
         new_code = _HEX.sub(sub_hex, _FUNC_REF.sub(sub_func, code))
         lines[i - 1] = new_code + sep + comment
     return "\n".join(lines)
+
+
+def _sda_line(code: str, comment: str, rel: str, i: int, s: str, res: _Resolver, changes: list[Change]) -> str:
+    """Reescribe `r13 - 0xNNNN` (y r2) con el desfase de Wii Sports para la variable que nombra
+    el comentario. Sin nombre seguro se deja igual y se anota."""
+    def name_for(after: str) -> str | None:
+        m = _INLINE_COMMENT.match(after)
+        if m:
+            return m.group(1)
+        ref = _comment_ref(comment)
+        return ref[0] if ref and ref[1] == "off" and ref[2] == 0 else None
+
+    def rewrite(m, reg_key: str, single: bool):
+        old_off = int(m.group("off"), 16)
+        base = res.sda[reg_key]
+        name = name_for(code[m.end():]) if single or _INLINE_COMMENT.match(code[m.end():]) else None
+        if name is None:
+            name = res.sda_seen.get((rel, reg_key, old_off))     # mismo desfase ya nombrado antes en el archivo
+        addr = res.ws.get(name) if name else None
+        if base is None or addr is None or not (0 < base - addr < 0x10000):
+            changes.append(Change(rel, i, "sin_resolver", old_off, None,
+                                  f"SDA {reg_key}-0x{old_off:X} {name or ''}".strip(), s[:140]))
+            return m.group(0)
+        new_off = base - addr
+        res.sda_seen[(rel, reg_key, old_off)] = name
+        changes.append(Change(rel, i, "sda", old_off, new_off, f"{name} ({reg_key}-0x{new_off:X})", s[:140]))
+        hexed = f"{new_off:X}" if any(c in "ABCDEF" for c in m.group("off")) else f"{new_off:x}"
+        return m.group(0)[:m.start("off") - m.start()] + hexed + m.group("suf")
+
+    exprs = list(_SDA_EXPR.finditer(code))
+    consts = list(_SDA_CONST.finditer(code))
+    single = len(exprs) + len(consts) == 1
+    out, pos = [], 0
+    for m in sorted(exprs + consts, key=lambda m: m.start()):
+        reg = m.groupdict().get("reg") or "r13"
+        key = "r2" if ("2]" in reg or reg in ("r2", "SDA2_BASE")) else "r13"
+        out.append(code[pos:m.start()])
+        out.append(rewrite(m, key, single))
+        pos = m.end()
+    out.append(code[pos:])
+    return "".join(out)
 
 
 def _suggest(old: int, res: _Resolver) -> str:
@@ -400,7 +486,7 @@ def _collect_moves(root: str, res: _Resolver) -> None:
                 hit = res.function(old, m.group("sym") or "", trailing[2:] if trailing.startswith("//") else "")
                 if hit:
                     seen[old].add(hit)
-    res.moved = {old: next(iter(h)) for old, h in seen.items() if len(h) == 1}
+    res.set_moved({old: next(iter(h)) for old, h in seen.items() if len(h) == 1})
     res.anchors = {n: next(iter(b)) for n, b in bases.items() if len(b) == 1 and res.ws.get(n) is not None}
 
 
@@ -412,6 +498,195 @@ def detect_source_games(runtime: str, maps: dict[str, dict[int, str]]) -> list[s
                 a = int(m.group("addr"), 16)
                 votes.update(g for g, mp in maps.items() if a in mp)
     return [g for g, _ in votes.most_common()]
+
+
+# --- datos del juego y parches revisados a mano ----------------------------------------
+
+@dataclass
+class GameInfo:
+    """Lo que Choya sabe de tu disco: sale de recomp.yml, main.dol, boot.bin y fst.bin."""
+    dol_path: str | None = None
+    entry: int | None = None
+    stack: int | None = None
+    sda: int | None = None
+    sda2: int | None = None
+    game_code: int | None = None      # boot.bin[0:4], p. ej. "RSPE"
+    maker_word: int | None = None     # boot.bin[4:8]: fabricante, número de disco, revisión
+    fst_size: int | None = None
+    dol: object = None                # choya.dol.Dol, para buscar tablas en los datos del juego
+
+    def find(self, pattern: bytes) -> int | None:
+        """Dirección de `pattern` en las secciones de datos del main.dol, solo si aparece una vez."""
+        if self.dol is None:
+            return None
+        hits = []
+        for s in self.dol.sections:
+            if s.kind != "data":
+                continue
+            blob = self.dol.data[s.offset:s.offset + s.size]
+            i = blob.find(pattern)
+            while i >= 0:
+                hits.append(s.address + i)
+                i = blob.find(pattern, i + 1)
+        return hits[0] if len(hits) == 1 else None
+
+    @property
+    def arena_lo(self) -> int | None:
+        # Consola retail sin depurador: OSInit usa el fin de la pila de arranque (_db_stack_end = _stack_addr),
+        # redondeado a 32. Es lo mismo que WiiCompiled hace para Brawl (0x805B5150 → 0x805B5160).
+        return None if self.stack is None else (self.stack + 31) & ~31
+
+    @property
+    def arena_hi(self) -> int | None:
+        # El apploader deja la FST al final de MEM1 y el arena termina justo debajo.
+        return None if self.fst_size is None else 0x81800000 - ((self.fst_size + 31) & ~31)
+
+
+def read_game_info(wiicompiled: str) -> GameInfo:
+    import struct
+    from . import dol as doltools
+    g = GameInfo()
+    yml = os.path.join(wiicompiled, "projects", "wiisports", "recomp.yml")
+    if not os.path.isfile(yml):
+        return g
+    with open(yml, encoding="utf-8") as f:
+        text = f.read()
+    m = re.search(r"^\s*sda_base:\s*0x([0-9A-Fa-f]+)", text, re.M)
+    g.sda = int(m.group(1), 16) if m else None
+    m = re.search(r"^\s*sda2_base:\s*0x([0-9A-Fa-f]+)", text, re.M)
+    g.sda2 = int(m.group(1), 16) if m else None
+    m = re.search(r"^\s*dol:\s*\n\s*path:\s*\"?([^\"\n]+)\"?", text, re.M)
+    if m and os.path.isfile(m.group(1).strip()):
+        g.dol_path = m.group(1).strip()
+        with open(g.dol_path, "rb") as f:
+            d = doltools.read_dol(f.read())
+        b = doltools.boot_info(d)
+        g.entry, g.stack, g.dol = b.entry, b.stack, d
+        sysd = os.path.dirname(g.dol_path)
+        boot = os.path.join(sysd, "boot.bin")
+        if os.path.isfile(boot):
+            with open(boot, "rb") as f:
+                g.game_code, g.maker_word = struct.unpack(">II", f.read(8))
+        fst = os.path.join(sysd, "fst.bin")
+        if os.path.isfile(fst):
+            g.fst_size = os.path.getsize(fst)
+    return g
+
+
+@dataclass
+class Patch:
+    file: str
+    pattern: str          # el grupo "v" es el número hexadecimal que se cambia
+    value: object         # función (Symbols, GameInfo) -> int | None
+    label: str
+
+
+def _sym(name: str, off: int = 0):
+    return lambda ws, g: None if ws.get(name) is None else ws.get(name) + off
+
+
+_H = r"(?P<v>[0-9A-Fa-f]{8})"
+
+# Revisados uno por uno contra ogws. Si WiiCompiled cambia y un patrón ya no aparece, se anota
+# como "parche no aplicado" en vez de adivinar.
+PATCHES = [
+    Patch("include/system_bridge.h", r"kDefaultEntryAddress\s*=\s*0x" + _H, lambda ws, g: g.entry,
+          "entrada (__start) de Wii Sports"),
+    Patch("src/system_bridge.cpp", r"kMem1ArenaLoDefault\s*=\s*0x" + _H, lambda ws, g: g.arena_lo,
+          "MEM1 arena lo: fin de la pila de arranque"),
+    Patch("src/system_bridge.cpp", r"mem1ArenaHiDefault\s*=\s*0x" + _H, lambda ws, g: g.arena_hi,
+          "MEM1 arena hi: fin de MEM1 menos la FST"),
+    Patch("src/system_bridge.cpp", r"\{0x80000000u,\s*0x" + _H + r"u,\s*\"Disc game code\"",
+          lambda ws, g: g.game_code, "ID del disco (boot.bin)"),
+    Patch("src/system_bridge.cpp", r"\{0x80000004u,\s*0x" + _H + r"u,\s*\"Disc maker",
+          lambda ws, g: g.maker_word, "fabricante y revision (boot.bin)"),
+    Patch("src/system_bridge.cpp", r"\{0x80003194u,\s*0x" + _H + r"u,\s*\"OS app game code\"",
+          lambda ws, g: g.game_code, "ID del juego para OSGetAppGamename"),
+    Patch("src/system_bridge.cpp", r"\{0x80003194u,\s*0x" + _H + r"u,\s*\"OS app gamename\"",
+          lambda ws, g: g.game_code, "ID del juego para OSGetAppGamename"),
+    Patch("src/hle/gx/gx_init.cpp", r"kCpInterruptHandlerAddr\s*=\s*0x" + _H, _sym("GXCPInterruptHandler"),
+          "GXCPInterruptHandler"),
+    Patch("src/hle/gx/gx_init.cpp", r"kPeTokenHandlerAddr\s*=\s*0x" + _H, _sym("GXTokenInterruptHandler"),
+          "GXTokenInterruptHandler"),
+    Patch("src/hle/gx/gx_stubs.cpp", r"kGxDrawDoneCallbackAddr\s*=\s*0x" + _H, _sym("DrawDoneCB"), "DrawDoneCB"),
+    Patch("src/hle/audio/ax_internal.h", r"kAxDspTaskAddr\s*=\s*0x" + _H, _sym("__AXDSPTask"), "__AXDSPTask"),
+    Patch("src/hle/audio/ax_internal.h", r"kAxInitCallback\s*=\s*0x" + _H, _sym("__AXDSPInitCallback"),
+          "__AXDSPInitCallback"),
+    Patch("src/hle/audio/ax_internal.h", r"kAxResumeCallback\s*=\s*0x" + _H, _sym("__AXDSPResumeCallback"),
+          "__AXDSPResumeCallback"),
+    Patch("src/hle/os/os_interrupt.cpp", r"kDefaultCallbackAddr\s*=\s*0x" + _H, _sym("__OSDefaultPowerCallback"),
+          "__OSDefaultPowerCallback"),
+    Patch("src/hle/os/os_interrupt.cpp", r"InvokeIndirectCpu\(0x(?P<v>80211A2C)u", _sym("IPCInit"), "IPCInit"),
+    Patch("src/hle/os/os_thread.cpp", r"kSchedulerInitFlagAddr\s*=\s*0x" + _H, _sym("__OSErrorTable", 0x40),
+          "__OSErrorTable[OS_ERROR_FPE]"),
+    Patch("src/hle/storage/dvd.cpp", r"kDvdFsInitAddress\s*=\s*0x" + _H, _sym("__DVDFSInit"), "__DVDFSInit"),
+    Patch("src/hle/vi.cpp", r"kViTimingGuardAddr\s*=\s*0x" + _H, _sym("__VIDimming_All_Clear"),
+          "__VIDimming_All_Clear"),
+    Patch("src/hle/storage/nand_api.cpp", r"WriteGuestNandPath\(0x" + _H, _sym("s_homeDir"), "s_homeDir"),
+    Patch("src/hle/storage/nand_api.cpp", r"Memory::Write32\(0x(?P<v>805A0BA8), 2\)", _sym("s_libState"),
+          "s_libState"),
+    Patch("src/hle/os/os_alarm.cpp", r"func_(?P<v>801D66A8)\b", _sym("InsertAlarm"), "InsertAlarm"),
+    Patch("src/hle/os/os_init.cpp", r"func_(?P<v>801E0480)\b", _sym("__OSInitAlarm"), "__OSInitAlarm"),
+    # Copia de gxData y FIFO guardada durante una display list (GXDisplayList.c); mismo orden que NSMBW:
+    # DisplayListFifo, __savedGXdata (+0x80), OldCPUFifo (+0x680).
+    Patch("src/hle/gx/gx_init.cpp", r"0x(?P<v>804DF0B0)\b", _sym("__savedGXdata"), "__savedGXdata"),
+    Patch("src/hle/gx/gx_init.cpp", r"0x(?P<v>804DF6B0)\b", _sym("OldCPUFifo"), "OldCPUFifo"),
+    # Tablas de SC {código, "JPN"...}: se buscan en los datos de tu main.dol.
+    Patch("src/hle/sc.cpp", r"LookupProductRegion\(0x(?P<v>8047C4E0)u, 5, 13",
+          lambda ws, g: g.find(b"\x00JPN\x00\x01USA\x00\x02EUR\x00"), "tabla de áreas de SC"),
+    Patch("src/hle/sc.cpp", r"LookupProductRegion\(0x(?P<v>8047FAB0)u, 4, 4",
+          lambda ws, g: g.find(b"\x00JP\x00\x01US\x00\x02EU\x00"), "tabla de regiones de SC"),
+    # Wii Sports no tiene btm_cb con ese nombre; con 0 la escritura cae fuera de la memoria y se ignora.
+    Patch("src/hle/os/os_init.cpp", r"kBtmCbBase\s*=\s*0x" + _H, lambda ws, g: 0, "sin btm_cb: escritura omitida"),
+]
+
+
+# Tamaños que el runtime da por hechos, comparados con los objetos de Wii Sports en ogws.
+STRUCT_CHECKS = [
+    ("DefaultThread", 0x318, "OSThread (estado en +0x2C8, cola en +0x2DC)"),
+    ("IdleContext", 0x2C8, "OSContext"),
+    ("gxData", 0x600, "GXData (copia de 0x600 bytes)"),
+    ("__savedGXdata", 0x600, "GXData guardado en display lists"),
+    ("FifoObj", 0x80, "GXFifoObj"),
+    ("DisplayListFifo", 0x80, "GXFifoObj de display lists"),
+    ("CPUFifo", 0x24, "kFifoObjSize = 0x24"),
+    ("GPFifo", 0x24, "kFifoObjSize = 0x24"),
+    ("__OSErrorTable", 0x44, "17 manejadores; FPE en +0x40"),
+]
+
+
+def struct_checks(ws: Symbols) -> list[tuple[str, int, int | None, str]]:
+    out = []
+    for name, size, what in STRUCT_CHECKS:
+        a = ws.get(name)
+        out.append((name, size, None if a is None else ws.size.get(a), what))
+    return out
+
+
+def apply_patches(text: str, rel: str, ws: Symbols, game: GameInfo, changes: list[Change]) -> str:
+    for p in PATCHES:
+        if p.file != rel:
+            continue
+        rx = re.compile(p.pattern)
+        found = list(rx.finditer(text))
+        value = p.value(ws, game)
+        if not found or value is None:
+            why = ("patrón no encontrado (¿cambió WiiCompiled?)" if not found else
+                   "no encontré el dato en tu disco" if game.dol is not None else "falta correr recomp-prep")
+            changes.append(Change(rel, 0, "parche_fallido", 0, None, p.label, why))
+            continue
+        for m in reversed(found):
+            old = m.group("v")
+            new = f"{value:08X}" if any(c in "ABCDEF" for c in old) or old.isdigit() else f"{value:08x}"
+            line = _line_of(text, m.start())
+            eol = text.find("\n", m.end())
+            eol = len(text) if eol < 0 else eol
+            tail = text[m.end("v"):eol]
+            marker = "" if "choya:" in tail else ("  // choya: " if "//" not in tail else " · choya: ") + p.label
+            text = text[:m.start("v")] + new + tail + marker + text[eol:]
+            changes.append(Change(rel, line, "parche", int(old, 16), value, p.label, p.label))
+    return text
+
 
 
 def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = False) -> RetargetResult:
@@ -431,6 +706,10 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
     res = _Resolver(load_wiisports_symbols(simbolos), maps)
     games = detect_source_games(src_runtime, maps)
     result = RetargetResult(out, ", ".join(games[:3]) or None)
+    game = read_game_info(wiicompiled)
+    res.sda = {"r13": game.sda, "r2": game.sda2}
+    result.game = game
+    result.structs = struct_checks(res.ws)
     _collect_moves(out, res)
     registered: dict[int, str] = {}
     for sub in ("src", "include"):
@@ -438,7 +717,8 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
             rel = os.path.relpath(path, out).replace("\\", "/")
             with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
                 text = f.read()
-            new = retarget_text(text, rel, res, registered, result.changes)
+            new = apply_patches(text, rel, res.ws, game, result.changes)
+            new = retarget_text(new, rel, res, registered, result.changes)
             if new != text:
                 with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
                     f.write(new)
@@ -473,7 +753,33 @@ def report_markdown(r: RetargetResult) -> str:
          f"| Registros repetidos desactivados | {r.count('duplicado')} |",
          f"| Llamadas a funciones movidas | {r.count('funcion')} |",
          f"| Variables del SDK movidas | {r.count('dato')} |",
+         f"| Variables por desfase SDA (r13/r2) movidas | {r.count('sda')} |",
+         f"| Funciones deducidas por sus vecinas | {r.count('vecinos')} |",
+         f"| Parches revisados a mano aplicados | {r.count('parche')} |",
+         f"| **Parches que no se pudieron aplicar** | {r.count('parche_fallido')} |",
          f"| **Direcciones sin resolver (revisar a mano)** | {r.count('sin_resolver')} |", ""]
+    g = r.game
+    if g is not None:
+        def h(v):
+            return "—" if v is None else f"0x{v:08X}"
+        code = "—"
+        if g.game_code is not None:
+            code = g.game_code.to_bytes(4, "big").decode("ascii", "replace")
+        L += ["## Datos de tu disco", "", "| Dato | Valor |", "|---|---|",
+              f"| Juego | {code} (revisión {'—' if g.maker_word is None else g.maker_word & 0xFF}) |",
+              f"| Entrada (__start) | {h(g.entry)} |", f"| SDA r13 / r2 | {h(g.sda)} / {h(g.sda2)} |",
+              f"| Pila de arranque | {h(g.stack)} |", f"| MEM1 arena | {h(g.arena_lo)} – {h(g.arena_hi)} |",
+              f"| Tamaño de la FST | {'—' if g.fst_size is None else hex(g.fst_size)} |", ""]
+    if r.structs:
+        L += ["## Estructuras del SDK de 2006", "", "| Objeto | El runtime espera | Wii Sports | |", "|---|---|---|---|"]
+        for name, want, got, what in r.structs:
+            ok = "✓" if got == want else "✗ revisar"
+            L.append(f"| {name} ({what}) | 0x{want:X} | {'—' if got is None else f'0x{got:X}'} | {ok} |")
+        L.append("")
+    if by["parche_fallido"]:
+        L += ["## Parches no aplicados", "", "| Archivo | Parche | Motivo |", "|---|---|---|"]
+        L += [f"| {c.file} | {c.name} | {c.text} |" for c in by["parche_fallido"]]
+        L.append("")
     files = Counter(c.file for c in by["sin_resolver"])
     if files:
         L += ["## Sin resolver por archivo", "", "| Archivo | Direcciones |", "|---|---:|"]
@@ -481,8 +787,9 @@ def report_markdown(r: RetargetResult) -> str:
         L += ["", "## Sin resolver", "", "| Archivo:línea | Dirección | En otros juegos | Código |", "|---|---|---|---|"]
         for c in sorted(by["sin_resolver"], key=lambda c: (c.file, c.line)):
             L.append(f"| {c.file}:{c.line} | {c.old:08X} | {c.name} | `{c.text.replace('|', '¦')}` |")
-    for kind, title in (("dato", "Variables movidas"), ("funcion", "Llamadas movidas"),
-                        ("registro", "Funciones nativas movidas")):
+    for kind, title in (("parche", "Parches revisados a mano"), ("sda", "Desfases SDA (nuevo desfase en Wii Sports)"),
+                        ("vecinos", "Funciones deducidas por sus vecinas"), ("dato", "Variables movidas"),
+                        ("funcion", "Llamadas movidas"), ("registro", "Funciones nativas movidas")):
         if by[kind]:
             L += ["", f"## {title}", "", "| Nombre | Antes | Wii Sports | Archivo:línea |", "|---|---|---|---|"]
             for c in sorted(by[kind], key=lambda c: (c.file, c.line)):

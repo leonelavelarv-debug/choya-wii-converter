@@ -171,8 +171,12 @@ El runtime de WiiCompiled tiene ~400 funciones nativas (gráficos, sistema, disc
 2. Busca cada función nativa por su nombre en los símbolos de ogws y le pone la dirección de Wii Sports.
 3. Desactiva con `#if 0` las que Wii Sports no tiene (por ejemplo el control de GameCube) y las repetidas.
 4. Mueve las variables del SDK que el comentario nombra (`// FifoObj`, `// HorVer+0x1C`, `// HorVer.DispSizeX`).
-5. Cambia `recomp.yml` para que el traductor use `runtime-wiisports\src`.
-6. Escribe `projects\wiisports\retarget.md` con todo lo que cambió y lo que no pudo resolver.
+5. Aplica los parches revisados a mano para Wii Sports: entrada `__start`, inicio y fin de la memoria (MEM1 arena, calculados de tu `main.dol` y `fst.bin`), ID del disco (`boot.bin`), manejadores de interrupción de GX, tarea del DSP de sonido, `__DVDFSInit`, tablas de SC (buscadas en tu `main.dol`), etc.
+6. Recalcula los desfases desde r13/r2 (`r13 - 0x3d00 // PowerCallback`) con la base SDA de Wii Sports.
+7. Deduce funciones sin nombre por sus vecinas: si las dos funciones nativas más cercanas se movieron con el mismo desfase y ese desfase cae justo en el inicio de una función de Wii Sports, es esa.
+8. Comprueba que los objetos del SDK de 2006 (`OSThread`, `OSContext`, `GXFifoObj`, `GXData`) miden lo que el runtime espera.
+9. Cambia `recomp.yml` para que el traductor use `runtime-wiisports\src`.
+10. Escribe `projects\wiisports\retarget.md` con todo lo que cambió y lo que no pudo resolver.
 
 Ante la duda no cambia nada: una dirección sin pista segura queda igual y aparece en la lista "Sin resolver" para revisarla a mano.
 
@@ -189,7 +193,7 @@ Little-endian, alineado a 16 bytes: cabecera de 64 bytes, tabla de entradas de 4
 python -m unittest discover tests
 ```
 
-43 pruebas con datos sintéticos (7 necesitan el runtime compilado): Yaz0/LZ77, U8, BRRES, TPL, los 11 formatos GX, ETC2/EAC (calidad y que nunca desborde el modo diferencial), DSP-ADPCM, BRSTM con bloques entrelazados, respaldo por calidad, audio ADPCM con bucle decodificado en C++, modelos MDL0, TEV con la configuración de materiales reales compilado y dibujado en OpenGL ES por software (Mesa llvmpipe) con revisión de píxeles, conversión de punta a punta, una prueba cruzada donde el runtime C++ lee el paquete de Python (claves, caché y audio idénticos), la lectura de `main.dol` y del arranque para WiiCompiled, y el cambio de direcciones del runtime de WiiCompiled.
+44 pruebas con datos sintéticos (7 necesitan el runtime compilado): Yaz0/LZ77, U8, BRRES, TPL, los 11 formatos GX, ETC2/EAC (calidad y que nunca desborde el modo diferencial), DSP-ADPCM, BRSTM con bloques entrelazados, respaldo por calidad, audio ADPCM con bucle decodificado en C++, modelos MDL0, TEV con la configuración de materiales reales compilado y dibujado en OpenGL ES por software (Mesa llvmpipe) con revisión de píxeles, conversión de punta a punta, una prueba cruzada donde el runtime C++ lee el paquete de Python (claves, caché y audio idénticos), la lectura de `main.dol` y del arranque para WiiCompiled, y el cambio de direcciones del runtime de WiiCompiled.
 
 ## Pendiente
 
