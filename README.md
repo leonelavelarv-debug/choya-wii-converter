@@ -178,7 +178,8 @@ El runtime de WiiCompiled tiene ~400 funciones nativas (gráficos, sistema, disc
 9. Cambia `recomp.yml` para que el traductor use `runtime-wiisports\src`.
 10. Renombra las llamadas a funciones de otros juegos que Wii Sports no tiene (`choya_ausente_XXXXXXXX`) y las define en `src/choya_ausentes.cpp`: así enlaza, y si alguna llegara a llamarse el programa se detiene diciendo cuál.
 11. Reactiva las funciones nativas que WiiCompiled apagó solo porque Brawl, SPM o NSMBW no las tenían (`#if 0  // BRAWL: no matching function...`) cuando Wii Sports sí las tiene, como `OSInitFont` o las de NAND y caché.
-12. Escribe `projects\wiisports\retarget.md` con todo lo que cambió y lo que no pudo resolver.
+12. Agrega funciones nativas propias para lo que Wii Sports usa y los juegos de WiiCompiled no (`src/choya_wiisports_hle.cpp`); la primera es `WPADSetSensorBarPower`, que en la consola enciende la barra de sensores por un registro de hardware.
+13. Escribe `projects\wiisports\retarget.md` con todo lo que cambió y lo que no pudo resolver.
 
 Ante la duda no cambia nada: una dirección sin pista segura queda igual y aparece en la lista "Sin resolver" para revisarla a mano.
 

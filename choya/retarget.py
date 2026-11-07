@@ -29,6 +29,23 @@ MARKER = ".choya-generado"
 OUT_DIR = "runtime-wiisports"
 MISSING_PREFIX = "choya_ausente_"
 MISSING_FILE = "src/choya_ausentes.cpp"
+HLE_FILE = "src/choya_wiisports_hle.cpp"
+
+# Funciones nativas propias de Choya para lo que Wii Sports usa y los juegos de WiiCompiled no.
+# Cada una: (función de Wii Sports, cuerpo en C++ con {addr} para la dirección).
+CHOYA_NATIVES = [
+    # RPSysCoreController::initScene enciende la barra de sensores. En la consola es un bit de GPIO de
+    # Hollywood (0xCD0000C0); aquí no hay hardware: se guarda el estado y se devuelve el anterior.
+    ("WPADSetSensorBarPower", """namespace {{ bool g_choyaSensorBar = false; }}
+extern "C" uint32_t WPADSetSensorBarPower_choya(uint32_t enable)
+{{
+    const bool previous = g_choyaSensorBar;
+    g_choyaSensorBar = enable != 0;
+    return previous ? 1u : 0u;
+}}
+PPC_NATIVE_OVERRIDE({addr}, WPADSetSensorBarPower_choya, uint32_t, (uint32_t enable), (enable));
+"""),
+]
 
 LOW_MEM_END = 0x80004000      # 0x80000000-0x80003FFF: globales del sistema, iguales en todos los juegos
 GUEST_END = 0x81800000
@@ -818,7 +835,24 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
                     f.write(new)
     with open(os.path.join(out, MISSING_FILE), "w", encoding="utf-8", newline="\n") as f:
         f.write(missing_stubs(sorted(res.missing)))
+    with open(os.path.join(out, HLE_FILE), "w", encoding="utf-8", newline="\n") as f:
+        f.write(choya_natives(res.ws, registered, result.changes))
     return result
+
+
+def choya_natives(ws: Symbols, registered: dict[int, str], changes: list[Change]) -> str:
+    """Archivo con las funciones nativas propias de Choya, en las direcciones de Wii Sports."""
+    parts = ["// Generado por choya recomp-native: funciones nativas para Wii Sports que WiiCompiled no trae.",
+             '#include "hle_stubs.h"', "", "#include <cstdint>", ""]
+    for name, body in CHOYA_NATIVES:
+        addr = ws.get(name)
+        if addr is None or addr in registered:
+            continue                     # no existe, o WiiCompiled ya la reemplaza
+        parts.append(f"// {name} (Wii Sports 0x{addr:08X})")
+        parts.append(body.format(addr=f"{addr:08X}"))
+        registered[addr] = HLE_FILE
+        changes.append(Change(HLE_FILE, 0, "choya_nativa", 0, addr, name, name))
+    return "\n".join(parts) + "\n"
 
 
 def missing_stubs(addresses: list[int]) -> str:
@@ -872,6 +906,7 @@ def report_markdown(r: RetargetResult) -> str:
          f"| Funciones deducidas por sus vecinas | {r.count('vecinos')} |",
          f"| Parches revisados a mano aplicados | {r.count('parche')} |",
          f"| **Parches que no se pudieron aplicar** | {r.count('parche_fallido')} |",
+         f"| Funciones nativas propias de Choya ({HLE_FILE}) | {r.count('choya_nativa')} |",
          f"| Funciones de otros juegos sin equivalente (stub en {MISSING_FILE}) | {r.count('ausente')} |",
          f"| **Direcciones sin resolver (revisar a mano)** | {r.count('sin_resolver')} |", ""]
     g = r.game

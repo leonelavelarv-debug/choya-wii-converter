@@ -338,3 +338,15 @@ class TestReactivate(unittest.TestCase):
         self.assertIn("#if 0  // NSMBW: MKW-only", out)
         self.assertEqual(out.count("#if 0  // BRAWL"), 2)
         self.assertNotIn(4, {l for l in R.disabled_lines(out) if "OSInitFont" in out.split("\n")[l - 1]})
+
+
+class TestChoyaNatives(unittest.TestCase):
+    def test_sensor_bar(self):
+        from choya import retarget as R
+        ws = R.Symbols({"WPADSetSensorBarPower": 0x800CFF18}, {}, {}, set())
+        changes = []
+        src = R.choya_natives(ws, {}, changes)
+        self.assertIn("PPC_NATIVE_OVERRIDE(800CFF18, WPADSetSensorBarPower_choya", src)
+        self.assertEqual(len(changes), 1)
+        # si WiiCompiled ya la reemplaza, Choya no la duplica
+        self.assertNotIn("PPC_NATIVE_OVERRIDE", R.choya_natives(ws, {0x800CFF18: "otro.cpp"}, []))
