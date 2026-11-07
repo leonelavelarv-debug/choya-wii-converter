@@ -39,6 +39,7 @@ class Layer:
     texture: str
     wrap_s: int = 0            # 0 clamp, 1 repeat, 2 mirror
     wrap_t: int = 0
+    texmap: int = 0            # unidad GX (GX_TEXMAP0..7) que usan las etapas TEV
 
 
 @dataclass
@@ -49,6 +50,7 @@ class Material:
     cull: int = 2              # 0 ninguna, 1 frente, 2 atrás, 3 todo
     xlu: bool = False
     layers: list[Layer] = field(default_factory=list)
+    tev: object = None         # tev.TevRaw
 
 
 @dataclass
@@ -408,10 +410,28 @@ def read_mdl0(d: bytes, mdl0: int, name: str) -> Model:
                     break
     for moff, refs in layer_refs.items():
         mat = mat_by_off[moff]
-        for ref, tname in sorted(set(refs)):
+        for li, (ref, tname) in enumerate(sorted(set(refs))):
             ws = _u32(d, ref + 0x18) if ref + 0x1C <= len(d) else 1
             wt = _u32(d, ref + 0x1C) if ref + 0x20 <= len(d) else 1
-            mat.layers.append(Layer(tname, ws if ws <= 2 else 1, wt if wt <= 2 else 1))
+            tm = _u32(d, ref + 0x10) if ref + 0x14 <= len(d) else li
+            mat.layers.append(Layer(tname, ws if ws <= 2 else 1, wt if wt <= 2 else 1, tm if tm < 8 else li))
+
+    # TEV: lista de comandos del shader (etapas) + la del material (registros, alfa, mezcla, texgens)
+    from . import tev as _tev
+    shader_offs = {off for _, off in sec["shaders"]}
+    for mat in materials:
+        m = mat.offset
+        size = _u32(d, m)
+        cmds = []
+        sh = m + _s32(d, m + 0x28)
+        if sh in shader_offs:
+            cmds += _tev.scan_commands(d, sh + 0x10, sh + _u32(d, sh))
+        dl = _s32(d, m + 0x38)
+        start = m + dl if 0x40 <= dl < size else m + 0x40
+        cmds += _tev.scan_commands(d, start, m + size)
+        mat.tev = _tev.raw_from_commands(cmds, d[m + 0x16], d[m + 0x14])
+        if not mat.tev.found:
+            warnings.append(f"material {mat.name}: no se encontraron comandos TEV")
 
     # Lista de dibujo: qué objeto se dibuja con qué material.
     draws: list[tuple[int, int, bool]] = []

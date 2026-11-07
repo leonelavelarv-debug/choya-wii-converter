@@ -5,4 +5,4 @@ cd "$(dirname "$0")/.."
 docker build -t choya-aarch64 runtime/docker
 rm -rf runtime/build-aarch64
 docker run --rm -v "$PWD":/src -u "$(id -u):$(id -g)" choya-aarch64
-echo "Binarios en runtime/build-aarch64/: wl_view, wl_info, wl_selftest"
+echo "Binarios en runtime/build-aarch64/: choya_model, wl_view, wl_info, wl_selftest, wl_tevgen"

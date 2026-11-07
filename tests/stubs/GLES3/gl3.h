@@ -57,6 +57,15 @@ typedef unsigned char GLboolean; typedef float GLfloat; typedef char GLchar; typ
 #define GL_CLAMP_TO_EDGE 0x812F
 #define GL_MIRRORED_REPEAT 0x8370
 typedef ptrdiff_t GLsizeiptr;
+#define GL_FUNC_ADD 0x8006
+#define GL_FUNC_REVERSE_SUBTRACT 0x800B
+#define GL_LEQUAL 0x0203
+#define GL_FRAMEBUFFER 0x8D40
+#define GL_RENDERBUFFER 0x8D41
+#define GL_RGBA8 0x8058
+#define GL_DEPTH_COMPONENT24 0x81A6
+#define GL_COLOR_ATTACHMENT0 0x8CE0
+#define GL_DEPTH_ATTACHMENT 0x8D00
 extern "C" {
 void glGenTextures(GLsizei, GLuint*); void glBindTexture(GLenum, GLuint); void glPixelStorei(GLenum, GLint);
 void glCompressedTexImage2D(GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void*);
@@ -77,4 +86,9 @@ void glBufferData(GLenum, GLsizeiptr, const void*, GLenum); void glDrawElements(
 void glEnable(GLenum); void glDisable(GLenum); void glCullFace(GLenum); void glFrontFace(GLenum);
 void glBlendFunc(GLenum, GLenum); void glDepthMask(GLboolean); void glUniformMatrix4fv(GLint, GLsizei, GLboolean, const GLfloat*);
 void glUniform3f(GLint, GLfloat, GLfloat, GLfloat);
+void glBlendEquation(GLenum); void glDepthFunc(GLenum); void glDeleteProgram(GLuint); void glDeleteShader(GLuint);
+void glGenFramebuffers(GLsizei, GLuint*); void glBindFramebuffer(GLenum, GLuint); void glGenRenderbuffers(GLsizei, GLuint*);
+void glBindRenderbuffer(GLenum, GLuint); void glRenderbufferStorage(GLenum, GLenum, GLsizei, GLsizei);
+void glFramebufferRenderbuffer(GLenum, GLenum, GLenum, GLuint);
+void glReadPixels(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
 }

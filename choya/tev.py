@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 COLOR_IN = ["CPREV", "APREV", "C0", "A0", "C1", "A1", "C2", "A2", "TEXC", "TEXA", "RASC", "RASA",
             "ONE", "HALF", "KONST", "ZERO"]
 ALPHA_IN = ["APREV", "A0", "A1", "A2", "TEXA", "RASA", "KONST", "ZERO"]
-DEST = ["PREV", "R0", "R1", "R2"]
+DEST = ["PREV", "C0", "C1", "C2"]
 BIAS = ["0", "+0.5", "-0.5", "comp"]
 SCALE = ["x1", "x2", "x4", "x0.5"]
 COMPARE = ["NEVER", "LESS", "EQUAL", "LEQUAL", "GREATER", "NEQUAL", "GEQUAL", "ALWAYS"]
@@ -51,6 +51,26 @@ def _parse_at(d: bytes, p: int, end: int):
         vals = list(struct.unpack_from(f">{n}I", d, p + 5))
         return Cmd("XF", addr, vals), p + 5 + 4 * n
     return False
+
+
+def apply_bp_mask(cmds: list[Cmd]) -> list[Cmd]:
+    """Resuelve las escrituras enmascaradas: BP 0xFE fija qué bits cambia la siguiente escritura BP.
+    NW4R escribe así las tablas de intercambio (KSEL bits 0-3) y la selección konstante por separado."""
+    state: dict[int, int] = {}
+    mask = 0xFFFFFF
+    out = []
+    for c in cmds:
+        if c.kind != "BP":
+            out.append(c)
+            continue
+        if c.reg == 0xFE:
+            mask = c.value & 0xFFFFFF
+            continue
+        v = (state.get(c.reg, 0) & ~mask) | (c.value & mask)
+        state[c.reg] = v
+        mask = 0xFFFFFF
+        out.append(Cmd("BP", c.reg, v))
+    return out
 
 
 def scan_commands(d: bytes, start: int, end: int, min_run: int = 3) -> list[Cmd]:
@@ -107,12 +127,14 @@ def _s11(v: int) -> int:
 
 
 def decode(cmds: list[Cmd]) -> TevConfig:
+    cmds = apply_bp_mask(cmds)
     stages: dict[int, TevStage] = {}
 
     def st(i):
         return stages.setdefault(i, TevStage(i))
 
     regs: dict[str, list[int]] = {}
+    swaps: dict[int, int] = {}
     ac = blend = zmode = None
     other = []
     for c in cmds:
@@ -141,7 +163,7 @@ def decode(cmds: list[Cmd]) -> TevConfig:
         elif 0xE0 <= r <= 0xE7:
             i = (r - 0xE0) // 2
             konst = (v >> 23) & 1
-            name = f"K{i}" if konst else ("PREV" if i == 0 else f"R{i}")
+            name = f"K{i}" if konst else ("PREV" if i == 0 else f"C{i - 1}")
             reg = regs.setdefault(name, [0, 0, 0, 0])
             if r % 2 == 0:      # L: R y A
                 reg[0], reg[3] = _s11(v & 0x7FF), _s11((v >> 12) & 0x7FF)
@@ -149,6 +171,7 @@ def decode(cmds: list[Cmd]) -> TevConfig:
                 reg[2], reg[1] = _s11(v & 0x7FF), _s11((v >> 12) & 0x7FF)
         elif 0xF6 <= r <= 0xFD:
             i = r - 0xF6
+            swaps[i] = v & 0xF
             st(i * 2).kcsel, st(i * 2).kasel = (v >> 4) & 31, (v >> 9) & 31
             st(i * 2 + 1).kcsel, st(i * 2 + 1).kasel = (v >> 14) & 31, (v >> 19) & 31
         elif r == 0xF3:
@@ -161,6 +184,13 @@ def decode(cmds: list[Cmd]) -> TevConfig:
             zmode = dict(test=bool(v & 1), func=COMPARE[(v >> 1) & 7], write=bool(v & 16))
         else:
             other.append(f"BP 0x{r:02X} = {v:06X}")
+    if swaps:
+        comp = "rgba"
+        tabs = []
+        for t in range(4):
+            lo, hi = swaps.get(2 * t, DEFAULT_KSEL[2 * t]), swaps.get(2 * t + 1, DEFAULT_KSEL[2 * t + 1])
+            tabs.append(comp[lo & 3] + comp[(lo >> 2) & 3] + comp[hi & 3] + comp[(hi >> 2) & 3])
+        other.insert(0, "tablas de intercambio: " + " ".join(f"{i}={t}" for i, t in enumerate(tabs)))
     return TevConfig(sorted(stages.values(), key=lambda s: s.index),
                      {k: tuple(v) for k, v in regs.items()}, ac, blend, zmode, other)
 
@@ -193,3 +223,76 @@ def format_config(cfg: TevConfig, active: int | None = None) -> list[str]:
         lines.append(f"    z: test {'on' if z['test'] else 'off'} {z['func']} escritura {'on' if z['write'] else 'off'}")
     lines += [f"    {o}" for o in cfg.other[:12]]
     return lines
+
+
+# ------------------------------------------------------------------ registros crudos para el runtime
+
+# Tablas de intercambio por defecto de GX: 0 RGBA, 1 RRRA, 2 GGGA, 3 BBBA (bits 0-3 de cada KSEL).
+DEFAULT_KSEL = (0x4, 0xE, 0x0, 0xC, 0x5, 0xD, 0xA, 0xE)
+
+
+@dataclass
+class TevRaw:
+    """Estado TEV de un material, en los mismos bits que el hardware (el runtime los decodifica)."""
+    num_stages: int = 1
+    num_texgens: int = 1
+    color_env: list = field(default_factory=lambda: [0] * 16)
+    alpha_env: list = field(default_factory=lambda: [0] * 16)
+    tref: list = field(default_factory=lambda: [(0, 0, 0, 7)] * 16)   # (texmap, texcoord, enable, ras)
+    ksel: list = field(default_factory=lambda: list(DEFAULT_KSEL))
+    cregs: list = field(default_factory=lambda: [[0, 0, 0, 0] for _ in range(4)])   # PREV, C0, C1, C2
+    kregs: list = field(default_factory=lambda: [[0, 0, 0, 0] for _ in range(4)])   # K0..K3
+    alpha_compare: int = (7 << 16) | (7 << 19)    # ALWAYS / ALWAYS
+    blend: int = 0x18                             # sin mezcla, escribir color y alfa
+    zmode: int = 0x17                             # test LEQUAL + escritura
+    texgen: list = field(default_factory=lambda: [0x5280] * 8)   # XF 0x1040+i (por defecto: TEX0)
+    dualtex: list = field(default_factory=lambda: [0] * 8)
+    found: bool = False
+
+
+def raw_from_commands(cmds: list[Cmd], num_stages: int, num_texgens: int) -> TevRaw:
+    t = TevRaw(num_stages=max(1, min(16, num_stages or 1)), num_texgens=max(0, min(8, num_texgens)))
+    ksel_seen = set()
+    for c in apply_bp_mask(cmds):
+        if c.kind == "XF":
+            for k, v in enumerate(c.value):
+                addr = c.reg + k
+                if 0x1040 <= addr < 0x1048:
+                    t.texgen[addr - 0x1040] = v
+                elif 0x1050 <= addr < 0x1058:
+                    t.dualtex[addr - 0x1050] = v
+            continue
+        r, v = c.reg, c.value
+        t.found = True
+        if 0x28 <= r <= 0x2F:
+            for half, sh in ((0, 0), (1, 12)):
+                t.tref[(r - 0x28) * 2 + half] = ((v >> sh) & 7, (v >> (sh + 3)) & 7, (v >> (sh + 6)) & 1,
+                                                 (v >> (sh + 7)) & 7)
+        elif 0xC0 <= r <= 0xDF:
+            i = (r - 0xC0) // 2
+            if r % 2 == 0:
+                t.color_env[i] = v
+            else:
+                t.alpha_env[i] = v
+        elif 0xE0 <= r <= 0xE7:
+            i = (r - 0xE0) // 2
+            konst = (v >> 23) & 1
+            reg = t.kregs[i] if konst else t.cregs[i]
+            lo, hi = _s11(v & 0x7FF), _s11((v >> 12) & 0x7FF)
+            if r % 2 == 0:
+                reg[0], reg[3] = lo, hi        # R, A
+            else:
+                reg[2], reg[1] = lo, hi        # B, G
+        elif 0xF6 <= r <= 0xFD:
+            t.ksel[r - 0xF6] = v
+            ksel_seen.add(r)
+        elif r == 0xF3:
+            t.alpha_compare = v
+        elif r == 0x41:
+            t.blend = v
+        elif r == 0x40:
+            t.zmode = v
+    for row in t.kregs:
+        for k in range(4):
+            row[k] = max(0, min(255, row[k]))
+    return t

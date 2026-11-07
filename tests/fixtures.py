@@ -346,7 +346,96 @@ class _Blob:
         struct.pack_into(fmt, self.b, off, *vals)
 
 
-def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0, 0.0)) -> bytes:
+# ---------------------------------------------------------------------------- comandos TEV sintéticos
+
+from choya.tev import ALPHA_IN, COLOR_IN  # noqa: E402
+
+
+def bp(reg: int, val: int) -> bytes:
+    return bytes([0x61, reg, (val >> 16) & 255, (val >> 8) & 255, val & 255])
+
+
+def color_env(a, b, c, d, dest=0, bias=0, sub=0, clamp=1, scale=0) -> int:
+    ix = COLOR_IN.index
+    return ix(d) | (ix(c) << 4) | (ix(b) << 8) | (ix(a) << 12) | (bias << 16) | (sub << 18) | (clamp << 19) | (
+        scale << 20) | (dest << 22)
+
+
+def alpha_env(a, b, c, d, dest=0, bias=0, sub=0, clamp=1, scale=0, rswap=0, tswap=0) -> int:
+    ix = ALPHA_IN.index
+    return rswap | (tswap << 2) | (ix(d) << 4) | (ix(c) << 7) | (ix(b) << 10) | (ix(a) << 13) | (bias << 16) | (
+        sub << 18) | (clamp << 19) | (scale << 20) | (dest << 22)
+
+
+def tref(s0, s1=(0, 0, 0, 7)) -> int:
+    f = lambda m, c, e, r: m | (c << 3) | (e << 6) | (r << 7)
+    return f(*s0) | (f(*s1) << 12)
+
+
+def ksel(kc0=0x0C, ka0=0x1C, kc1=0x0C, ka1=0x1C, swap=0) -> int:
+    return swap | (kc0 << 4) | (ka0 << 9) | (kc1 << 14) | (ka1 << 19)
+
+
+def tevreg(i: int, rgba, konst=False) -> bytes:
+    r, g, b, a = rgba
+    t = (1 << 23) if konst else 0
+    return bp(0xE0 + 2 * i, (r & 0x7FF) | ((a & 0x7FF) << 12) | t) + bp(0xE1 + 2 * i, (b & 0x7FF) | ((g & 0x7FF) << 12) | t)
+
+
+def xf(addr: int, vals) -> bytes:
+    return bytes([0x10]) + struct.pack(">HH", len(vals) - 1, addr) + b"".join(struct.pack(">I", v) for v in vals)
+
+
+def tev_config(stages, konst=None, cregs=None, alpha_compare=None, blend=0x18 | (4 << 8) | (5 << 5), zmode=0x17,
+               texgens=(0x5280,)):
+    """stages = [(tref(map,coord,en,ras), color_env, alpha_env, kcsel, kasel)] -> (dl_shader, dl_material, n, ntg)."""
+    sh = bytearray()
+    swap = (0x4, 0xE, 0x0, 0xC, 0x5, 0xD, 0xA, 0xE)      # tablas por defecto de GX
+    for i in range(8):                                    # como NW4R: primero las tablas, enmascaradas
+        sh += bp(0xFE, 0x00000F) + bp(0xF6 + i, swap[i] | 0xFFFFF0)
+    for i in range(0, len(stages), 2):
+        pair = stages[i:i + 2]
+        t1 = pair[1][0] if len(pair) > 1 else (0, 0, 0, 7)
+        sh += bp(0x28 + i // 2, tref(pair[0][0], t1))
+        k1 = pair[1][3:5] if len(pair) > 1 else (0x0C, 0x1C)
+        sh += bp(0xFE, 0xFFFFF0) + bp(0xF6 + i // 2, ksel(pair[0][3], pair[0][4], k1[0], k1[1], 0))
+    for i, st in enumerate(stages):
+        sh += bp(0xC0 + 2 * i, st[1]) + bp(0xC1 + 2 * i, st[2])
+    mt = bytearray()
+    mt += bp(0xF3, alpha_compare if alpha_compare is not None else (7 << 16) | (7 << 19))
+    mt += bp(0x40, zmode) + bp(0x41, blend)
+    for i, rgba in enumerate(cregs or []):
+        mt += tevreg(i, rgba)
+    for i, rgba in enumerate(konst or []):
+        mt += tevreg(i, rgba, konst=True)
+    for i, v in enumerate(texgens):
+        mt += xf(0x1040 + i, [v])
+    return bytes(sh), bytes(mt), len(stages), len(texgens)
+
+
+def sphere(rings=12, segs=16, radius=1.0):
+    """Esfera UV: (posiciones, normales, uv, triángulos) para modelos de prueba."""
+    import math
+    pos, nrm, uv = [], [], []
+    for r in range(rings + 1):
+        th = math.pi * r / rings
+        for sgi in range(segs + 1):
+            ph = 2 * math.pi * sgi / segs
+            n = (math.sin(th) * math.cos(ph), math.cos(th), math.sin(th) * math.sin(ph))
+            nrm.append(n)
+            pos.append(tuple(radius * c for c in n))
+            uv.append((sgi / segs, r / rings))
+    tris = []
+    for r in range(rings):
+        for sgi in range(segs):
+            a = r * (segs + 1) + sgi
+            b = a + segs + 1
+            tris += [(a, a + 1, b), (a + 1, b + 1, b)]   # sentido horario visto desde afuera (GX)
+    return pos, nrm, uv, tris
+
+
+def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0, 0.0), tev=None,
+               extra_textures=(), mesh=None) -> bytes:
     """MDL0 v9 con un hueso, 4 vértices (tira de 2 triángulos), UV y un material con textura."""
     m = _Blob()
     m.alloc(0x40)
@@ -377,50 +466,97 @@ def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0,
     m.put(">3f", bone + 0x20, 1, 1, 1)
     m.put(">3f", bone + 0x38, *translate)
     m.put(">12f", bone + 0x70, 1, 0, 0, translate[0], 0, 1, 0, translate[1], 0, 0, 1, translate[2])
-    # posiciones (s16, 8 bits de fracción)
-    pos = [(-1, -1, 0), (1, -1, 0), (-1, 1, 0), (1, 1, 0)]
-    vb = m.alloc(0x40 + 6 * 4)
-    m.put(">iiii", vb, 0x40 + 24, -vb, 0x40, 0)
-    m.put(">IIBBH", vb + 0x14, 1, 3, 8, 6, 4)
+    # posiciones (s16, 8 bits de fracción), normales (float) y UV (float)
+    if mesh:
+        pos, nrms, uvs, tris = mesh
+    else:
+        pos = [(-1, -1, 0), (1, -1, 0), (-1, 1, 0), (1, 1, 0)]
+        uvs = [(0, 1), (1, 1), (0, 0), (1, 0)]
+        nrms, tris = None, None
+    vb = m.alloc(0x40 + 6 * len(pos))
+    m.put(">iiii", vb, 0x40 + 6 * len(pos), -vb, 0x40, 0)
+    m.put(">IIBBH", vb + 0x14, 1, 3, 8, 6, len(pos))
     for i, p in enumerate(pos):
-        m.put(">3h", vb + 0x40 + i * 6, *(int(c * 256) for c in p))
-    # UV (float)
-    uvs = [(0, 1), (1, 1), (0, 0), (1, 0)]
-    ub = m.alloc(0x40 + 8 * 4)
-    m.put(">iiii", ub, 0x40 + 32, -ub, 0x40, 0)
-    m.put(">IIBBH", ub + 0x14, 1, 4, 0, 8, 4)
+        m.put(">3h", vb + 0x40 + i * 6, *(int(round(c * 256)) for c in p))
+    ub = m.alloc(0x40 + 8 * len(uvs))
+    m.put(">iiii", ub, 0x40 + 8 * len(uvs), -ub, 0x40, 0)
+    m.put(">IIBBH", ub + 0x14, 1, 4, 0, 8, len(uvs))
     for i, uv in enumerate(uvs):
         m.put(">2f", ub + 0x40 + i * 8, *uv)
-    # material con una capa de textura
-    mat = m.alloc(0x40 + 0x34)
+    nb = None
+    if nrms:
+        nb = m.alloc(0x40 + 12 * len(nrms))
+        m.put(">iiii", nb, 0x40 + 12 * len(nrms), -nb, 0x40, 0)
+        m.put(">IIBBH", nb + 0x14, 0, 4, 0, 12, len(nrms))
+        for i, n in enumerate(nrms):
+            m.put(">3f", nb + 0x40 + i * 12, *n)
+    # material con sus capas de textura y su lista de comandos; shader con las etapas TEV
+    if tev is None:
+        tev = tev_config([((0, 0, 1, 0), color_env("ZERO", "TEXC", "RASC", "ZERO"),
+                           alpha_env("ZERO", "TEXA", "RASA", "ZERO"), 0x0C, 0x1C)])
+    sh_dl, mt_dl, nst, ntg = tev
+    textures = [texture] + list(extra_textures)
+    mat_size = (0x40 + 0x34 * len(textures) + 0x1F) & ~0x1F
+    dl_rel = mat_size
+    mat_size += (len(mt_dl) + 0x1F) & ~0x1F
+    mat = m.alloc(mat_size, 32)
+    shader = m.alloc(0x200, 32)
+    m.put(">I", mat, mat_size)
     m.put(">i", mat + 4, -mat)
     m.put(">ii", mat + 0x0C, 0, 0)
+    m.b[mat + 0x14:mat + 0x18] = bytes([ntg, 1, nst, 0])
     m.put(">I", mat + 0x18, 2)
-    layer = mat + 0x40
-    m.put(">i", layer, string(texture) - layer)
-    m.put(">II", layer + 0x18, 1, 1)
-    # objeto: POS índice8 + TEX0 índice8, una tira de triángulos
-    dl = bytes([0x20, 0x00, 0x00, 0xB0, 0x00]) + bytes([0x98, 0x00, 0x04]) + bytes(
-        [0, 0, 1, 1, 2, 2, 3, 3]) + b"\x00" * 3
+    m.put(">i", mat + 0x28, shader - mat)
+    m.put(">i", mat + 0x38, dl_rel)
+    m.b[mat + dl_rel:mat + dl_rel + len(mt_dl)] = mt_dl
+    m.put(">I", shader, 0x200)
+    m.put(">i", shader + 4, -shader)
+    m.b[shader + 0x0C] = nst
+    m.b[shader + 0x20:shader + 0x20 + len(sh_dl)] = sh_dl
+    layers = []
+    for i, tname in enumerate(textures):
+        layer = mat + 0x40 + 0x34 * i
+        m.put(">i", layer, string(tname) - layer)
+        m.put(">I", layer + 0x10, i)
+        m.put(">II", layer + 0x18, 1, 1)
+        layers.append(layer)
+    layer = layers[0]
+    # objeto: POS índice8 + TEX0 índice8, una tira de triángulos (o la malla dada, con índices de 16 bits)
+    if mesh:
+        body = bytearray([0x90]) + struct.pack(">H", 3 * len(tris))
+        for t in tris:
+            for k in t:
+                body += struct.pack(">HHH", k, k, k)       # pos, nrm, tex0
+        dl = bytes(body) + b"\x00" * ((-len(body)) % 32)
+        vcd_lo, vcd_hi = (3 << 9) | (3 << 11), 3
+    else:
+        dl = bytes([0x20, 0x00, 0x00, 0xB0, 0x00]) + bytes([0x98, 0x00, 0x04]) + bytes(
+            [0, 0, 1, 1, 2, 2, 3, 3]) + b"\x00" * 3
+        vcd_lo, vcd_hi = 2 << 9, 2
     obj = m.alloc(0x80)
     prim = m.alloc(len(dl), 32)
     m.b[prim:prim + len(dl)] = dl
     m.put(">i", obj + 4, -obj)
     m.put(">i", obj + 0x08, 0)
-    m.put(">II", obj + 0x0C, 2 << 9, 2)
+    m.put(">II", obj + 0x0C, vcd_lo, vcd_hi)
     m.put(">IIi", obj + 0x24, len(dl), len(dl), prim - (obj + 0x24))
     m.put(">i", obj + 0x3C, 0)
-    m.put(">hhhh8h", obj + 0x48, 0, -1, -1, -1, 0, -1, -1, -1, -1, -1, -1, -1)
-    # enlaces de texturas
-    tl = m.alloc(4 + 8)
-    m.put(">Iii", tl, 1, mat - tl, layer - tl)
+    m.put(">hhhh8h", obj + 0x48, 0, 0 if nrms else -1, -1, -1, 0, -1, -1, -1, -1, -1, -1, -1)
+    # enlaces de texturas (uno por textura)
+    tex_links = []
+    for tname, lay in zip(textures, layers):
+        tl = m.alloc(4 + 8)
+        m.put(">Iii", tl, 1, mat - tl, lay - tl)
+        tex_links.append((tname, tl))
     # definiciones
     draw = m.alloc(16)
     m.b[draw:draw + 9] = bytes([0x04, 0, 0, 0, 0, 0, 0, 0, 0x01])
     groups = {
         "defs": group([("DrawOpa", draw)]), "bones": group([("root", bone)]),
-        "verts": group([("pos", vb)]), "uvs": group([("uv", ub)]), "mats": group([("mat", mat)]),
-        "objs": group([("obj", obj)]), "texs": group([(texture, tl)]),
+        "verts": group([("pos", vb)]), "uvs": group([("uv", ub)]),
+        **({"norms": group([("nrm", nb)])} if nb else {}), "mats": group([("mat", mat)]),
+        "shaders": group([("mat", shader)]),
+        "objs": group([("obj", obj)]), "texs": group(tex_links),
     }
     order = ["defs", "bones", "verts", "norms", "colors", "uvs", "mats", "shaders", "objs", "texs", "pals"]
     for i, sname in enumerate(order):

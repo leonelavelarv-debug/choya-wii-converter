@@ -101,11 +101,23 @@ python -m choya package C:\wii\ports --title "Choya Modelos" --folder choyamodel
 | A / B | Acercar / alejar |
 | L1 / R1 | Modelo anterior / siguiente |
 | X | Activar o desactivar el descarte de caras traseras |
-| Y | Texturas sí / no |
-| Select | Iluminación sí / no |
+| Y | Material TEV / sombreado simple |
+| Select | Texturas sí / no (modo simple) |
 | Start | Salir |
 
-El sombreado de esta versión es simplificado: textura principal × color de vértice × luz direccional. Los colores exactos de cada material (TEV) llegan en la siguiente versión.
+Desde la 0.3, cada material se dibuja con su **TEV** traducido a GLSL ES 3.00: etapas, texturas por unidad, coordenadas de reflejo calculadas desde la normal, registros de color y konstantes, tablas de intercambio, prueba de alfa, mezcla y profundidad. El botón Y alterna entre TEV y el sombreado simple para comparar. La iluminación del canal COLOR0 es aproximada (luz fija), y aún no se aplican las matrices de textura (escala/rotación de UV) de cada material.
+
+### Dibujar modelos en la PC sin la consola (WSL2)
+
+`choya_render` usa el mismo código de render que `choya_model` y guarda PNG con Mesa (llvmpipe). En Ubuntu:
+
+```sh
+sh scripts/build-pc-render.sh
+mkdir -p /mnt/c/wii/render
+runtime/build-pc/choya_render /mnt/c/wii/salida/assets.wlpk /mnt/c/wii/render bwg_pin --max 5
+```
+
+Agrega `--simple` para ver el sombreado simple y `--size 1024` para imágenes más grandes.
 
 ## 7. Conectar con la capa GX del juego
 
@@ -138,11 +150,11 @@ Little-endian, alineado a 16 bytes: cabecera de 64 bytes, tabla de entradas de 4
 python -m unittest discover tests
 ```
 
-24 pruebas con datos sintéticos: Yaz0/LZ77, U8, BRRES, TPL, los 11 formatos GX, ETC2/EAC (calidad y que nunca desborde el modo diferencial), DSP-ADPCM, BRSTM con bloques entrelazados, respaldo por calidad, audio ADPCM con bucle decodificado en C++, conversión de punta a punta, y una prueba cruzada donde el runtime C++ lee el paquete de Python (claves, caché y audio idénticos).
+31 pruebas con datos sintéticos: Yaz0/LZ77, U8, BRRES, TPL, los 11 formatos GX, ETC2/EAC (calidad y que nunca desborde el modo diferencial), DSP-ADPCM, BRSTM con bloques entrelazados, respaldo por calidad, audio ADPCM con bucle decodificado en C++, modelos MDL0, TEV con la configuración de materiales reales compilado y dibujado en OpenGL ES por software (Mesa llvmpipe) con revisión de píxeles, conversión de punta a punta, y una prueba cruzada donde el runtime C++ lee el paquete de Python (claves, caché y audio idénticos).
 
 ## Pendiente
 
-- **TEV:** traducir los shaders de material de Wii a GLSL ES 3.20. Hoy el visor usa un sombreado simplificado y solo la primera capa de textura.
+- **Matrices de textura y canales de luz del material:** se leen todavía con valores por defecto (UV sin escala, luz fija).
 - **Modelos con piel (varios huesos por vértice):** se muestran en pose de reposo; las animaciones (CHR0) aún no se leen.
 
 - **BRSAR** (efectos de sonido): se cuenta en el reporte y se deja tal cual en el disco; la capa AX lo decodifica con `wl::dsp_decode`.

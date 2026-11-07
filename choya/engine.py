@@ -63,15 +63,21 @@ def _convert_models(res, writer, key_by_name, preview_by_key, obj_dir, errors) -
             totals["fallidos"] += 1
             errors.append(f"modelo {full}: {type(e).__name__}: {e}")
             continue
-        keys, files, missing = [], [], 0
+        keys, files, maps, missing = [], [], [], 0
         for mat in m.materials:
-            key = _find_texture(item.path, mat.layers[0].texture, key_by_name) if mat.layers else 0
-            if mat.layers and not key:
-                missing += 1
+            mat_maps = [None] * 8
+            for lay in mat.layers:
+                k = _find_texture(item.path, lay.texture, key_by_name)
+                if not k:
+                    missing += 1
+                if lay.texmap < 8:
+                    mat_maps[lay.texmap] = (k, lay.wrap_s, lay.wrap_t)
+            key = mat_maps[mat.layers[0].texmap][0] if mat.layers and mat.layers[0].texmap < 8 else 0
             keys.append(key)
+            maps.append(mat_maps)
             files.append(f"../texturas/{preview_by_key[key]}" if key in preview_by_key else None)
-        writer.add(pack.Entry(kind=pack.KIND_MODEL, fmt=1, count=len(m.submeshes), flags=0,
-                              key=pack.path_key(full), name=full, data=mp.pack_model(m, keys),
+        writer.add(pack.Entry(kind=pack.KIND_MODEL, fmt=2, count=len(m.submeshes), flags=0,
+                              key=pack.path_key(full), name=full, data=mp.pack_model(m, keys, maps),
                               extra0=len(m.positions), extra1=len(m.indices), extra2=m.stats["triangulos"]))
         if obj_dir and len(m.indices):
             mp.write_obj(m, os.path.join(obj_dir, _safe(full) + ".obj"), files)

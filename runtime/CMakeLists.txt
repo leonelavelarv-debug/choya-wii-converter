@@ -7,7 +7,8 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-option(WL_WITH_GL "Compilar la subida a GLES y el visor wl_view (requiere SDL2 y GLES)" ON)
+option(WL_WITH_GL "Compilar la subida a GLES y los visores (requiere SDL2 y GLES)" ON)
+option(WL_BUILD_RENDER "Compilar choya_render (PNG sin pantalla; requiere EGL, p. ej. Mesa en WSL2)" OFF)
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
   # Cortex-A53 de la Allwinner H700
@@ -17,7 +18,7 @@ add_compile_options(-Wall -Wextra -O2)
 
 find_package(ZLIB REQUIRED)
 
-add_library(wl_core STATIC src/format.cpp src/pack.cpp src/texcache.cpp src/audio.cpp src/model.cpp)
+add_library(wl_core STATIC src/format.cpp src/pack.cpp src/texcache.cpp src/audio.cpp src/model.cpp src/tev_gen.cpp)
 target_include_directories(wl_core PUBLIC include)
 target_link_libraries(wl_core PUBLIC ZLIB::ZLIB)
 
@@ -27,10 +28,13 @@ target_link_libraries(wl_info PRIVATE wl_core)
 add_executable(wl_selftest tools/wl_selftest.cpp)
 target_link_libraries(wl_selftest PRIVATE wl_core)
 
+add_executable(wl_tevgen tools/wl_tevgen.cpp)
+target_link_libraries(wl_tevgen PRIVATE wl_core)
+
 if(WL_WITH_GL)
   find_package(SDL2 REQUIRED)
   find_library(GLES_LIB NAMES GLESv2 REQUIRED)
-  add_library(wl_gl STATIC src/gl_upload.cpp)
+  add_library(wl_gl STATIC src/gl_upload.cpp src/model_render.cpp)
   target_compile_definitions(wl_gl PUBLIC WL_WITH_GL)
   target_link_libraries(wl_gl PUBLIC wl_core ${GLES_LIB})
   add_executable(wl_view tools/wl_view.cpp)
@@ -43,6 +47,16 @@ if(WL_WITH_GL)
       target_link_libraries(${tool} PRIVATE wl_gl ${SDL2_LIBRARIES})
     endif()
   endforeach()
+endif()
+
+if(WL_BUILD_RENDER)
+  find_library(EGL_LIB NAMES EGL REQUIRED)
+  find_library(GLES_LIB2 NAMES GLESv2 REQUIRED)
+  add_library(wl_gl_render STATIC src/gl_upload.cpp src/model_render.cpp)
+  target_compile_definitions(wl_gl_render PUBLIC WL_WITH_GL)
+  target_link_libraries(wl_gl_render PUBLIC wl_core ${GLES_LIB2})
+  add_executable(choya_render tools/choya_render.cpp)
+  target_link_libraries(choya_render PRIVATE wl_gl_render ${EGL_LIB})
 endif()
 
 install(TARGETS wl_info DESTINATION bin)
