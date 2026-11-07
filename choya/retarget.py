@@ -981,6 +981,10 @@ def update_manifest(yml_path: str) -> bool:
     return bool(n)
 
 
+def _hx(v) -> str:
+    return "—" if v is None else f"{v:08X}"
+
+
 def report_markdown(r: RetargetResult) -> str:
     by = defaultdict(list)
     for c in r.changes:
@@ -1029,7 +1033,7 @@ def report_markdown(r: RetargetResult) -> str:
               "Se renombraron a `choya_ausente_XXXXXXXX` para que no se enlacen con otra función de Wii Sports.", "",
               "| Archivo:línea | Dirección | En otros juegos | Código |", "|---|---|---|---|"]
         for c in sorted(by["ausente"], key=lambda c: (c.file, c.line)):
-            L.append(f"| {c.file}:{c.line} | {c.old:08X} | {c.name} | `{c.text.replace('|', '¦')}` |")
+            L.append(f"| {c.file}:{c.line} | {_hx(c.old)} | {c.name} | `{c.text.replace('|', '¦')}` |")
         L.append("")
     files = Counter(c.file for c in by["sin_resolver"])
     if files:
@@ -1037,17 +1041,17 @@ def report_markdown(r: RetargetResult) -> str:
         L += [f"| {f} | {n} |" for f, n in files.most_common()]
         L += ["", "## Sin resolver", "", "| Archivo:línea | Dirección | En otros juegos | Código |", "|---|---|---|---|"]
         for c in sorted(by["sin_resolver"], key=lambda c: (c.file, c.line)):
-            L.append(f"| {c.file}:{c.line} | {c.old:08X} | {c.name} | `{c.text.replace('|', '¦')}` |")
+            L.append(f"| {c.file}:{c.line} | {_hx(c.old)} | {c.name} | `{c.text.replace('|', '¦')}` |")
     for kind, title in (("reactivado", "Funciones nativas reactivadas"), ("parche", "Parches revisados a mano"), ("sda", "Desfases SDA (nuevo desfase en Wii Sports)"),
                         ("vecinos", "Funciones deducidas por sus vecinas"), ("dato", "Variables movidas"),
                         ("funcion", "Llamadas movidas"), ("registro", "Funciones nativas movidas")):
         if by[kind]:
             L += ["", f"## {title}", "", "| Nombre | Antes | Wii Sports | Archivo:línea |", "|---|---|---|---|"]
             for c in sorted(by[kind], key=lambda c: (c.file, c.line)):
-                L.append(f"| {c.name} | {c.old:08X} | {c.new:08X} | {c.file}:{c.line} |")
+                L.append(f"| {c.name} | {_hx(c.old)} | {_hx(c.new)} | {c.file}:{c.line} |")
     if by["desactivado"] or by["duplicado"]:
         L += ["", "## Desactivadas", "", "| Archivo:línea | Antes | Símbolo | Motivo |", "|---|---|---|---|"]
         for c in sorted(by["desactivado"] + by["duplicado"], key=lambda c: (c.file, c.line)):
             why = "repetido" if c.kind == "duplicado" else "no existe en Wii Sports"
-            L.append(f"| {c.file}:{c.line} | {c.old:08X} | {c.name} | {why} |")
+            L.append(f"| {c.file}:{c.line} | {_hx(c.old)} | {c.name} | {why} |")
     return "\n".join(L) + "\n"

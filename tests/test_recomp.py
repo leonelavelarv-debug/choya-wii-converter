@@ -337,6 +337,8 @@ class TestReactivate(unittest.TestCase):
         self.assertIn("#if 1  // BRAWL: no matching function in the Brawl dol  // choya:", out)
         self.assertIn("#if 0  // NSMBW: MKW-only", out)
         self.assertEqual(out.count("#if 0  // BRAWL"), 2)
+        report = R.report_markdown(R.RetargetResult("x", None, changes))   # sin dirección nueva: no falla
+        self.assertIn("OSInitFont", report)
         self.assertNotIn(4, {l for l in R.disabled_lines(out) if "OSInitFont" in out.split("\n")[l - 1]})
 
 
