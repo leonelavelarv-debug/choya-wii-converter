@@ -870,6 +870,18 @@ AURORA_EDITS = [
      "                           ? wgpu::TextureUsage::RenderAttachment\n"
      "                           : wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,\n",
      "superficie Null sin CopySrc"),
+    # Con el backend Null, ImGui (portada, menús) se dibuja con el renderizador por software de SDL en la ventana
+    # offscreen que nadie ve: en la consola eso se comía ~100 ms por cuadro (SDL_BlitTriangle_Slow).
+    ("lib/imgui.cpp",
+     "    SDL_Renderer* renderer = window::get_sdl_renderer();\n    SDL_RenderClear(renderer);\n",
+     "    // choya: ventana offscreen (KNULLI): nadie la ve, no se rasteriza ImGui por software.\n"
+     "    static const bool choyaOffscreen =\n"
+     "        SDL_strcmp(SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : \"\", \"offscreen\") == 0;\n"
+     "    if (choyaOffscreen) {\n"
+     "      return;\n"
+     "    }\n"
+     "    SDL_Renderer* renderer = window::get_sdl_renderer();\n    SDL_RenderClear(renderer);\n",
+     "ImGui sin dibujar en la ventana offscreen"),
 ]
 
 
