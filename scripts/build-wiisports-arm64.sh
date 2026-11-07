@@ -36,17 +36,19 @@ JOBS=$(( MEM_GB * 2 / 3 )); [ "$JOBS" -lt 1 ] && JOBS=1; [ "$JOBS" -gt "$(nproc)
 echo "Memoria ${MEM_GB} GB → ${JOBS} trabajos a la vez" | tee -a "$LOG"
 # Al compilar cruzado aurora quiere construir Dawn desde el código (y esa etiqueta no existe en google/dawn):
 # se usa el paquete ya compilado para Linux aarch64, igual que en la PC.
+# KNULLI no tiene X11, Wayland ni /dev/dri: SDL3 se compila "de consola" (ventana offscreen por ahora).
 rm -rf "$WC/$BUILD/_deps/dawn-"*
 docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$WC":"$WC" -w "$WC" "$IMG" bash -c "
   cmake -S runtime-wiisports -B $BUILD -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE=/opt/choya/aarch64-clang.cmake \
-        -DAURORA_DAWN_PROVIDER=package -DAURORA_SDL3_PROVIDER=vendor &&
+        -DAURORA_DAWN_PROVIDER=package -DAURORA_SDL3_PROVIDER=vendor \
+        -DSDL_UNIX_CONSOLE_BUILD=ON -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=OFF &&
   cmake --build $BUILD -j $JOBS -- -k 0" >>"$LOG" 2>&1
 STATUS=$?
 ERRS=$(grep -c " error: " "$LOG" || true)
 echo "Errores de compilación: $ERRS" | tee -a "$LOG"
 if [ "$STATUS" -ne 0 ] || [ ! -f "$WC/$BUILD/WiiCompiled" ]; then
-  grep -nE "CMake Error| error: |undefined (reference|symbol)" "$LOG" | sed -E 's#^.*/(runtime-wiisports|generated|aurora-main)/#\1/#' | head -20 | tee -a "$LOG"
+  grep -nE -A4 "CMake Error| error: |undefined (reference|symbol)" "$LOG" | sed -E 's#^.*/(runtime-wiisports|generated|aurora-main|_deps)/#\1/#' | head -30 | tee -a "$LOG"
   cp "$LOG" /mnt/c/Users/Public/choya-build-arm64.log 2>/dev/null
   falla "compilación aarch64"
 fi
