@@ -139,6 +139,54 @@ class TestOptimize(unittest.TestCase):
         self.assertEqual(len(c.data), 32 * 32 * 2)
 
 
+class TestModels(unittest.TestCase):
+    def brres(self):
+        img = fx.gradient(16, 16)
+        return fx.build_brres_folders({
+            "3DModels(NW4R)": [("box", fx.build_mdl0())],
+            "Textures(NW4R)": [("tex_box", fx.tex0_blob(gxtex.RGB565, 16, 16, fx.encode_gx(gxtex.RGB565, img)))]})
+
+    def test_read_mdl0(self):
+        from choya import mdl0
+        b = self.brres()
+        (name, off), = mdl0.find_models(b, containers.brres_sections(b))
+        m = mdl0.read_mdl0(b, off, name)
+        self.assertEqual(m.warnings, [])
+        self.assertEqual((m.stats["objetos"], m.stats["triangulos"]), (1, 2))
+        # el hueso sube el modelo 1 unidad en Y
+        self.assertAlmostEqual(float(m.positions[:, 1].min()), 0.0)
+        self.assertAlmostEqual(float(m.positions[:, 1].max()), 2.0)
+        self.assertEqual(m.materials[0].layers[0].texture, "tex_box")
+        tris = m.positions[m.indices].reshape(-1, 3, 3)
+        # ambos triángulos con el mismo sentido de giro
+        cross = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])[:, 2]
+        self.assertTrue(np.all(cross > 0) or np.all(cross < 0))
+
+    def test_engine_packs_model_with_texture_key(self):
+        from choya import model_pack
+        with tempfile.TemporaryDirectory() as tmp:
+            files = os.path.join(tmp, "disc", "files", "Stage")
+            os.makedirs(files)
+            with open(os.path.join(files, "m.szs"), "wb") as f:
+                f.write(fx.yaz0_literal(u8.build_u8([("g3d/box.brres", self.brres())])))
+            out = os.path.join(tmp, "out")
+            rep = engine.run(os.path.join(tmp, "disc"), out, profiles.get("rg35xxh"), jobs=1, preview=True,
+                             log=lambda *_: None)
+            self.assertEqual(rep["summary"]["models"]["modelos"], 1)
+            self.assertEqual(rep["summary"]["models"]["sin_textura"], 0)
+            _man, entries = pack.read_pack(os.path.join(out, "assets.wlpk"))
+            model = [e for e in entries if e["kind"] == pack.KIND_MODEL][0]
+            tex = [e for e in entries if e["kind"] == pack.KIND_TEXTURE][0]
+            self.assertEqual(model["key"], pack.path_key("Stage/m.szs/g3d/box.brres/box"))
+            mdl = model_pack.unpack_model(model["data"])
+            self.assertEqual(mdl["submeshes"][0][2], tex["key"])
+            self.assertEqual(len(mdl["indices"]), 6)
+            objs = os.listdir(os.path.join(out, "preview", "modelos"))
+            self.assertIn("Stage_m.szs_g3d_box.brres_box.obj", objs)
+            with open(os.path.join(out, "preview", "modelos", "Stage_m.szs_g3d_box.brres_box.mtl")) as fh:
+                self.assertIn("map_Kd ../texturas/", fh.read())
+
+
 class TestQualityFallback(unittest.TestCase):
     def tex(self, fmt, img, source):
         return gxtex.GXTexture("t", fmt, img.shape[1], img.shape[0], 1, fx.encode_gx(fmt, img), source=source)

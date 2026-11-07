@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "wl/audio.h"
+#include "wl/model.h"
 #include "wl/pack.h"
 
 static int decode_dsp_file(const char* in, const char* out) {
@@ -65,7 +66,8 @@ int main(int argc, char** argv) {
     const bool list = argc > 2 && std::strcmp(argv[2], "-l") == 0;
     std::map<std::string, std::pair<int, uint64_t>> by_fmt;
     uint64_t tex_bytes = 0, audio_bytes = 0;
-    int textures = 0, audio = 0, bad_order = 0;
+    int textures = 0, audio = 0, models = 0, bad_order = 0;
+    uint64_t tris = 0;
     for (uint32_t i = 0; i < pack.size(); ++i) {
         const wl::PackEntry& e = pack.entry(i);
         if (i && pack.entry(i - 1).key >= e.key) ++bad_order;
@@ -83,6 +85,14 @@ int main(int argc, char** argv) {
                 std::printf("TEX %016llx %-14s %4ux%-4u m%u %8llu B  %s\n", (unsigned long long)e.key,
                             wl::out_format_name(wl::OutFormat(e.format)), e.width, e.height, e.count,
                             (unsigned long long)e.data_size, pack.name(e));
+        } else if (e.kind == wl::KIND_MODEL) {
+            ++models;
+            wl::ModelView mv;
+            if (!wl::model_view(pack, e, mv)) ++bad_order;
+            else tris += mv.index_count / 3;
+            if (list)
+                std::printf("MDL %016llx %6u vért. %6u tri. %2u submallas  %s\n", (unsigned long long)e.key,
+                            mv.vertex_count, mv.index_count / 3, mv.submesh_count, pack.name(e));
         } else if (e.kind == uint8_t(wl::Kind::Audio)) {
             ++audio;
             audio_bytes += e.data_size;
@@ -97,6 +107,7 @@ int main(int argc, char** argv) {
     for (auto& kv : by_fmt)
         std::printf("  %-14s %5d  %.2f MiB\n", kv.first.c_str(), kv.second.first, kv.second.second / 1048576.0);
     std::printf("audio: %d (%.2f MiB)\n", audio, audio_bytes / 1048576.0);
+    std::printf("modelos: %d (%llu triángulos)\n", models, (unsigned long long)tris);
     if (bad_order) {
         std::printf("ERROR: %d entradas fuera de orden o con clave inconsistente\n", bad_order);
         return 1;

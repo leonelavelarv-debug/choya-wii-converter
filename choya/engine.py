@@ -9,7 +9,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 from PIL import Image
 
-from . import __version__, audio as au, optimize as opt, pack, scan as sc
+from . import __version__, audio as au, mdl0 as md, model_pack as mp, optimize as opt, pack, scan as sc
 from .gxtex import FORMAT_NAMES, GXTexture, level_size
 from .profiles import Profile
 
@@ -35,6 +35,57 @@ def _convert_audio(args):
         return item, None, None, 0, f"{item.path}: {type(e).__name__}: {e}"
 
 
+def _find_texture(model_path: str, tname: str, key_by_name: dict[str, int]) -> int:
+    """Busca la textura de un material: mismo BRRES, luego el archivo más cercano en la ruta."""
+    exact = key_by_name.get(f"{model_path}/{tname}")
+    if exact is not None:
+        return exact
+    best, best_len = 0, -1
+    for full, key in key_by_name.items():
+        if full.rsplit("/", 1)[-1] != tname:
+            continue
+        common = len(os.path.commonprefix([full, model_path]))
+        if common > best_len:
+            best, best_len = key, common
+    return best
+
+
+def _convert_models(res, writer, key_by_name, preview_by_key, obj_dir, errors) -> dict:
+    rows = []
+    totals = dict(modelos=0, fallidos=0, objetos=0, triangulos=0, omitidos=0, sin_textura=0, avisos=0)
+    if obj_dir:
+        os.makedirs(obj_dir, exist_ok=True)
+    for item in res.models:
+        full = f"{item.path}/{item.name}"
+        try:
+            m = md.read_mdl0(item.brres, item.offset, item.name)
+        except Exception as e:  # noqa: BLE001
+            totals["fallidos"] += 1
+            errors.append(f"modelo {full}: {type(e).__name__}: {e}")
+            continue
+        keys, files, missing = [], [], 0
+        for mat in m.materials:
+            key = _find_texture(item.path, mat.layers[0].texture, key_by_name) if mat.layers else 0
+            if mat.layers and not key:
+                missing += 1
+            keys.append(key)
+            files.append(f"../texturas/{preview_by_key[key]}" if key in preview_by_key else None)
+        writer.add(pack.Entry(kind=pack.KIND_MODEL, fmt=1, count=len(m.submeshes), flags=0,
+                              key=pack.path_key(full), name=full, data=mp.pack_model(m, keys),
+                              extra0=len(m.positions), extra1=len(m.indices), extra2=m.stats["triangulos"]))
+        if obj_dir and len(m.indices):
+            mp.write_obj(m, os.path.join(obj_dir, _safe(full) + ".obj"), files)
+        totals["modelos"] += 1
+        for k in ("objetos", "triangulos", "omitidos"):
+            totals[k] += m.stats[k]
+        totals["sin_textura"] += missing
+        totals["avisos"] += len(m.warnings)
+        rows.append(dict(name=full, version=m.version, vertices=len(m.positions), triangles=m.stats["triangulos"],
+                         objects=m.stats["objetos"], skipped=m.stats["omitidos"], materials=len(m.materials),
+                         missing_textures=missing, warnings=m.warnings[:10]))
+    return dict(summary=totals, models=rows)
+
+
 def preview_png(conv: opt.ConvertedTexture) -> Image.Image:
     """El nivel 0 tal como lo verá la GPU, para revisarlo en la PC."""
     d = conv.data[:opt.out_level_size(conv.fmt, conv.width, conv.height)]
@@ -58,11 +109,14 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
     # Deduplicar texturas por clave antes de convertir (la misma textura aparece en varios archivos).
     unique: dict[int, GXTexture] = {}
     refs: dict[int, int] = {}
+    key_by_name: dict[str, int] = {}
     for tex in res.textures:
         lvl0 = tex.data[:level_size(tex.fmt, tex.width, tex.height)]
         key = pack.texture_key(lvl0, tex.width, tex.height, tex.fmt)
         refs[key] = refs.get(key, 0) + 1
         unique.setdefault(key, tex)
+        key_by_name[tex.name] = key
+    preview_by_key: dict[int, str] = {}
     log(f"  {len(unique)} texturas únicas; convirtiendo con el perfil '{profile.name}' ...")
 
     writer = pack.PackWriter(flags=pack.FLAG_GLES3 if profile.gles3 else 0)
@@ -99,7 +153,9 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
             alpha=conv.alpha, psnr=None if conv.psnr is None or conv.psnr == float("inf") else round(conv.psnr, 2),
             uses=refs.get(key, 1), notes=tex.notes, fallback=conv.fallback))
         if preview:
-            preview_png(conv).save(os.path.join(prev_dir, "texturas", f"{_safe(tex.name)}.png"))
+            fname = f"{_safe(tex.name)}.png"
+            preview_png(conv).save(os.path.join(prev_dir, "texturas", fname))
+            preview_by_key[key] = fname
         if done % 50 == 0:
             log(f"    {done}/{len(work)} texturas")
 
@@ -128,6 +184,9 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
             with open(os.path.join(prev_dir, "audio", _safe(item.path) + ".wav"), "wb") as f:
                 f.write(au.wav_bytes(conv or dec))
 
+    model_report = _convert_models(res, writer, key_by_name, preview_by_key,
+                                   os.path.join(prev_dir, "modelos") if preview else None, errors)
+
     tex_report.sort(key=lambda r: -r["naive_vram"])
     summary = dict(
         textures=len(tex_report), texture_refs=len(res.textures),
@@ -146,12 +205,14 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
         f = r["out"].split()[0]
         summary["formats"][f] = summary["formats"].get(f, 0) + 1
 
-    manifest = dict(tool="choya-wii-converter", version=__version__, game_id=gid, revision=disc["revision"],
+    manifest_models = model_report["summary"]["modelos"]
+    manifest = dict(tool="choya-wii-converter", models=manifest_models, version=__version__, game_id=gid, revision=disc["revision"],
                     dol_sha1=disc["dol_sha1"], profile=profile.to_dict(),
                     textures=summary["textures"], audio=summary["audio"])
     pack_path = os.path.join(out_dir, "assets.wlpk")
     size = writer.write(pack_path, manifest)
-    report = dict(manifest=manifest, summary=summary, counts=res.counts, pending=res.pending,
+    summary["models"] = model_report["summary"]
+    report = dict(manifest=manifest, summary=summary, models=model_report["models"], counts=res.counts, pending=res.pending,
                   errors=errors, textures=tex_report, audio=audio_report, pack_bytes=size,
                   disc_files=res.files, disc_bytes=res.disc_bytes, seconds=round(time.time() - t0, 1))
     with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
@@ -214,6 +275,17 @@ def render_markdown(r: dict) -> str:
         lines += ["", f"## Sin compresión por calidad ({len(fb)} texturas, {_mb(extra)})", "",
                   "| Textura | Origen | Salida | Motivo |", "| --- | --- | --- | --- |"]
         lines += [f"| {t['name']} | {t['src']} | {t['out']} | {t['fallback']} |" for t in fb[:30]]
+    mo = s.get("models")
+    if mo:
+        lines += ["", "## Modelos 3D", "",
+                  f"{mo['modelos']} modelos leídos, {mo['fallidos']} fallidos. {mo['objetos']} objetos y "
+                  f"{mo['triangulos']} triángulos; {mo['omitidos']} objetos omitidos, "
+                  f"{mo['sin_textura']} materiales sin su textura, {mo['avisos']} avisos."]
+        problem = [x for x in r.get("models", []) if x["warnings"] or x["skipped"] or x["missing_textures"]]
+        if problem:
+            lines += ["", "| Modelo | Triángulos | Omitidos | Sin textura | Primer aviso |", "| --- | --- | --- | --- | --- |"]
+            lines += [f"| {x['name']} | {x['triangles']} | {x['skipped']} | {x['missing_textures']} | "
+                      f"{(x['warnings'] or [''])[0]} |" for x in problem[:40]]
     lines += ["", "## Contenido del disco", "", "| Tipo | Cantidad |", "| --- | --- |"]
     lines += [f"| {k} | {v} |" for k, v in sorted(r["counts"].items())]
     if r["pending"]:

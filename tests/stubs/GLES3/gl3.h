@@ -38,6 +38,25 @@ typedef unsigned char GLboolean; typedef float GLfloat; typedef char GLchar; typ
 #define GL_FLOAT 0x1406
 #define GL_FALSE 0
 #define GL_TRIANGLE_STRIP 0x0005
+#define GL_TRIANGLES 0x0004
+#define GL_TRUE 1
+#define GL_UNSIGNED_INT 0x1405
+#define GL_ARRAY_BUFFER 0x8892
+#define GL_ELEMENT_ARRAY_BUFFER 0x8893
+#define GL_STATIC_DRAW 0x88E4
+#define GL_DEPTH_TEST 0x0B71
+#define GL_CW 0x0900
+#define GL_BLEND 0x0BE2
+#define GL_SRC_ALPHA 0x0302
+#define GL_ONE_MINUS_SRC_ALPHA 0x0303
+#define GL_CULL_FACE 0x0B44
+#define GL_FRONT 0x0404
+#define GL_BACK 0x0405
+#define GL_FRONT_AND_BACK 0x0408
+#define GL_DEPTH_BUFFER_BIT 0x0100
+#define GL_CLAMP_TO_EDGE 0x812F
+#define GL_MIRRORED_REPEAT 0x8370
+typedef ptrdiff_t GLsizeiptr;
 extern "C" {
 void glGenTextures(GLsizei, GLuint*); void glBindTexture(GLenum, GLuint); void glPixelStorei(GLenum, GLint);
 void glCompressedTexImage2D(GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void*);
@@ -52,4 +71,10 @@ void glUniform1i(GLint, GLint); const GLubyte* glGetString(GLenum); void glViewp
 void glClearColor(GLfloat, GLfloat, GLfloat, GLfloat); void glClear(unsigned int); void glActiveTexture(GLenum);
 void glVertexAttribPointer(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*);
 void glEnableVertexAttribArray(GLuint); void glDrawArrays(GLenum, GLint, GLsizei);
+void glGenVertexArrays(GLsizei, GLuint*); void glBindVertexArray(GLuint); void glDeleteVertexArrays(GLsizei, const GLuint*);
+void glGenBuffers(GLsizei, GLuint*); void glBindBuffer(GLenum, GLuint); void glDeleteBuffers(GLsizei, const GLuint*);
+void glBufferData(GLenum, GLsizeiptr, const void*, GLenum); void glDrawElements(GLenum, GLsizei, GLenum, const void*);
+void glEnable(GLenum); void glDisable(GLenum); void glCullFace(GLenum); void glFrontFace(GLenum);
+void glBlendFunc(GLenum, GLenum); void glDepthMask(GLboolean); void glUniformMatrix4fv(GLint, GLsizei, GLboolean, const GLfloat*);
+void glUniform3f(GLint, GLfloat, GLfloat, GLfloat);
 }

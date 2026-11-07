@@ -83,7 +83,31 @@ Copia `Wii Sports.sh` y la carpeta `wiisports/` a `ports/` en la microSD. Al abr
 
 `wl_info assets.wlpk -l` revisa el paquete por SSH sin abrir la pantalla.
 
-## 6. Conectar con la capa GX del juego
+## 6. Ver modelos 3D en la consola (puerta 1)
+
+Desde la versión 0.2, `convert` también lee los modelos MDL0 de los BRRES. Los guarda en el paquete ya listos para la GPU: posiciones en la pose de reposo, normales, color de vértice, UV y submallas por material con su textura principal.
+
+- **En la PC:** con `--preview`, cada modelo se exporta a `salida/preview/modelos/*.obj`, con sus texturas. Ábrelos con el Visor 3D de Windows o con Blender para comprobar la geometría antes de ir a la consola.
+- **En el reporte:** la sección "Modelos 3D" cuenta modelos, triángulos, objetos omitidos y avisos del lector.
+- **En la consola:** `choya_model` muestra los modelos con cámara orbital y escribe los FPS en `log.txt`:
+
+```powershell
+python -m choya package C:\wii\ports --title "Choya Modelos" --folder choyamodel --pack-dir C:\wii\salida --runtime C:\wii\bin\choya_model --binary choya_model
+```
+
+| Botón | Acción |
+| --- | --- |
+| Cruceta o stick izquierdo | Girar la cámara |
+| A / B | Acercar / alejar |
+| L1 / R1 | Modelo anterior / siguiente |
+| X | Activar o desactivar el descarte de caras traseras |
+| Y | Texturas sí / no |
+| Select | Iluminación sí / no |
+| Start | Salir |
+
+El sombreado de esta versión es simplificado: textura principal × color de vértice × luz direccional. Los colores exactos de cada material (TEV) llegan en la siguiente versión.
+
+## 7. Conectar con la capa GX del juego
 
 El juego (recompilado o decompilado de ogws) llama a `GXInitTexObj` con un puntero a datos GX. La capa de compatibilidad hace esto:
 
@@ -118,8 +142,10 @@ python -m unittest discover tests
 
 ## Pendiente
 
+- **TEV:** traducir los shaders de material de Wii a GLSL ES 3.20. Hoy el visor usa un sombreado simplificado y solo la primera capa de textura.
+- **Modelos con piel (varios huesos por vértice):** se muestran en pose de reposo; las animaciones (CHR0) aún no se leen.
+
 - **BRSAR** (efectos de sonido): se cuenta en el reporte y se deja tal cual en el disco; la capa AX lo decodifica con `wl::dsp_decode`.
-- **Modelos (MDL0) y shaders TEV**: se cuentan pero no se convierten offline; van en la capa GX del runtime (puertas 1 y 3 del plan).
 - **ETC2 punchthrough (RGB8A1)** para CMPR con alfa de 1 bit: hoy usa RGBA8_EAC (8 bpp); con punchthrough bajaría a 4 bpp.
 - El códec ETC2/EAC se verificó con un decodificador propio. Falta confirmarlo en la Mali-G31 con `wl_view`.
 - Las texturas C4/C8 usan como clave solo los índices, no la paleta.

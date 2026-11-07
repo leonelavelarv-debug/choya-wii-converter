@@ -44,6 +44,8 @@ def cmd_info(a):
             if e["kind"] == pack.KIND_TEXTURE:
                 print(f"TEX {e['key']:016x} {OUT_NAMES.get(e['fmt'], e['fmt']):14s} "
                       f"{e['width']}x{e['height']} m{e['count']} {e['size']:8d} B  {e['name']}")
+            elif e["kind"] == pack.KIND_MODEL:
+                print(f"MDL {e['key']:016x} {e['extra0']} vért. {e['extra2']} tri. {e['count']} submallas  {e['name']}")
             else:
                 kind = "DSP-ADPCM" if e["fmt"] == pack.AUDIO_DSPADPCM else "PCM16"
                 print(f"AUD {e['key']:016x} {kind} {e['extra0']} Hz {e['count']} can. "

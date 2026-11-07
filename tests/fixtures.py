@@ -267,3 +267,165 @@ def build_brstm(channels: list[np.ndarray], rate: int, block_size: int = 0x2000,
 
 __all__ = ["encode_gx", "tile", "gradient", "yaz0_literal", "build_brres", "build_u8", "build_dsp",
            "build_brstm", "dsp_encode", "cmpr_block_solid"]
+
+
+# ---------------------------------------------------------------------------- modelos MDL0 sintéticos
+
+def build_brres_folders(folders: dict) -> bytes:
+    """BRRES con varias carpetas. folders = {"3DModels(NW4R)": [(nombre, blob)], ...}."""
+    names = list(folders)
+    strings = bytearray()
+    str_off = {}
+
+    def s(name):
+        if name not in str_off:
+            strings.extend(struct.pack(">I", len(name)))
+            str_off[name] = len(strings)
+            strings.extend(name.encode() + b"\x00")
+            strings.extend(b"\x00" * ((-len(strings)) % 4))
+        return str_off[name]
+
+    root_grp = 0x18
+    root_size = 8 + 16 * (len(names) + 1)
+    cur = root_grp + root_size
+    sub_offs = {}
+    for f in names:
+        sub_offs[f] = cur
+        cur += 8 + 16 * (len(folders[f]) + 1)
+    cur = (cur + 0x1F) & ~0x1F
+    blob_offs = {}
+    for f in names:
+        for n, b in folders[f]:
+            blob_offs[(f, n)] = cur
+            cur = (cur + len(b) + 0x1F) & ~0x1F
+    str_base = cur
+    for f in names:
+        s(f)
+        for n, _ in folders[f]:
+            s(n)
+    out = bytearray(b"bres" + struct.pack(">HHIHH", 0xFEFF, 0, 0, 0x10, 1))
+    out += b"root" + struct.pack(">I", root_size + 8)
+    out += struct.pack(">II", root_size, len(names)) + struct.pack(">HHHHII", 0xFFFF, 0, 1, 0, 0, 0)
+    for f in names:
+        out += struct.pack(">HHHHii", 0, 0, 0, 0, str_base + str_off[f] - root_grp, sub_offs[f] - root_grp)
+    for f in names:
+        g = sub_offs[f]
+        out += struct.pack(">II", 8 + 16 * (len(folders[f]) + 1), len(folders[f]))
+        out += struct.pack(">HHHHII", 0xFFFF, 0, 1, 0, 0, 0)
+        for n, _ in folders[f]:
+            out += struct.pack(">HHHHii", 0, 0, 0, 0, str_base + str_off[n] - g, blob_offs[(f, n)] - g)
+    for f in names:
+        for n, b in folders[f]:
+            out += b"\x00" * (blob_offs[(f, n)] - len(out))
+            out += b
+    out += b"\x00" * (str_base - len(out))
+    out += strings
+    struct.pack_into(">I", out, 8, len(out))
+    return bytes(out)
+
+
+def tex0_blob(fmt: int, w: int, h: int, data: bytes, mips: int = 1) -> bytes:
+    hdr = bytearray(b"TEX0" + struct.pack(">IIi", 0x40 + len(data), 1, 0))
+    hdr += struct.pack(">II", 0x40, 0) + struct.pack(">IHHII", 0, w, h, fmt, mips)
+    hdr += struct.pack(">ff", 0.0, float(mips - 1))
+    hdr += b"\x00" * (0x40 - len(hdr))
+    return bytes(hdr) + data
+
+
+class _Blob:
+    def __init__(self):
+        self.b = bytearray()
+
+    def alloc(self, size: int, align: int = 4) -> int:
+        self.b.extend(b"\x00" * ((-len(self.b)) % align))
+        off = len(self.b)
+        self.b.extend(b"\x00" * size)
+        return off
+
+    def put(self, fmt: str, off: int, *vals):
+        struct.pack_into(fmt, self.b, off, *vals)
+
+
+def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0, 0.0)) -> bytes:
+    """MDL0 v9 con un hueso, 4 vértices (tira de 2 triángulos), UV y un material con textura."""
+    m = _Blob()
+    m.alloc(0x40)
+    m.b[0:4] = b"MDL0"
+    m.put(">I", 8, 9)
+    strings = {}
+
+    def string(txt):
+        if txt not in strings:
+            off = m.alloc(4 + len(txt) + 1)
+            m.put(">I", off, len(txt))
+            m.b[off + 4:off + 4 + len(txt)] = txt.encode()
+            strings[txt] = off + 4
+        return strings[txt]
+
+    def group(entries):            # entries = [(nombre, offset_absoluto)]
+        g = m.alloc(8 + 16 * (len(entries) + 1))
+        m.put(">II", g, 8 + 16 * (len(entries) + 1), len(entries))
+        m.put(">HHHHii", g + 8, 0xFFFF, 0, 1, 0, 0, 0)
+        for i, (n, off) in enumerate(entries, 1):
+            m.put(">HHHHii", g + 8 + i * 16, 0, 0, 0, 0, string(n) - g, off - g)
+        return g
+
+    # hueso
+    bone = m.alloc(0xD0)
+    m.put(">i", bone + 4, -bone)
+    m.put(">ii", bone + 0x0C, 0, 0)
+    m.put(">3f", bone + 0x20, 1, 1, 1)
+    m.put(">3f", bone + 0x38, *translate)
+    m.put(">12f", bone + 0x70, 1, 0, 0, translate[0], 0, 1, 0, translate[1], 0, 0, 1, translate[2])
+    # posiciones (s16, 8 bits de fracción)
+    pos = [(-1, -1, 0), (1, -1, 0), (-1, 1, 0), (1, 1, 0)]
+    vb = m.alloc(0x40 + 6 * 4)
+    m.put(">iiii", vb, 0x40 + 24, -vb, 0x40, 0)
+    m.put(">IIBBH", vb + 0x14, 1, 3, 8, 6, 4)
+    for i, p in enumerate(pos):
+        m.put(">3h", vb + 0x40 + i * 6, *(int(c * 256) for c in p))
+    # UV (float)
+    uvs = [(0, 1), (1, 1), (0, 0), (1, 0)]
+    ub = m.alloc(0x40 + 8 * 4)
+    m.put(">iiii", ub, 0x40 + 32, -ub, 0x40, 0)
+    m.put(">IIBBH", ub + 0x14, 1, 4, 0, 8, 4)
+    for i, uv in enumerate(uvs):
+        m.put(">2f", ub + 0x40 + i * 8, *uv)
+    # material con una capa de textura
+    mat = m.alloc(0x40 + 0x34)
+    m.put(">i", mat + 4, -mat)
+    m.put(">ii", mat + 0x0C, 0, 0)
+    m.put(">I", mat + 0x18, 2)
+    layer = mat + 0x40
+    m.put(">i", layer, string(texture) - layer)
+    m.put(">II", layer + 0x18, 1, 1)
+    # objeto: POS índice8 + TEX0 índice8, una tira de triángulos
+    dl = bytes([0x20, 0x00, 0x00, 0xB0, 0x00]) + bytes([0x98, 0x00, 0x04]) + bytes(
+        [0, 0, 1, 1, 2, 2, 3, 3]) + b"\x00" * 3
+    obj = m.alloc(0x80)
+    prim = m.alloc(len(dl), 32)
+    m.b[prim:prim + len(dl)] = dl
+    m.put(">i", obj + 4, -obj)
+    m.put(">i", obj + 0x08, 0)
+    m.put(">II", obj + 0x0C, 2 << 9, 2)
+    m.put(">IIi", obj + 0x24, len(dl), len(dl), prim - (obj + 0x24))
+    m.put(">i", obj + 0x3C, 0)
+    m.put(">hhhh8h", obj + 0x48, 0, -1, -1, -1, 0, -1, -1, -1, -1, -1, -1, -1)
+    # enlaces de texturas
+    tl = m.alloc(4 + 8)
+    m.put(">Iii", tl, 1, mat - tl, layer - tl)
+    # definiciones
+    draw = m.alloc(16)
+    m.b[draw:draw + 9] = bytes([0x04, 0, 0, 0, 0, 0, 0, 0, 0x01])
+    groups = {
+        "defs": group([("DrawOpa", draw)]), "bones": group([("root", bone)]),
+        "verts": group([("pos", vb)]), "uvs": group([("uv", ub)]), "mats": group([("mat", mat)]),
+        "objs": group([("obj", obj)]), "texs": group([(texture, tl)]),
+    }
+    order = ["defs", "bones", "verts", "norms", "colors", "uvs", "mats", "shaders", "objs", "texs", "pals"]
+    for i, sname in enumerate(order):
+        m.put(">i", 0x10 + 4 * i, groups.get(sname, 0))
+    m.put(">i", 0x10 + 44, string(name))
+    m.b.extend(b"\x00" * ((-len(m.b)) % 32))
+    m.put(">I", 4, len(m.b))
+    return bytes(m.b)

@@ -26,6 +26,7 @@ assert HEADER.size == 64 and ENTRY.size == 48
 
 KIND_TEXTURE = 1
 KIND_AUDIO = 2
+KIND_MODEL = 3     # ver choya/model_pack.py
 
 AUDIO_PCM16 = 1
 AUDIO_DSPADPCM = 2   # ver audio.adpcm_payload; el runtime lo decodifica al vuelo

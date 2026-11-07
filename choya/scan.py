@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from . import audio, compress, containers, u8
+from . import audio, compress, containers, mdl0, u8
 from .gxtex import GXTexture
 
 
@@ -16,10 +16,19 @@ class AudioItem:
 
 
 @dataclass
+class ModelItem:
+    path: str          # ruta del BRRES dentro del disco
+    name: str          # nombre del modelo dentro del BRRES
+    offset: int        # posición del MDL0 dentro del BRRES
+    brres: bytes
+
+
+@dataclass
 class ScanResult:
     root: str
     textures: list[GXTexture] = field(default_factory=list)
     audio: list[AudioItem] = field(default_factory=list)
+    models: list[ModelItem] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
     pending: list[str] = field(default_factory=list)     # tipos conocidos aún no convertidos
     errors: list[str] = field(default_factory=list)
@@ -102,6 +111,8 @@ def _visit(res: ScanResult, path: str, data: bytes, depth: int):
             res.bump("BRRES")
             texs, counts = containers.read_brres(raw, source=path)
             res.textures.extend(texs)
+            for mname, moff in mdl0.find_models(raw, containers.brres_sections(raw)):
+                res.models.append(ModelItem(path, mname, moff, raw))
             for folder, n in counts.items():
                 res.bump(folder, n)
         elif containers.is_tpl(raw):
