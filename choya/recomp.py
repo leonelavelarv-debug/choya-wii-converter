@@ -4,7 +4,7 @@ Choya no incluye código de WiiCompiled (GPLv3) ni del juego. Solo escribe archi
 configuración a partir del main.dol del usuario y de los símbolos de ogws (CC0):
 
   projects/wiisports/recomp.yml   manifiesto del traductor (SDA, entrada, SHA-256)
-  projects/wiisports/MAP.txt      direcciones y nombres de las 14 122 funciones
+  projects/wiisports/MAP.txt      direcciones y nombres de las 14 121 funciones
   projects/wiisports/native/      carpeta vacía para las funciones nativas (HLE) de Wii Sports
   projects/wiisports/hle_cobertura.md   qué funciones nativas de WiiCompiled existen en Wii Sports
 """
@@ -29,12 +29,19 @@ _OVERRIDE = re.compile(r"\b(PPC_NATIVE_OVERRIDE\w*|REGISTER_NATIVE_FUNCTION\w*|R
                        r"\(\s*(?:0x)?([0-9A-Fa-f]{8})\s*,\s*([A-Za-z_]\w*)")
 
 
+def is_placeholder(name: str) -> bool:
+    """decomp-toolkit llama pad_* a huecos sin analizar. En Wii Sports el único que cae en código es
+    pad_00_80004188_init: la tabla de vectores del depurador MetroTRK (empieza con el texto
+    "Metrowerks..."), que el juego nunca llama. Traducirla como función deja una instrucción inválida."""
+    return name.startswith("pad_")
+
+
 def parse_symbols(text: str) -> list[tuple[int, str]]:
     """symbols.txt de decomp-toolkit (ogws) → [(dirección, nombre)] de funciones, ordenado."""
     out = {}
     for line in text.splitlines():
         m = _SYM.match(line)
-        if m:
+        if m and not is_placeholder(m.group(1)):
             out.setdefault(int(m.group(3), 16), m.group(1))
     return sorted(out.items())
 
@@ -45,7 +52,9 @@ def parse_map(text: str) -> list[tuple[int, str]]:
         p = line.split()
         if not p or p[0].startswith("#"):
             continue
-        out.append((int(p[0], 16), p[1] if len(p) > 1 else ""))
+        name = p[1] if len(p) > 1 else ""
+        if not is_placeholder(name):
+            out.append((int(p[0], 16), name))
     return out
 
 

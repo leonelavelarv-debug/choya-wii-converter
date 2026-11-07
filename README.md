@@ -153,7 +153,7 @@ Escribe en `projects\wiisports\`:
 | Archivo | Qué es |
 |---|---|
 | `recomp.yml` | manifiesto: bases SDA (r13/r2) leídas de `__init_registers`, entrada `__start` 0x80006124, SHA-256 de tu `main.dol` |
-| `MAP.txt` | 14 122 funciones con nombre, de los símbolos de [ogws](https://github.com/doldecomp/ogws) (CC0, incluidos en `choya/data`) |
+| `MAP.txt` | 14 121 funciones con nombre, de los símbolos de [ogws](https://github.com/doldecomp/ogws) (CC0, incluidos en `choya/data`) |
 | `native\` | carpeta vacía para las funciones nativas propias de Wii Sports |
 | `hle_cobertura.md` | qué funciones nativas de WiiCompiled existen en Wii Sports y en qué dirección |
 

@@ -53,11 +53,16 @@ class TestRecompPrep(unittest.TestCase):
                "lbl_1 = .data:0x80300000; // type:object size:0x4\n"
                "main = .text:0x80156448; // type:function size:0x10\n")
         self.assertEqual(recomp.parse_symbols(txt), [(START, "__start"), (0x80156448, "main")])
+        pad = "pad_00_80004188_init = .init:0x80004188; // type:function size:0x1F34 scope:local\n"
+        self.assertEqual(recomp.parse_symbols(pad + txt)[0], (START, "__start"))
+        self.assertEqual(recomp.parse_map("80004188 pad_00_80004188_init\n80006124 __start\n"),
+                         [(START, "__start")])
 
     def test_bundled_map(self):
         funcs, _src = recomp.load_functions(None)
         names = {n: a for a, n in funcs}
-        self.assertEqual(len(funcs), 14122)
+        self.assertEqual(len(funcs), 14121)
+        self.assertNotIn(0x80004188, dict(funcs))
         self.assertEqual(names["__start"], recomp.WIISPORTS_START)
         self.assertEqual(names["__init_registers"], recomp.WIISPORTS_INIT_REGISTERS)
         self.assertEqual(names["main"], 0x80183EE4)
