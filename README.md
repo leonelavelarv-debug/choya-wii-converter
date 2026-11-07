@@ -153,77 +153,13 @@ Escribe en `projects\wiisports\`:
 | Archivo | Qué es |
 |---|---|
 | `recomp.yml` | manifiesto: bases SDA (r13/r2) leídas de `__init_registers`, entrada `__start` 0x80006124, SHA-256 de tu `main.dol` |
-| `MAP.txt` | 14 121 funciones con nombre, de los símbolos de [ogws](https://github.com/doldecomp/ogws) (CC0, incluidos en `choya/data`) |
+| `MAP.txt` | 14 122 funciones con nombre, de los símbolos de [ogws](https://github.com/doldecomp/ogws) (CC0, incluidos en `choya/data`) |
 | `native\` | carpeta vacía para las funciones nativas propias de Wii Sports |
 | `hle_cobertura.md` | qué funciones nativas de WiiCompiled existen en Wii Sports y en qué dirección |
 
 Solo acepta Wii Sports USA Rev 1 (el mismo `main.dol` que ogws). Con `--simbolos` se le da otro `symbols.txt` o `MAP.txt`.
 
-### Mover el runtime de WiiCompiled a Wii Sports
-
-```powershell
-choya recomp-native C:\choya\BrawlRecompiled\wiicompiled
-```
-
-El runtime de WiiCompiled tiene ~400 funciones nativas (gráficos, sistema, disco, control, sonido) y decenas de variables del SDK, todas en direcciones de otros juegos (Brawl, NSMBW, MKW, SPM). El comando:
-
-1. Copia `runtime\` a `runtime-wiisports\` (el original no se toca; la copia se rehace cada vez).
-2. Busca cada función nativa por su nombre en los símbolos de ogws y le pone la dirección de Wii Sports.
-3. Desactiva con `#if 0` las que Wii Sports no tiene (por ejemplo el control de GameCube) y las repetidas.
-4. Mueve las variables del SDK que el comentario nombra (`// FifoObj`, `// HorVer+0x1C`, `// HorVer.DispSizeX`).
-5. Aplica los parches revisados a mano para Wii Sports: entrada `__start`, inicio y fin de la memoria (MEM1 arena, calculados de tu `main.dol` y `fst.bin`), ID del disco (`boot.bin`), manejadores de interrupción de GX, tarea del DSP de sonido, `__DVDFSInit`, tablas de SC (buscadas en tu `main.dol`), etc.
-6. Recalcula los desfases desde r13/r2 (`r13 - 0x3d00 // PowerCallback`) con la base SDA de Wii Sports.
-7. Deduce funciones sin nombre por sus vecinas: si las dos funciones nativas más cercanas se movieron con el mismo desfase y ese desfase cae justo en el inicio de una función de Wii Sports, es esa.
-8. Comprueba que los objetos del SDK de 2006 (`OSThread`, `OSContext`, `GXFifoObj`, `GXData`) miden lo que el runtime espera.
-9. Cambia `recomp.yml` para que el traductor use `runtime-wiisports\src`.
-10. Renombra las llamadas a funciones de otros juegos que Wii Sports no tiene (`choya_ausente_XXXXXXXX`) y las define en `src/choya_ausentes.cpp`: así enlaza, y si alguna llegara a llamarse el programa se detiene diciendo cuál.
-11. Reactiva las funciones nativas que WiiCompiled apagó solo porque Brawl, SPM o NSMBW no las tenían (`#if 0  // BRAWL: no matching function...`) cuando Wii Sports sí las tiene, como `OSInitFont` o las de NAND y caché.
-12. Agrega funciones nativas propias para lo que Wii Sports usa y los juegos de WiiCompiled no (`src/choya_wiisports_hle.cpp`); la primera es `WPADSetSensorBarPower`, que en la consola enciende la barra de sensores por un registro de hardware.
-13. Hace unos pocos cambios de código revisados a mano (cada uno debe encontrar su texto exacto o se anota sin tocar nada): botón **B** en el teclado (S o B) y en el mando (gatillo derecho), porque Wii Sports lo pide desde la pantalla de título; la pantalla de inicio dice Wii Sports y conserva el crédito de BrawlRecompiled y WiiCompiled; y el mensaje de `OSSetPowerCallback`, que Wii Sports llama en cada cuadro, solo se anota cuando cambia.
-14. Escribe `projects\wiisports\retarget.md` con todo lo que cambió y lo que no pudo resolver.
-
-Ante la duda no cambia nada: una dirección sin pista segura queda igual y aparece en la lista "Sin resolver" para revisarla a mano.
-
-
-### Traducir y compilar en Ubuntu (WSL2)
-
-Linux x86_64 es lo más parecido a la consola (Linux ARM64) y WiiCompiled lo soporta tal cual. Un solo script hace todo: `recomp-prep`, `recomp-native`, traducir, `generate-data-init`, `emit-build-shards`, configurar CMake (descarga Dawn la primera vez) y compilar con Clang sin detenerse en el primer error.
-
-```sh
-sudo apt install -y clang lld cmake ninja-build git pkg-config dotnet-sdk-8.0 python3-numpy python3-pil \
-  libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
-  libxkbcommon-dev libwayland-dev wayland-protocols libegl1-mesa-dev libgles-dev libdrm-dev libgbm-dev \
-  libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libvulkan-dev mesa-vulkan-drivers
-bash scripts/build-wiisports-wsl.sh /mnt/c/wii/RSPE01/DATA/sys/main.dol ~/BrawlRecompiled/wiicompiled
-```
-
-Con `RAPIDO=1` delante no vuelve a traducir: solo rehace el runtime y enlaza. Todo queda en `~/choya-build.log` (y una copia en `C:\Users\Public\choya-build.log`); al final imprime cuántos errores hubo y en qué archivos.
-
-
-Controles con teclado: **A** = A, **S** o **B** = B, **Z**/Shift = 1, **X**/Espacio = 2, flechas = cruz, Enter/Esc = +, guion/Tab = −, **C**/Ctrl = agitar. Con mando: el gatillo derecho es B.
-
-Para arrancarlo y ver dónde se detiene:
-
-```sh
-bash scripts/run-wiisports-wsl.sh /mnt/c/wii/RSPE01/DATA
-python3 -m choya donde 0x80009D90      # qué función de Wii Sports hay en una dirección
-```
-
-### Wii Sports en la RG35XX H (en progreso)
-
-El driver de la Mali-G31 de KNULLI solo ofrece Vulkan 1.0 y Dawn (los gráficos de WiiCompiled) pide 1.1, así que la primera prueba en la consola usa el modo de gráficos **null**: el juego corre completo sin imagen (con sonido) y el log dice cuántos cuadros por segundo da el procesador.
-
-```sh
-bash scripts/build-wiisports-wsl.sh /mnt/c/wii/RSPE01/DATA/sys/main.dol ~/BrawlRecompiled/wiicompiled   # una vez
-bash scripts/build-wiisports-arm64.sh ~/BrawlRecompiled/wiicompiled
-```
-
-Compila con Docker (Ubuntu 24.04, glibc 2.39, Clang 21, `-mcpu=cortex-a53`, libstdc++ estática) y deja `C:\Users\Public\choya-port\`: `Wii Sports (Choya).sh` y la carpeta `wiisports-choya` van a la carpeta `ports` de la microSD, y la carpeta `DATA` del disco extraído va en `wiisports-choya/game/`. Al abrirlo desde Ports corre 90 segundos y escribe `run.log` y `resumen.txt`.
-
-`scripts/knulli/Choya-Info.sh` (desde Ports) escribe `choya-info.txt` con el sistema, la GPU, Vulkan/GLES y el espacio libre.
-
-
-Lo que genera el traductor (`generated\`, `build-wiisports\`) contiene código del juego: no lo subas a ningún repositorio.
+Lo que genera el traductor (`build\wiisports\`) contiene código del juego: no lo subas a ningún repositorio.
 
 ## Formato `.wlpk`
 
@@ -235,7 +171,7 @@ Little-endian, alineado a 16 bytes: cabecera de 64 bytes, tabla de entradas de 4
 python -m unittest discover tests
 ```
 
-44 pruebas con datos sintéticos (7 necesitan el runtime compilado): Yaz0/LZ77, U8, BRRES, TPL, los 11 formatos GX, ETC2/EAC (calidad y que nunca desborde el modo diferencial), DSP-ADPCM, BRSTM con bloques entrelazados, respaldo por calidad, audio ADPCM con bucle decodificado en C++, modelos MDL0, TEV con la configuración de materiales reales compilado y dibujado en OpenGL ES por software (Mesa llvmpipe) con revisión de píxeles, conversión de punta a punta, una prueba cruzada donde el runtime C++ lee el paquete de Python (claves, caché y audio idénticos), la lectura de `main.dol` y del arranque para WiiCompiled, y el cambio de direcciones del runtime de WiiCompiled.
+39 pruebas con datos sintéticos (7 necesitan el runtime compilado): Yaz0/LZ77, U8, BRRES, TPL, los 11 formatos GX, ETC2/EAC (calidad y que nunca desborde el modo diferencial), DSP-ADPCM, BRSTM con bloques entrelazados, respaldo por calidad, audio ADPCM con bucle decodificado en C++, modelos MDL0, TEV con la configuración de materiales reales compilado y dibujado en OpenGL ES por software (Mesa llvmpipe) con revisión de píxeles, conversión de punta a punta, una prueba cruzada donde el runtime C++ lee el paquete de Python (claves, caché y audio idénticos), y la lectura de `main.dol` y del arranque para WiiCompiled.
 
 ## Pendiente
 

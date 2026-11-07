@@ -113,75 +113,6 @@ def cmd_recomp_prep(a):
     print(f"Proyecto escrito en {r.project_dir}")
 
 
-def cmd_recomp_native(a):
-    from . import retarget
-    r = retarget.retarget(a.wiicompiled, simbolos=a.simbolos, rehacer=a.rehacer)
-    proj = os.path.join(a.wiicompiled, "projects", "wiisports")
-    os.makedirs(proj, exist_ok=True)
-    rep = os.path.join(proj, "retarget.md")
-    with open(rep, "w", encoding="utf-8", newline="\n") as f:
-        f.write(retarget.report_markdown(r))
-    yml = os.path.join(proj, "recomp.yml")
-    print(f"Runtime copiado a:          {r.out_dir}")
-    print(f"Direcciones de origen:      {r.source_game}")
-    print(f"Funciones nativas movidas:  {r.count('registro')}")
-    print(f"Desactivadas (no existen):  {r.count('desactivado')}")
-    print(f"Reactivadas para Wii Sports:{r.count('reactivado'):3d}")
-    print(f"Repetidas desactivadas:     {r.count('duplicado')}")
-    print(f"Llamadas movidas:           {r.count('funcion')}")
-    print(f"Variables movidas:          {r.count('dato')}")
-    print(f"Desfases SDA movidos:       {r.count('sda')}")
-    print(f"Deducidas por vecinas:      {r.count('vecinos')}")
-    print(f"Parches revisados a mano:   {r.count('parche')}")
-    print(f"Nativas propias de Choya:   {r.count('choya_nativa')} ({retarget.HLE_FILE})")
-    print(f"Funciones de otros juegos:  {r.count('ausente')} (stub en {retarget.MISSING_FILE})")
-    bad = [c for c in r.changes if c.kind == "parche_fallido"]
-    for c in bad:
-        print(f"AVISO: parche no aplicado: {c.name} ({c.file}): {c.text}")
-    g = r.game
-    if g is not None and g.entry is not None:
-        lo, hi = g.arena_lo, g.arena_hi
-        print(f"Entrada {g.entry:08X} · SDA {g.sda or 0:08X}/{g.sda2 or 0:08X} · MEM1 arena "
-              f"{'?' if lo is None else f'{lo:08X}'}-{'?' if hi is None else f'{hi:08X}'}")
-    wrong = [s for s in r.structs if s[2] != s[1]]
-    print("Estructuras del SDK: " + ("iguales a las que espera el runtime" if not wrong else
-                                     "REVISAR " + ", ".join(s[0] for s in wrong)))
-    print(f"Sin resolver (a mano):      {r.count('sin_resolver')}")
-    print(f"Informe:                    {rep}")
-    if os.path.isfile(yml) and retarget.update_manifest(yml):
-        print(f"recomp.yml ahora usa {retarget.OUT_DIR}/src para las funciones nativas")
-    else:
-        print("AVISO: no encontré projects/wiisports/recomp.yml; corre primero recomp-prep")
-
-
-def cmd_donde(a):
-    """Nombre de la función de Wii Sports que contiene cada dirección (para leer los registros de un fallo)."""
-    import bisect
-    import re as _re
-    from . import retarget
-    ws = retarget.load_wiisports_symbols(a.simbolos)
-    rows = sorted((addr, name) for name, addr in ws.funcs.items())
-    keys = [r[0] for r in rows]
-    text = " ".join(a.direcciones)
-    if a.archivo:
-        with open(a.archivo, encoding="utf-8", errors="replace") as f:
-            text += " " + " ".join(f.read().splitlines()[-a.lineas:])
-    seen = []
-    for h in _re.findall(r"(?:0x)?(8[0-1][0-9A-Fa-f]{6})\b", text):
-        v = int(h, 16)
-        if v not in seen:
-            seen.append(v)
-    for v in seen:
-        i = bisect.bisect_right(keys, v) - 1
-        if i < 0:
-            continue
-        addr, name = rows[i]
-        size = ws.size.get(addr, 0)
-        if size and v >= addr + size:
-            continue                     # pila, montículo o datos: no es código del juego
-        print(f"{v:08X}  {name}+0x{v - addr:X}")
-
-
 def cmd_profiles(_a):
     for p in profiles.PROFILES.values():
         print(f"{p.name:10s} {p.description}")
@@ -235,21 +166,6 @@ def main(argv=None):
     rp.add_argument("--simbolos", help="symbols.txt de ogws o un MAP.txt (por defecto el incluido)")
     rp.add_argument("--forzar", action="store_true", help="seguir aunque el main.dol no sea RSPE01 Rev 1")
     rp.set_defaults(fn=cmd_recomp_prep)
-
-    rn = sub.add_parser("recomp-native",
-                        help="copia el runtime de WiiCompiled y lo mueve a las direcciones de Wii Sports")
-    rn.add_argument("wiicompiled", help="carpeta de WiiCompiled (la misma de recomp-prep)")
-    rn.add_argument("--simbolos", help="symbols.txt de ogws (por defecto el incluido)")
-    rn.add_argument("--rehacer", action="store_true",
-                    help="reemplazar runtime-wiisports aunque no lo haya creado Choya")
-    rn.set_defaults(fn=cmd_recomp_native)
-
-    dn = sub.add_parser("donde", help="qué función de Wii Sports hay en una dirección (para leer fallos)")
-    dn.add_argument("direcciones", nargs="*", help="direcciones en hexadecimal, p. ej. 0x80009D90")
-    dn.add_argument("-a", "--archivo", help="log de WiiCompiled: busca direcciones en sus últimas líneas")
-    dn.add_argument("--lineas", type=int, default=80, help="cuántas líneas del final del log mirar")
-    dn.add_argument("--simbolos", help="symbols.txt de ogws (por defecto el incluido)")
-    dn.set_defaults(fn=cmd_donde)
 
     pr = sub.add_parser("profiles", help="lista los perfiles de optimización")
     pr.set_defaults(fn=cmd_profiles)
