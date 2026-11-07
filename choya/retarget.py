@@ -821,6 +821,20 @@ EDITS = [
      'static constexpr std::array<std::string_view, 3> values{"auto", "vulkan", "null"};  // choya',
      "gráficos null en Linux"),
     # Compilado en la PC para la consola: -mcpu=native describiría la PC. La RG35XX H es Cortex-A53 (ARMv8.0).
+    # Clang no tiene __builtin_setjmp/__builtin_longjmp en aarch64. Solo los usan los save states: en ARM el cambio de
+    # hilo va directo y los save states quedan apagados. En la PC (x86-64) todo sigue igual.
+    ("src/save_states.cpp", "    __builtin_longjmp(slot.jmp, 1);\n",
+     "#if defined(__x86_64__)\n    __builtin_longjmp(slot.jmp, 1);\n#else\n    std::abort();  // choya: sin save states en ARM\n#endif\n",
+     "save states solo en x86-64 (salto)"),
+    ("src/save_states.cpp", "    void** jmp = g_fibers[HostContext::Current()].jmp;\n    if (__builtin_setjmp(jmp) == 0) {",
+     "#if !defined(__x86_64__)\n    HostContext::Switch(target);  // choya: ARM, cambio de hilo directo\n#else\n"
+     "    void** jmp = g_fibers[HostContext::Current()].jmp;\n    if (__builtin_setjmp(jmp) == 0) {",
+     "save states solo en x86-64 (cambio de hilo)"),
+    ("src/save_states.cpp", "        SwitchBelow(target);\n    }\n}",
+     "        SwitchBelow(target);\n    }\n#endif\n}", "save states solo en x86-64 (cierre)"),
+    ("src/save_states.cpp", "bool Available() { return !DetClock::Enabled(); }",
+     "bool Available() {\n#if defined(__x86_64__)\n    return !DetClock::Enabled();\n#else\n    return false;  // choya: sin save states en ARM\n#endif\n}",
+     "save states solo en x86-64 (menú)"),
     ("cmake/PublicProducts.cmake", "    set(MKW_BASELINE_ARCH_FLAG -mcpu=native)",
      "    set(MKW_BASELINE_ARCH_FLAG -mcpu=cortex-a53)  # choya: RG35XX H (Allwinner H700, Cortex-A53)",
      "procesador de la consola"),

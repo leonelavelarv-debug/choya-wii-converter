@@ -355,6 +355,17 @@ class TestChoyaNatives(unittest.TestCase):
 
 
 class TestEdits(unittest.TestCase):
+    def test_save_states_arm(self):
+        from choya import retarget as R
+        real = "/home/claude/ext/brawlrecomp/wiicompiled/runtime/src/save_states.cpp"
+        import os
+        if not os.path.exists(real):
+            self.skipTest("sin WiiCompiled")
+        changes = []
+        out = R.apply_edits(open(real).read(), "src/save_states.cpp", changes)
+        self.assertEqual([c.kind for c in changes], ["edicion"] * 4)
+        self.assertEqual(out.count("#if"), open(real).read().count("#if") + 3)
+
     def test_exact_once(self):
         from choya import retarget as R
         changes = []
