@@ -350,3 +350,16 @@ class TestChoyaNatives(unittest.TestCase):
         self.assertEqual(len(changes), 1)
         # si WiiCompiled ya la reemplaza, Choya no la duplica
         self.assertNotIn("PPC_NATIVE_OVERRIDE", R.choya_natives(ws, {0x800CFF18: "otro.cpp"}, []))
+
+
+class TestEdits(unittest.TestCase):
+    def test_exact_once(self):
+        from choya import retarget as R
+        changes = []
+        src = "enum Action : int {\n    kMinus,\n    kActionCount,\n};\n"
+        out = R.apply_edits(src, "include/keybinds.h", changes)
+        self.assertIn("kButtonB,", out)
+        self.assertEqual([c.kind for c in changes], ["edicion"])
+        changes = []
+        self.assertEqual(R.apply_edits("nada que ver\n", "include/keybinds.h", changes), "nada que ver\n")
+        self.assertEqual([c.kind for c in changes], ["parche_fallido"])

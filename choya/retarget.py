@@ -761,6 +761,71 @@ def struct_checks(ws: Symbols) -> list[tuple[str, int, int | None, str]]:
     return out
 
 
+# Cambios de código (no de direcciones) para Wii Sports: (archivo, texto exacto, reemplazo, etiqueta).
+# Cada texto debe aparecer exactamente una vez; si no, se anota y no se toca nada.
+_B_NOTE = "  // choya: botón B, Wii Sports lo pide en casi todos los menús"
+EDITS = [
+    # Botón B en el teclado (S o B) y en el mando (gatillo derecho). Los juegos de WiiCompiled se juegan con
+    # el Wii Remote de lado y no lo usan; Wii Sports pide "A y B" desde la pantalla de título.
+    ("include/keybinds.h", "    kMinus,\n    kActionCount,",
+     "    kMinus,\n    kButtonB," + _B_NOTE + "\n    kActionCount,", "tecla para el botón B"),
+    ("src/keybinds.cpp", '{"minus", "- (Minus)", {SDL_SCANCODE_MINUS, SDL_SCANCODE_TAB}},',
+     '{"minus", "- (Minus)", {SDL_SCANCODE_MINUS, SDL_SCANCODE_TAB}},\n'
+     '        {"b", "B", {SDL_SCANCODE_S, SDL_SCANCODE_B}},' + _B_NOTE, "tecla para el botón B"),
+    ("src/virtual_remote.cpp", "kWpadMinus = 0x1000;",
+     "kWpadMinus = 0x1000, kWpadB = 0x0400;" + _B_NOTE, "tecla para el botón B"),
+    ("src/virtual_remote.cpp", "    if (Held(kMinus)) intent.buttons |= kWpadMinus;\n",
+     "    if (Held(kMinus)) intent.buttons |= kWpadMinus;\n"
+     "    if (Held(kButtonB)) intent.buttons |= kWpadB;" + _B_NOTE + "\n", "tecla para el botón B"),
+    ("src/virtual_remote.cpp", "        if (held(kMinus)) intent.buttons |= kWpadMinus;\n",
+     "        if (held(kMinus)) intent.buttons |= kWpadMinus;\n"
+     "        if (held(kButtonB)) intent.buttons |= kWpadB;" + _B_NOTE + "\n", "botón B en el mando"),
+    ("src/virtual_remote.cpp",
+     '    {"rightshoulder,righttrigger", "rightshoulder,righttrigger", "rightshoulder,righttrigger"},',
+     '    {"rightshoulder", "rightshoulder", "rightshoulder"},  // choya: agitar solo con RB (el gatillo es B)',
+     "botón B en el mando"),
+    ("src/virtual_remote.cpp",
+     '    {"back,leftshoulder,lefttrigger", "back,touchpad,leftshoulder,lefttrigger", "back,leftshoulder,lefttrigger"},\n};',
+     '    {"back,leftshoulder,lefttrigger", "back,touchpad,leftshoulder,lefttrigger", "back,leftshoulder,lefttrigger"},\n'
+     '    {"righttrigger", "righttrigger", "righttrigger"},' + _B_NOTE + '\n};', "botón B en el mando"),
+    ("src/virtual_remote.cpp", '"plus", "minus",\n};', '"plus", "minus", "b",' + _B_NOTE + '\n};',
+     "botón B en el mando"),
+    # Wii Sports registra su función de apagado en cada cuadro: anotarlo solo cuando cambia.
+    ("src/hle/os/os_interrupt.cpp",
+     '    RT_LOG(RT_TAG_OS) << "OSSetPowerCallback_801ab75c called: newCB=0x"\n'
+     '              << std::hex << newCallback << std::dec << std::endl;',
+     '    static uint32_t choyaLastPowerCallback = 0xFFFFFFFFu;  // choya: Wii Sports la llama en cada cuadro\n'
+     '    if (newCallback != choyaLastPowerCallback) {\n'
+     '        choyaLastPowerCallback = newCallback;\n'
+     '        RT_LOG(RT_TAG_OS) << "OSSetPowerCallback_801ab75c called: newCB=0x"\n'
+     '                  << std::hex << newCallback << std::dec << std::endl;\n'
+     '    }', "log de OSSetPowerCallback solo al cambiar"),
+    # Pantalla de inicio: dice qué juego es y conserva el crédito del runtime.
+    ("src/settings_overlay.cpp", 'constexpr const char* kTitle = "Made by JosiahG";',
+     'constexpr const char* kTitle = "Wii Sports - Choya Wii Converter";  // choya', "pantalla de inicio"),
+    ("src/settings_overlay.cpp", '"A Super Smash Bros. Brawl PC recomp. Built on WiiCompiled\'s code.";',
+     '"Runtime: BrawlRecompiled by JosiahG, built on WiiCompiled. Press A.";  // choya', "pantalla de inicio"),
+    ("src/settings_overlay.cpp", 'Outlined("SUPER SMASH BROS. BRAWL",', 'Outlined("WII SPORTS",', "pantalla de inicio"),
+    ("src/settings_overlay.cpp", 'Outlined("Made by JosiahG",', 'Outlined("Choya Wii Converter",',
+     "pantalla de inicio"),
+]
+
+
+def apply_edits(text: str, rel: str, changes: list[Change]) -> str:
+    for file, old, new, label in EDITS:
+        if file != rel:
+            continue
+        n = text.count(old)
+        if n != 1:
+            changes.append(Change(rel, 0, "parche_fallido", 0, None, label,
+                                  "texto no encontrado (¿cambió WiiCompiled?)" if n == 0 else f"aparece {n} veces"))
+            continue
+        line = _line_of(text, text.index(old))
+        text = text.replace(old, new, 1)
+        changes.append(Change(rel, line, "edicion", 0, None, label, label))
+    return text
+
+
 def apply_patches(text: str, rel: str, ws: Symbols, game: GameInfo, changes: list[Change]) -> str:
     for p in PATCHES:
         if p.file != rel:
@@ -828,7 +893,8 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
             rel = os.path.relpath(path, out).replace("\\", "/")
             with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
                 text = f.read()
-            new = apply_patches(text, rel, res.ws, game, result.changes)
+            new = apply_edits(text, rel, result.changes)
+            new = apply_patches(new, rel, res.ws, game, result.changes)
             new = retarget_text(new, rel, res, registered, result.changes)
             if new != text:
                 with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
@@ -905,6 +971,7 @@ def report_markdown(r: RetargetResult) -> str:
          f"| Variables por desfase SDA (r13/r2) movidas | {r.count('sda')} |",
          f"| Funciones deducidas por sus vecinas | {r.count('vecinos')} |",
          f"| Parches revisados a mano aplicados | {r.count('parche')} |",
+         f"| Cambios de código para Wii Sports (p. ej. botón B) | {r.count('edicion')} |",
          f"| **Parches que no se pudieron aplicar** | {r.count('parche_fallido')} |",
          f"| Funciones nativas propias de Choya ({HLE_FILE}) | {r.count('choya_nativa')} |",
          f"| Funciones de otros juegos sin equivalente (stub en {MISSING_FILE}) | {r.count('ausente')} |",
