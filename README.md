@@ -177,7 +177,8 @@ El runtime de WiiCompiled tiene ~400 funciones nativas (gráficos, sistema, disc
 8. Comprueba que los objetos del SDK de 2006 (`OSThread`, `OSContext`, `GXFifoObj`, `GXData`) miden lo que el runtime espera.
 9. Cambia `recomp.yml` para que el traductor use `runtime-wiisports\src`.
 10. Renombra las llamadas a funciones de otros juegos que Wii Sports no tiene (`choya_ausente_XXXXXXXX`) y las define en `src/choya_ausentes.cpp`: así enlaza, y si alguna llegara a llamarse el programa se detiene diciendo cuál.
-11. Escribe `projects\wiisports\retarget.md` con todo lo que cambió y lo que no pudo resolver.
+11. Reactiva las funciones nativas que WiiCompiled apagó solo porque Brawl, SPM o NSMBW no las tenían (`#if 0  // BRAWL: no matching function...`) cuando Wii Sports sí las tiene, como `OSInitFont` o las de NAND y caché.
+12. Escribe `projects\wiisports\retarget.md` con todo lo que cambió y lo que no pudo resolver.
 
 Ante la duda no cambia nada: una dirección sin pista segura queda igual y aparece en la lista "Sin resolver" para revisarla a mano.
 
@@ -196,6 +197,13 @@ bash scripts/build-wiisports-wsl.sh /mnt/c/wii/RSPE01/DATA/sys/main.dol ~/BrawlR
 
 Con `RAPIDO=1` delante no vuelve a traducir: solo rehace el runtime y enlaza. Todo queda en `~/choya-build.log` (y una copia en `C:\Users\Public\choya-build.log`); al final imprime cuántos errores hubo y en qué archivos.
 
+
+Para arrancarlo y ver dónde se detiene:
+
+```sh
+bash scripts/run-wiisports-wsl.sh /mnt/c/wii/RSPE01/DATA
+python3 -m choya donde 0x80009D90      # qué función de Wii Sports hay en una dirección
+```
 
 Lo que genera el traductor (`generated\`, `build-wiisports\`) contiene código del juego: no lo subas a ningún repositorio.
 

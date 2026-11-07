@@ -337,6 +337,59 @@ def _resolve_literal(old: int, comment: str, single: bool, anchors: dict[str, in
     return None
 
 
+# Motivos con los que WiiCompiled apagó un registro porque *otro* juego no tenía la función.
+_ABSENT = re.compile(r"no matching function|name not in|not linked|no \w+ symbol at this address|"
+                     r"has no |not in the \w+ dol|is not present|does not exist", re.I)
+
+
+def reactivate(text: str, rel: str, res: "_Resolver", changes: list[Change]) -> str:
+    """WiiCompiled apagó con `#if 0  // BRAWL: no matching function...` funciones nativas que Brawl, SPM o
+    NSMBW no tienen. Si Wii Sports sí las tiene (por el nombre del símbolo) y el bloque contiene solo ese
+    registro, se vuelve a encender: `#if 0` → `#if 1`. Así OSInitFont, por ejemplo, vuelve a ser nativa
+    en vez de leer un registro de hardware que no existe."""
+    lines = text.split("\n")
+    stack = []                     # (línea, es_if0, motivo_de_ausencia)
+    blocks = []                    # (inicio, fin) de cada #if 0
+    for i, raw in enumerate(lines):
+        s = raw.strip()
+        d = s[1:].lstrip() if s.startswith("#") else ""
+        if d.startswith("if"):
+            stack.append((i, re.match(r"if\s+0\b", d) is not None, bool(_ABSENT.search(s))))
+        elif d.startswith(("else", "elif")) and stack:
+            stack[-1] = (stack[-1][0], False, False)
+        elif d.startswith("endif") and stack:
+            start, zero, absent = stack.pop()
+            if zero:
+                blocks.append((start, i, absent))
+    for start, end, absent in sorted(blocks):
+        if not absent or "choya:" in lines[start]:
+            continue                     # (un bloque interno ya encendido junto con el de afuera)
+        body = "\n".join(lines[start + 1:end])
+        content = [l for l in lines[start + 1:end]
+                   if l.strip() and not l.strip().startswith(("#", "//"))]
+        m = _STATEMENTS.search(body)
+        if not m or not content or m.group("macro") == _CATALOG:
+            continue
+        stmt_end = _statement_end(body, body.index("(", m.start()))
+        stmt_lines = [l for l in body[m.start():stmt_end].split("\n") if l.strip()]
+        if len(content) != len(stmt_lines) or len(_STATEMENTS.findall(body)) != 1:
+            continue
+        inner = [lines[j].strip() for j in range(start + 1, end) if lines[j].strip().startswith("#if")]
+        if any(not (re.match(r"#\s*if\s+0\b", x) and _ABSENT.search(x)) for x in inner):
+            continue
+        sym = m.group("sym") or ""
+        name = next((c for c in base_names(sym) if c in res.ws.funcs and c not in res.ws.ambiguous), None)
+        if not name:
+            continue
+        for j in [start] + [j for j in range(start + 1, end) if lines[j].strip().startswith("#if")]:
+            lines[j] = re.sub(r"#(\s*)if\s+0\b", r"#\1if 1", lines[j], count=1) + \
+                f"  // choya: Wii Sports sí tiene {name}"
+        changes.append(Change(rel, start + 1, "reactivado", int(m.group("addr"), 16), None, name,
+                              " ".join(body[m.start():stmt_end].split())[:140]))
+    return "\n".join(lines)
+
+
+
 def retarget_text(text: str, rel: str, res: _Resolver, registered: dict[int, str],
                   changes: list[Change]) -> str:
     # 1) instrucciones de registro
@@ -726,6 +779,16 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
     res.sda = {"r13": game.sda, "r2": game.sda2}
     result.game = game
     result.structs = struct_checks(res.ws)
+    # Primero se reactivan los registros apagados solo porque otro juego no tenía la función.
+    for sub in ("src", "include"):
+        for path in source_files(os.path.join(out, sub)):
+            rel = os.path.relpath(path, out).replace("\\", "/")
+            with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
+                text = f.read()
+            new = reactivate(text, rel, res, result.changes)
+            if new != text:
+                with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+                    f.write(new)
     _collect_moves(out, res)
     registered: dict[int, str] = {}
     for sub in ("src", "include"):
@@ -786,6 +849,7 @@ def report_markdown(r: RetargetResult) -> str:
          "| Qué | Cantidad |", "|---|---:|",
          f"| Funciones nativas movidas | {r.count('registro')} |",
          f"| Funciones nativas desactivadas (Wii Sports no las tiene) | {r.count('desactivado')} |",
+         f"| Funciones nativas reactivadas (otro juego no las tenía, Wii Sports sí) | {r.count('reactivado')} |",
          f"| Registros repetidos desactivados | {r.count('duplicado')} |",
          f"| Llamadas a funciones movidas | {r.count('funcion')} |",
          f"| Variables del SDK movidas | {r.count('dato')} |",
@@ -831,7 +895,7 @@ def report_markdown(r: RetargetResult) -> str:
         L += ["", "## Sin resolver", "", "| Archivo:línea | Dirección | En otros juegos | Código |", "|---|---|---|---|"]
         for c in sorted(by["sin_resolver"], key=lambda c: (c.file, c.line)):
             L.append(f"| {c.file}:{c.line} | {c.old:08X} | {c.name} | `{c.text.replace('|', '¦')}` |")
-    for kind, title in (("parche", "Parches revisados a mano"), ("sda", "Desfases SDA (nuevo desfase en Wii Sports)"),
+    for kind, title in (("reactivado", "Funciones nativas reactivadas"), ("parche", "Parches revisados a mano"), ("sda", "Desfases SDA (nuevo desfase en Wii Sports)"),
                         ("vecinos", "Funciones deducidas por sus vecinas"), ("dato", "Variables movidas"),
                         ("funcion", "Llamadas movidas"), ("registro", "Funciones nativas movidas")):
         if by[kind]:

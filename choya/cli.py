@@ -126,6 +126,7 @@ def cmd_recomp_native(a):
     print(f"Direcciones de origen:      {r.source_game}")
     print(f"Funciones nativas movidas:  {r.count('registro')}")
     print(f"Desactivadas (no existen):  {r.count('desactivado')}")
+    print(f"Reactivadas para Wii Sports:{r.count('reactivado'):3d}")
     print(f"Repetidas desactivadas:     {r.count('duplicado')}")
     print(f"Llamadas movidas:           {r.count('funcion')}")
     print(f"Variables movidas:          {r.count('dato')}")
@@ -150,6 +151,33 @@ def cmd_recomp_native(a):
         print(f"recomp.yml ahora usa {retarget.OUT_DIR}/src para las funciones nativas")
     else:
         print("AVISO: no encontré projects/wiisports/recomp.yml; corre primero recomp-prep")
+
+
+def cmd_donde(a):
+    """Nombre de la función de Wii Sports que contiene cada dirección (para leer los registros de un fallo)."""
+    import bisect
+    import re as _re
+    from . import retarget
+    ws = retarget.load_wiisports_symbols(a.simbolos)
+    rows = sorted((addr, name) for name, addr in list(ws.funcs.items()) + list(ws.data.items()))
+    keys = [r[0] for r in rows]
+    text = " ".join(a.direcciones)
+    if a.archivo:
+        with open(a.archivo, encoding="utf-8", errors="replace") as f:
+            text += " " + " ".join(f.read().splitlines()[-a.lineas:])
+    seen = []
+    for h in _re.findall(r"(?:0x)?(8[0-1][0-9A-Fa-f]{6})\b", text):
+        v = int(h, 16)
+        if v not in seen:
+            seen.append(v)
+    for v in seen:
+        i = bisect.bisect_right(keys, v) - 1
+        if i < 0:
+            continue
+        addr, name = rows[i]
+        size = ws.size.get(addr, 0)
+        inside = size == 0 or v < addr + size
+        print(f"{v:08X}  {name}+0x{v - addr:X}" + ("" if inside else "  (fuera del símbolo)"))
 
 
 def cmd_profiles(_a):
@@ -213,6 +241,13 @@ def main(argv=None):
     rn.add_argument("--rehacer", action="store_true",
                     help="reemplazar runtime-wiisports aunque no lo haya creado Choya")
     rn.set_defaults(fn=cmd_recomp_native)
+
+    dn = sub.add_parser("donde", help="qué función de Wii Sports hay en una dirección (para leer fallos)")
+    dn.add_argument("direcciones", nargs="*", help="direcciones en hexadecimal, p. ej. 0x80009D90")
+    dn.add_argument("-a", "--archivo", help="log de WiiCompiled: busca direcciones en sus últimas líneas")
+    dn.add_argument("--lineas", type=int, default=80, help="cuántas líneas del final del log mirar")
+    dn.add_argument("--simbolos", help="symbols.txt de ogws (por defecto el incluido)")
+    dn.set_defaults(fn=cmd_donde)
 
     pr = sub.add_parser("profiles", help="lista los perfiles de optimización")
     pr.set_defaults(fn=cmd_profiles)

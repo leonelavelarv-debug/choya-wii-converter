@@ -304,3 +304,32 @@ class TestRetargetWiiSports(unittest.TestCase):
             self.assertEqual(r.count("vecinos"), 1)
             self.assertEqual(r.count("sda"), 4)
             self.assertIn("✓", R.report_markdown(r))
+
+
+class TestReactivate(unittest.TestCase):
+    def test_reenable_absent_in_other_game(self):
+        from choya import retarget as R
+        src = (
+            'extern "C" uint32_t OSInitFont_HLE_801b0d60(uint32_t f) { return 0; }\n'
+            "#if 0  // SPM: OSInitFont: name not in SPM\n"
+            "#if 0  // BRAWL: no matching function in the Brawl dol\n"
+            "PPC_NATIVE_OVERRIDE(801B0D60, OSInitFont_HLE_801b0d60, uint32_t, (uint32_t f), (f));\n"
+            "#endif\n#endif\n"
+            "#if 0  // NSMBW: MKW-only body with hardcoded addresses\n"     # motivo distinto: no se toca
+            "PPC_NATIVE_OVERRIDE(801B0E00, OSLoadFont_HLE, uint32_t, (), ());\n#endif\n"
+            "#if 0  // BRAWL: no matching function in the Brawl dol\n"      # trae más código: no se toca
+            'extern "C" void Algo() {}\n'
+            "PPC_NATIVE_OVERRIDE(801B0F00, OSGetFontTexel_HLE, uint32_t, (), ());\n#endif\n"
+            "#if 0  // BRAWL: no matching function in the Brawl dol\n"      # Wii Sports no la tiene
+            "PPC_NATIVE_OVERRIDE(80215E68, PAD__Init_HLE, int32_t, (), ());\n#endif\n")
+        ws = R.Symbols({"OSInitFont": 0x800F14C8, "OSLoadFont": 0x800F0BEC, "OSGetFontTexel": 0x800F0FCC},
+                       {}, {}, set())
+        res = R._Resolver(ws, {})
+        changes = []
+        out = R.reactivate(src, "x.cpp", res, changes)
+        self.assertEqual([c.name for c in changes], ["OSInitFont"])
+        self.assertIn("#if 1  // SPM: OSInitFont: name not in SPM  // choya: Wii Sports sí tiene OSInitFont", out)
+        self.assertIn("#if 1  // BRAWL: no matching function in the Brawl dol  // choya:", out)
+        self.assertIn("#if 0  // NSMBW: MKW-only", out)
+        self.assertEqual(out.count("#if 0  // BRAWL"), 2)
+        self.assertNotIn(4, {l for l in R.disabled_lines(out) if "OSInitFont" in out.split("\n")[l - 1]})
