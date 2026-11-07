@@ -181,7 +181,22 @@ El runtime de WiiCompiled tiene ~400 funciones nativas (gráficos, sistema, disc
 Ante la duda no cambia nada: una dirección sin pista segura queda igual y aparece en la lista "Sin resolver" para revisarla a mano.
 
 
-Lo que genera el traductor (`build\wiisports\`) contiene código del juego: no lo subas a ningún repositorio.
+### Traducir y compilar en Ubuntu (WSL2)
+
+Linux x86_64 es lo más parecido a la consola (Linux ARM64) y WiiCompiled lo soporta tal cual. Un solo script hace todo: `recomp-prep`, `recomp-native`, traducir, `generate-data-init`, `emit-build-shards`, configurar CMake (descarga Dawn la primera vez) y compilar con Clang sin detenerse en el primer error.
+
+```sh
+sudo apt install -y clang lld cmake ninja-build git pkg-config dotnet-sdk-8.0 python3-numpy python3-pil \
+  libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
+  libxkbcommon-dev libwayland-dev wayland-protocols libegl1-mesa-dev libgles-dev libdrm-dev libgbm-dev \
+  libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libvulkan-dev mesa-vulkan-drivers
+bash scripts/build-wiisports-wsl.sh /mnt/c/wii/RSPE01/DATA/sys/main.dol ~/BrawlRecompiled/wiicompiled
+```
+
+Todo queda en `~/choya-build.log` (y una copia en `C:\Users\Public\choya-build.log`); al final imprime cuántos errores hubo y en qué archivos.
+
+
+Lo que genera el traductor (`generated\`, `build-wiisports\`) contiene código del juego: no lo subas a ningún repositorio.
 
 ## Formato `.wlpk`
 

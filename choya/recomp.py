@@ -187,11 +187,12 @@ translation:
 
 {_runtime_block(native_root)}
 output:
-  root: build/wiisports
+  # runtime/CMakeLists.txt lee ../generated (shards.cmake, RuntimeConfig.h, data_sections_init.cpp).
+  root: generated
   functions: functions
   runtime_config: RuntimeConfig.h
   data_initializer: data_sections_init.cpp
-  base_manifest: base/wiisports_base_manifest.json
+  base_manifest: ../build/base/wiisports_base_manifest.json
 """
 
 

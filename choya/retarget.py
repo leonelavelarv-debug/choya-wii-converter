@@ -579,6 +579,7 @@ class Patch:
     pattern: str          # el grupo "v" es el número hexadecimal que se cambia
     value: object         # función (Symbols, GameInfo) -> int | None
     label: str
+    optional: bool = False  # si no está en Wii Sports no importa (la función que lo usa quedó desactivada)
 
 
 def _sym(name: str, off: int = 0):
@@ -635,7 +636,8 @@ PATCHES = [
     Patch("src/hle/sc.cpp", r"LookupProductRegion\(0x(?P<v>8047C4E0)u, 5, 13",
           lambda ws, g: g.find(b"\x00JPN\x00\x01USA\x00\x02EUR\x00"), "tabla de áreas de SC"),
     Patch("src/hle/sc.cpp", r"LookupProductRegion\(0x(?P<v>8047FAB0)u, 4, 4",
-          lambda ws, g: g.find(b"\x00JP\x00\x01US\x00\x02EU\x00"), "tabla de regiones de SC"),
+          lambda ws, g: g.find(b"\x00JP\x00\x01US\x00\x02EU\x00"), "tabla de regiones de SC",
+          optional=True),   # SCGetProductGameRegion no existe en el SDK de Wii Sports
     # Wii Sports no tiene btm_cb con ese nombre; con 0 la escritura cae fuera de la memoria y se ignora.
     Patch("src/hle/os/os_init.cpp", r"kBtmCbBase\s*=\s*0x" + _H, lambda ws, g: 0, "sin btm_cb: escritura omitida"),
 ]
@@ -671,6 +673,9 @@ def apply_patches(text: str, rel: str, ws: Symbols, game: GameInfo, changes: lis
         found = list(rx.finditer(text))
         value = p.value(ws, game)
         if not found or value is None:
+            if p.optional:
+                changes.append(Change(rel, 0, "parche_omitido", 0, None, p.label, "no hace falta en Wii Sports"))
+                continue
             why = ("patrón no encontrado (¿cambió WiiCompiled?)" if not found else
                    "no encontré el dato en tu disco" if game.dol is not None else "falta correr recomp-prep")
             changes.append(Change(rel, 0, "parche_fallido", 0, None, p.label, why))
@@ -735,6 +740,9 @@ def update_manifest(yml_path: str) -> bool:
              "  native_abi_directories:\n"
              f"    - {OUT_DIR}/src/hle/gx\n\n")
     new, n = re.subn(r"runtime:\n(?:[ \t]+.*\n|[ \t]*\n)*", block, text, count=1)
+    # La compilación de WiiCompiled busca lo generado en ../generated respecto del runtime.
+    new = re.sub(r"(?m)^(output:\n(?:[ \t]*#.*\n)*[ \t]+root:)[ \t]*\S+", r"\1 generated", new, count=1)
+    new = re.sub(r"(?m)^([ \t]+base_manifest:)[ \t]*base/", r"\1 ../build/base/", new, count=1)
     if n and new != text:
         with open(yml_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(new)
