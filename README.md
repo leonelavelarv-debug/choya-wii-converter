@@ -159,6 +159,24 @@ Escribe en `projects\wiisports\`:
 
 Solo acepta Wii Sports USA Rev 1 (el mismo `main.dol` que ogws). Con `--simbolos` se le da otro `symbols.txt` o `MAP.txt`.
 
+### Mover el runtime de WiiCompiled a Wii Sports
+
+```powershell
+choya recomp-native C:\choya\BrawlRecompiled\wiicompiled
+```
+
+El runtime de WiiCompiled tiene ~400 funciones nativas (gráficos, sistema, disco, control, sonido) y decenas de variables del SDK, todas en direcciones de otros juegos (Brawl, NSMBW, MKW, SPM). El comando:
+
+1. Copia `runtime\` a `runtime-wiisports\` (el original no se toca; la copia se rehace cada vez).
+2. Busca cada función nativa por su nombre en los símbolos de ogws y le pone la dirección de Wii Sports.
+3. Desactiva con `#if 0` las que Wii Sports no tiene (por ejemplo el control de GameCube) y las repetidas.
+4. Mueve las variables del SDK que el comentario nombra (`// FifoObj`, `// HorVer+0x1C`, `// HorVer.DispSizeX`).
+5. Cambia `recomp.yml` para que el traductor use `runtime-wiisports\src`.
+6. Escribe `projects\wiisports\retarget.md` con todo lo que cambió y lo que no pudo resolver.
+
+Ante la duda no cambia nada: una dirección sin pista segura queda igual y aparece en la lista "Sin resolver" para revisarla a mano.
+
+
 Lo que genera el traductor (`build\wiisports\`) contiene código del juego: no lo subas a ningún repositorio.
 
 ## Formato `.wlpk`
@@ -171,7 +189,7 @@ Little-endian, alineado a 16 bytes: cabecera de 64 bytes, tabla de entradas de 4
 python -m unittest discover tests
 ```
 
-39 pruebas con datos sintéticos (7 necesitan el runtime compilado): Yaz0/LZ77, U8, BRRES, TPL, los 11 formatos GX, ETC2/EAC (calidad y que nunca desborde el modo diferencial), DSP-ADPCM, BRSTM con bloques entrelazados, respaldo por calidad, audio ADPCM con bucle decodificado en C++, modelos MDL0, TEV con la configuración de materiales reales compilado y dibujado en OpenGL ES por software (Mesa llvmpipe) con revisión de píxeles, conversión de punta a punta, una prueba cruzada donde el runtime C++ lee el paquete de Python (claves, caché y audio idénticos), y la lectura de `main.dol` y del arranque para WiiCompiled.
+43 pruebas con datos sintéticos (7 necesitan el runtime compilado): Yaz0/LZ77, U8, BRRES, TPL, los 11 formatos GX, ETC2/EAC (calidad y que nunca desborde el modo diferencial), DSP-ADPCM, BRSTM con bloques entrelazados, respaldo por calidad, audio ADPCM con bucle decodificado en C++, modelos MDL0, TEV con la configuración de materiales reales compilado y dibujado en OpenGL ES por software (Mesa llvmpipe) con revisión de píxeles, conversión de punta a punta, una prueba cruzada donde el runtime C++ lee el paquete de Python (claves, caché y audio idénticos), la lectura de `main.dol` y del arranque para WiiCompiled, y el cambio de direcciones del runtime de WiiCompiled.
 
 ## Pendiente
 

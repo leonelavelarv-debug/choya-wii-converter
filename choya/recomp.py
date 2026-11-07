@@ -152,7 +152,8 @@ def coverage_markdown(entries: list[HleEntry]) -> str:
 
 # --- manifiesto ---------------------------------------------------------------------
 
-def manifest_yaml(dol_path: str, sha256: str, boot: doltools.BootInfo, game_id: str = "RSPE01") -> str:
+def manifest_yaml(dol_path: str, sha256: str, boot: doltools.BootInfo, game_id: str = "RSPE01",
+                  native_root: str | None = None) -> str:
     p = os.path.abspath(dol_path).replace("\\", "/")
     return f"""schema_version: 1
 workspace_root: ../..
@@ -184,11 +185,7 @@ translation:
   # Primera pasada: dejar pasar instrucciones raras y contarlas en el informe.
   allow_unsupported_instructions: true
 
-runtime:
-  # Carpeta propia: las funciones nativas de runtime/src están en direcciones de otro juego.
-  native_registration_root: projects/wiisports/native
-  native_abi_directories: []
-
+{_runtime_block(native_root)}
 output:
   root: build/wiisports
   functions: functions
@@ -196,6 +193,19 @@ output:
   data_initializer: data_sections_init.cpp
   base_manifest: base/wiisports_base_manifest.json
 """
+
+
+def _runtime_block(native_root: str | None) -> str:
+    if native_root:
+        return ("runtime:\n"
+                "  # Runtime de WiiCompiled movido a Wii Sports por choya recomp-native.\n"
+                f"  native_registration_root: {native_root}\n"
+                "  native_abi_directories:\n"
+                f"    - {native_root}/hle/gx\n")
+    return ("runtime:\n"
+            "  # Carpeta propia: las funciones nativas de runtime/src están en direcciones de otro juego.\n"
+            "  native_registration_root: projects/wiisports/native\n"
+            "  native_abi_directories: []\n")
 
 
 @dataclass
@@ -244,7 +254,8 @@ def prep(src: str, out: str, simbolos: str | None = None, force: bool = False) -
     with open(os.path.join(proj, "MAP.txt"), "w", encoding="utf-8", newline="\n") as f:
         f.write(map_text(funcs))
     with open(os.path.join(proj, "recomp.yml"), "w", encoding="utf-8", newline="\n") as f:
-        f.write(manifest_yaml(dol_path, d.sha256, boot))
+        native = "runtime-wiisports/src" if os.path.isdir(os.path.join(out, "runtime-wiisports", "src")) else None
+        f.write(manifest_yaml(dol_path, d.sha256, boot, native_root=native))
     readme = os.path.join(proj, "native", "LEEME.txt")
     if not os.path.exists(readme):
         with open(readme, "w", encoding="utf-8", newline="\n") as f:

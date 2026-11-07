@@ -113,6 +113,30 @@ def cmd_recomp_prep(a):
     print(f"Proyecto escrito en {r.project_dir}")
 
 
+def cmd_recomp_native(a):
+    from . import retarget
+    r = retarget.retarget(a.wiicompiled, simbolos=a.simbolos, rehacer=a.rehacer)
+    proj = os.path.join(a.wiicompiled, "projects", "wiisports")
+    os.makedirs(proj, exist_ok=True)
+    rep = os.path.join(proj, "retarget.md")
+    with open(rep, "w", encoding="utf-8", newline="\n") as f:
+        f.write(retarget.report_markdown(r))
+    yml = os.path.join(proj, "recomp.yml")
+    print(f"Runtime copiado a:          {r.out_dir}")
+    print(f"Direcciones de origen:      {r.source_game}")
+    print(f"Funciones nativas movidas:  {r.count('registro')}")
+    print(f"Desactivadas (no existen):  {r.count('desactivado')}")
+    print(f"Repetidas desactivadas:     {r.count('duplicado')}")
+    print(f"Llamadas movidas:           {r.count('funcion')}")
+    print(f"Variables movidas:          {r.count('dato')}")
+    print(f"Sin resolver (a mano):      {r.count('sin_resolver')}")
+    print(f"Informe:                    {rep}")
+    if os.path.isfile(yml) and retarget.update_manifest(yml):
+        print(f"recomp.yml ahora usa {retarget.OUT_DIR}/src para las funciones nativas")
+    else:
+        print("AVISO: no encontré projects/wiisports/recomp.yml; corre primero recomp-prep")
+
+
 def cmd_profiles(_a):
     for p in profiles.PROFILES.values():
         print(f"{p.name:10s} {p.description}")
@@ -166,6 +190,14 @@ def main(argv=None):
     rp.add_argument("--simbolos", help="symbols.txt de ogws o un MAP.txt (por defecto el incluido)")
     rp.add_argument("--forzar", action="store_true", help="seguir aunque el main.dol no sea RSPE01 Rev 1")
     rp.set_defaults(fn=cmd_recomp_prep)
+
+    rn = sub.add_parser("recomp-native",
+                        help="copia el runtime de WiiCompiled y lo mueve a las direcciones de Wii Sports")
+    rn.add_argument("wiicompiled", help="carpeta de WiiCompiled (la misma de recomp-prep)")
+    rn.add_argument("--simbolos", help="symbols.txt de ogws (por defecto el incluido)")
+    rn.add_argument("--rehacer", action="store_true",
+                    help="reemplazar runtime-wiisports aunque no lo haya creado Choya")
+    rn.set_defaults(fn=cmd_recomp_native)
 
     pr = sub.add_parser("profiles", help="lista los perfiles de optimización")
     pr.set_defaults(fn=cmd_profiles)
