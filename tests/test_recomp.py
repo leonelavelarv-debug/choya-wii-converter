@@ -354,6 +354,23 @@ class TestChoyaNatives(unittest.TestCase):
         self.assertNotIn("PPC_NATIVE_OVERRIDE", R.choya_natives(ws, {0x800CFF18: "otro.cpp"}, []))
 
 
+class TestPerfil(unittest.TestCase):
+    def test_informe(self):
+        import tempfile, os
+        from choya import perfil
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "perfil.txt")
+            with open(path, "w") as f:
+                f.write("# choya perfil v1\nmuestras 10\nsegundos 1\nhilo 7 10 WiiCompiled\n"
+                        "pc 7 6 0x100\npc 7 3 0x200\nlib 7 1 libc.so.6:memcpy\n")
+            p = perfil.leer(path)
+            self.assertEqual((p.muestras, len(p.pcs), len(p.libs)), (10, 2, 1))
+            text = perfil.informe(p, {0x100: "func_80183EE4(CpuContext&)", 0x200: "aurora::gfx::draw()"})
+            self.assertIn("60.0%  func_80183EE4 [main]", text)
+            self.assertIn("juego (código traducido)", text)
+            self.assertIn("10.0%  libc.so.6:memcpy", text)
+
+
 class TestEdits(unittest.TestCase):
     def test_aurora_offscreen(self):
         import os, shutil, tempfile

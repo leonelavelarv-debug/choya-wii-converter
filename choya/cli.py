@@ -182,6 +182,21 @@ def cmd_donde(a):
         print(f"{v:08X}  {name}+0x{v - addr:X}")
 
 
+def cmd_perfil(a):
+    """Dónde se fue el tiempo en la consola (perfil.txt del lanzador)."""
+    from . import perfil
+    p = perfil.leer(a.archivo)
+    exe = os.path.expanduser(a.exe)
+    if not os.path.isfile(exe):
+        raise SystemExit(f"no encontré el ejecutable sin recortar: {exe} (usa --exe)")
+    names = perfil.nombrar(exe, sorted({o for _t, _c, o in p.pcs}))
+    text = perfil.informe(p, names, a.simbolos, a.top)
+    print(text)
+    if a.salida:
+        with open(a.salida, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+
+
 def cmd_profiles(_a):
     for p in profiles.PROFILES.values():
         print(f"{p.name:10s} {p.description}")
@@ -250,6 +265,15 @@ def main(argv=None):
     dn.add_argument("--lineas", type=int, default=80, help="cuántas líneas del final del log mirar")
     dn.add_argument("--simbolos", help="symbols.txt de ogws (por defecto el incluido)")
     dn.set_defaults(fn=cmd_donde)
+
+    pf = sub.add_parser("perfil", help="en qué funciones se fue el tiempo en la consola (perfil.txt)")
+    pf.add_argument("archivo", help="perfil.txt que dejó el lanzador en la consola")
+    pf.add_argument("--exe", default="~/BrawlRecompiled/wiicompiled/build-wiisports-arm64/WiiCompiled",
+                    help="WiiCompiled sin recortar (el de la carpeta de compilación ARM64)")
+    pf.add_argument("--simbolos", help="symbols.txt de ogws (por defecto el incluido)")
+    pf.add_argument("--top", type=int, default=35, help="cuántas funciones listar")
+    pf.add_argument("-o", "--salida", help="guardar el informe también en este archivo")
+    pf.set_defaults(fn=cmd_perfil)
 
     pr = sub.add_parser("profiles", help="lista los perfiles de optimización")
     pr.set_defaults(fn=cmd_profiles)

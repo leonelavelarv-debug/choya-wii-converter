@@ -30,6 +30,7 @@ OUT_DIR = "runtime-wiisports"
 MISSING_PREFIX = "choya_ausente_"
 MISSING_FILE = "src/choya_ausentes.cpp"
 HLE_FILE = "src/choya_wiisports_hle.cpp"
+PERFIL_FILE = "src/choya_perfil.cpp"  # perfilador por muestreo (solo con CHOYA_PERFIL)
 
 # Funciones nativas propias de Choya para lo que Wii Sports usa y los juegos de WiiCompiled no.
 # Cada una: (función de Wii Sports, cuerpo en C++ con {addr} para la dirección).
@@ -999,6 +1000,7 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
         f.write(missing_stubs(sorted(res.missing)))
     with open(os.path.join(out, HLE_FILE), "w", encoding="utf-8", newline="\n") as f:
         f.write(choya_natives(res.ws, registered, result.changes))
+    shutil.copyfile(os.path.join(os.path.dirname(__file__), "data", "choya_perfil.cpp"), os.path.join(out, PERFIL_FILE))
     return result
 
 
