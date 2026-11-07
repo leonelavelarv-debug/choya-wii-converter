@@ -34,9 +34,13 @@ paso "4/5 Compilar para aarch64 (Cortex-A53)"
 MEM_GB=$(awk '/MemTotal/{print int($2/1024/1024)}' /proc/meminfo)
 JOBS=$(( MEM_GB * 2 / 3 )); [ "$JOBS" -lt 1 ] && JOBS=1; [ "$JOBS" -gt "$(nproc)" ] && JOBS=$(nproc)
 echo "Memoria ${MEM_GB} GB → ${JOBS} trabajos a la vez" | tee -a "$LOG"
+# Al compilar cruzado aurora quiere construir Dawn desde el código (y esa etiqueta no existe en google/dawn):
+# se usa el paquete ya compilado para Linux aarch64, igual que en la PC.
+rm -rf "$WC/$BUILD/_deps/dawn-"*
 docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$WC":"$WC" -w "$WC" "$IMG" bash -c "
   cmake -S runtime-wiisports -B $BUILD -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_TOOLCHAIN_FILE=/opt/choya/aarch64-clang.cmake &&
+        -DCMAKE_TOOLCHAIN_FILE=/opt/choya/aarch64-clang.cmake \
+        -DAURORA_DAWN_PROVIDER=package -DAURORA_SDL3_PROVIDER=vendor &&
   cmake --build $BUILD -j $JOBS -- -k 0" >>"$LOG" 2>&1
 STATUS=$?
 ERRS=$(grep -c " error: " "$LOG" || true)

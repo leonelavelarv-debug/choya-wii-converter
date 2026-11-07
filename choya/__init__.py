@@ -1,2 +1,2 @@
 """Choya Wii Converter: adapta los recursos de juegos de Wii para la Anbernic RG35XX H (KNULLI/PortMaster)."""
-__version__ = "0.10.1"
+__version__ = "0.10.2"
