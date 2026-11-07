@@ -52,6 +52,29 @@ def cmd_info(a):
                       f"{e['size']:8d} B  {e['name']}")
 
 
+def cmd_modelo(a):
+    from . import containers, mdl0
+    res = sc.scan(a.src)
+    seen = 0
+    for item in res.models:
+        full = f"{item.path}/{item.name}"
+        if a.texto.lower() not in full.lower():
+            continue
+        seen += 1
+        print(f"=== {full}")
+        print(mdl0.describe(item.brres, item.offset, item.name))
+        m = mdl0.read_mdl0(item.brres, item.offset, item.name)
+        lo, hi = m.positions.min(0), m.positions.max(0)
+        print(f"  resultado: {len(m.positions)} vértices, {m.stats['triangulos']} triángulos, "
+              f"caja ({lo[0]:.2f},{lo[1]:.2f},{lo[2]:.2f})-({hi[0]:.2f},{hi[1]:.2f},{hi[2]:.2f})")
+        for w in m.warnings[:10]:
+            print("  aviso:", w)
+        if seen >= a.max:
+            break
+    if not seen:
+        print("ningún modelo contiene ese texto")
+
+
 def cmd_package(a):
     port = portmaster.build(a.out, a.title, a.folder, a.binary, a.pack_dir, a.runtime, a.files)
     print(f"Port armado en {port}")
@@ -95,6 +118,12 @@ def main(argv=None):
     k.add_argument("--runtime", help="binario aarch64 del runtime")
     k.add_argument("--files", help="carpeta files/ del disco extraído (se copia a gamedata/files)")
     k.set_defaults(fn=cmd_package)
+
+    mo = sub.add_parser("modelo", help="diagnóstico de los modelos cuyo nombre contenga un texto")
+    mo.add_argument("src")
+    mo.add_argument("texto")
+    mo.add_argument("--max", type=int, default=2)
+    mo.set_defaults(fn=cmd_modelo)
 
     pr = sub.add_parser("profiles", help="lista los perfiles de optimización")
     pr.set_defaults(fn=cmd_profiles)

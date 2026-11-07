@@ -542,3 +542,48 @@ def _weld(m: Model):
 
 def find_models(brres: bytes, brres_sections: dict) -> list[tuple[str, int]]:
     return [(n, off) for n, off in brres_sections.get("3DModels(NW4R)", []) if brres[off:off + 4] == b"MDL0"]
+
+
+def describe(d: bytes, mdl0: int, name: str, max_items: int = 12) -> str:
+    """Volcado de diagnóstico en texto: campos crudos de huesos, objetos y listas de dibujo."""
+    out = []
+    ver = _u32(d, mdl0 + 8)
+    out.append(f"MDL0 '{name}' versión {ver}, tamaño {_u32(d, mdl0 + 4)}")
+    for names in (SECTIONS_V8, SECTIONS_V10):
+        n_off = mdl0 + 0x10 + 4 * len(names)
+        out.append(f"  ¿{len(names)} secciones? nombre en cabecera = '{_cstr(d, mdl0 + _s32(d, n_off))}'")
+    layout = SECTIONS_V8 if ver <= 9 else SECTIONS_V10
+    for names in (SECTIONS_V8, SECTIONS_V10):
+        if _cstr(d, mdl0 + _s32(d, mdl0 + 0x10 + 4 * len(names))) == name:
+            layout = names
+    sec = {}
+    for i, sname in enumerate(layout):
+        off = _s32(d, mdl0 + 0x10 + 4 * i)
+        sec[sname] = _group(d, mdl0 + off) if off else []
+        out.append(f"  sección {i:2d} {sname:8s} offset 0x{off:X}  entradas {len(sec[sname])}")
+    hexs = lambda a, n: d[a:a + n].hex(" ")
+    for dname, doff in sec["defs"]:
+        out.append(f"  def {dname}: {hexs(doff, 48)}")
+    for bname, b in sec["bones"][:max_items]:
+        t = struct.unpack_from(">3f", d, b + 0x38)
+        mt = struct.unpack_from(">12f", d, b + 0x70)
+        out.append(f"  hueso {bname}: back_ok={_back_ok(d, b, mdl0)} idx={_s32(d, b + 0x0C)} node={_s32(d, b + 0x10)} "
+                   f"flags=0x{_u32(d, b + 0x14):X} T=({t[0]:.2f},{t[1]:.2f},{t[2]:.2f}) "
+                   f"M.T=({mt[3]:.2f},{mt[7]:.2f},{mt[11]:.2f}) padre={_s32(d, b + 0x5C)}")
+    if len(sec["bones"]) > max_items:
+        out.append(f"  ... {len(sec['bones']) - max_items} huesos más")
+    for oname, o in sec["objs"][:max_items]:
+        lo, hi = _u32(d, o + 0x0C), _u32(d, o + 0x10)
+        out.append(f"  objeto {oname}: back_ok={_back_ok(d, o, mdl0)} node={_s32(d, o + 0x08)} "
+                   f"VCD={lo:08X}/{hi:08X} campos={[n for n, _ in _vcd_fields(lo, hi)]}")
+        out.append(f"    cabecera: {hexs(o, 0x68)}")
+        psize, poff = _u32(d, o + 0x24), _s32(d, o + 0x2C)
+        for base, lbl in ((o + 0x24, "+0x24"), (o + 0x2C, "+0x2C"), (o, "+0")):
+            if _check_dl(d, base + poff, psize):
+                out.append(f"    primitivas (base {lbl}): {hexs(base + poff, 40)}")
+                break
+        else:
+            out.append("    primitivas: NO encontradas")
+    if len(sec["objs"]) > max_items:
+        out.append(f"  ... {len(sec['objs']) - max_items} objetos más")
+    return "\n".join(out)
