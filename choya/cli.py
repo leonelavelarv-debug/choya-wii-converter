@@ -159,7 +159,7 @@ def cmd_donde(a):
     import re as _re
     from . import retarget
     ws = retarget.load_wiisports_symbols(a.simbolos)
-    rows = sorted((addr, name) for name, addr in list(ws.funcs.items()) + list(ws.data.items()))
+    rows = sorted((addr, name) for name, addr in ws.funcs.items())
     keys = [r[0] for r in rows]
     text = " ".join(a.direcciones)
     if a.archivo:
@@ -176,8 +176,9 @@ def cmd_donde(a):
             continue
         addr, name = rows[i]
         size = ws.size.get(addr, 0)
-        inside = size == 0 or v < addr + size
-        print(f"{v:08X}  {name}+0x{v - addr:X}" + ("" if inside else "  (fuera del símbolo)"))
+        if size and v >= addr + size:
+            continue                     # pila, montículo o datos: no es código del juego
+        print(f"{v:08X}  {name}+0x{v - addr:X}")
 
 
 def cmd_profiles(_a):

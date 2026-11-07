@@ -321,8 +321,13 @@ class TestReactivate(unittest.TestCase):
             'extern "C" void Algo() {}\n'
             "PPC_NATIVE_OVERRIDE(801B0F00, OSGetFontTexel_HLE, uint32_t, (), ());\n#endif\n"
             "#if 0  // BRAWL: no matching function in the Brawl dol\n"      # Wii Sports no la tiene
-            "PPC_NATIVE_OVERRIDE(80215E68, PAD__Init_HLE, int32_t, (), ());\n#endif\n")
-        ws = R.Symbols({"OSInitFont": 0x800F14C8, "OSLoadFont": 0x800F0BEC, "OSGetFontTexel": 0x800F0FCC},
+            "PPC_NATIVE_OVERRIDE(80215E68, PAD__Init_HLE, int32_t, (), ());\n#endif\n"
+            "#if 0  // NSMBW: RFL is not linked into NSMBW; this read an MKW pointer\n"   # cuerpo apagado:
+            'extern "C" uint32_t RFLiIsWorking_HLE_800bd860() { return 0; }\n#endif\n'   # no se reactiva
+            "#if 0  // NSMBW: RFLiIsWorking is not linked into NSMBW (was MKW-only)\n"
+            "PPC_NATIVE_OVERRIDE(800BD860, RFLiIsWorking_HLE_800bd860, uint32_t, (), ());\n#endif\n")
+        ws = R.Symbols({"OSInitFont": 0x800F14C8, "OSLoadFont": 0x800F0BEC, "OSGetFontTexel": 0x800F0FCC,
+                        "RFLiIsWorking": 0x80169700},
                        {}, {}, set())
         res = R._Resolver(ws, {})
         changes = []

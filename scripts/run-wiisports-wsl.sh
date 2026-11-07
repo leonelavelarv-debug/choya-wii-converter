@@ -13,6 +13,12 @@ LOG="$HOME/wiisports-run.log"
 
 [ -x "$WC/build-wiisports/WiiCompiled" ] || { echo "No está compilado: corre primero build-wiisports-wsl.sh"; exit 1; }
 [ -f "$DATA/sys/boot.bin" ] || { echo "No encontré $DATA/sys/boot.bin"; exit 1; }
+if [ "$HOME/choya-build.log" -nt "$WC/build-wiisports/WiiCompiled" ] && ! grep -q "COMPILÓ" "$HOME/choya-build.log"; then
+  echo "AVISO: la última compilación falló; este ejecutable es de una compilación anterior."
+  grep -E "Errores de compilación| error: " "$HOME/choya-build.log" | head -5
+  echo "Arréglalo primero (o borra ~/choya-build.log para arrancar el viejo de todos modos)."
+  exit 1
+fi
 
 mkdir -p "$(dirname "$CFG")"
 if ! grep -q "dvd_root" "$CFG" 2>/dev/null; then

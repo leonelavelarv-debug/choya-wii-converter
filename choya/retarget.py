@@ -342,12 +342,27 @@ _ABSENT = re.compile(r"no matching function|name not in|not linked|no \w+ symbol
                      r"has no |not in the \w+ dol|is not present|does not exist", re.I)
 
 
+def _live_symbol(text: str, sym: str, dead: set[int]) -> bool:
+    """¿La función nativa `sym` existe fuera de un `#if 0`? (definida aquí o declarada para otro archivo).
+    Si su cuerpo también quedó apagado (p. ej. porque leía direcciones de MKW), no se reactiva."""
+    for m in re.finditer(rf"\b{re.escape(sym)}\s*\(", text):
+        line = _line_of(text, m.start())
+        if line in dead:
+            continue
+        before = text[text.rfind("\n", 0, m.start()) + 1:m.start()]
+        if _STATEMENTS.search(before) or before.strip().startswith("//"):
+            continue                     # es el propio registro o un comentario
+        return True
+    return False
+
+
 def reactivate(text: str, rel: str, res: "_Resolver", changes: list[Change]) -> str:
     """WiiCompiled apagó con `#if 0  // BRAWL: no matching function...` funciones nativas que Brawl, SPM o
     NSMBW no tienen. Si Wii Sports sí las tiene (por el nombre del símbolo) y el bloque contiene solo ese
     registro, se vuelve a encender: `#if 0` → `#if 1`. Así OSInitFont, por ejemplo, vuelve a ser nativa
     en vez de leer un registro de hardware que no existe."""
     lines = text.split("\n")
+    dead_before = disabled_lines(text)
     stack = []                     # (línea, es_if0, motivo_de_ausencia)
     blocks = []                    # (inicio, fin) de cada #if 0
     for i, raw in enumerate(lines):
@@ -379,7 +394,7 @@ def reactivate(text: str, rel: str, res: "_Resolver", changes: list[Change]) -> 
             continue
         sym = m.group("sym") or ""
         name = next((c for c in base_names(sym) if c in res.ws.funcs and c not in res.ws.ambiguous), None)
-        if not name:
+        if not name or not _live_symbol(text, sym, dead_before):
             continue
         for j in [start] + [j for j in range(start + 1, end) if lines[j].strip().startswith("#if")]:
             lines[j] = re.sub(r"#(\s*)if\s+0\b", r"#\1if 1", lines[j], count=1) + \
