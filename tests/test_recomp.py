@@ -141,6 +141,8 @@ constexpr uint32_t kHorY = 0x804de65c;    // HorVer+0x1C (PanSizeY)
 constexpr uint32_t kDup = 0x805A0000u;    // Dup
 constexpr uint32_t kRaro = 0x80123456u;
 void g(CpuContext* c) { func_80777777(c); }
+static void func_80666666(CpuContext*) {}  // definida aquí: no se toca
+void h(CpuContext* c) { func_80666666(c); }
 void f() { Memory::Write32(0x804DE6E4, 0); InvokeIndirectCpu(0x801E9A2Cu, c); }  // VISetNextFrameBuffer's blr
 """
 
@@ -182,6 +184,9 @@ void f() { Memory::Write32(0x804DE6E4, 0); InvokeIndirectCpu(0x801E9A2Cu, c); } 
             self.assertIn("choya_ausente_80777777(c)", out)                             # función de otro juego
             stubs = open(os.path.join(t, "runtime-wiisports", R.MISSING_FILE)).read()
             self.assertIn('void choya_ausente_80777777(CpuContext*)', stubs)
+            self.assertIn("static void func_80666666(CpuContext*) {}", out)
+            self.assertIn("{ func_80666666(c); }", out)
+            self.assertNotIn("80666666", stubs)
             self.assertEqual(r.count("duplicado"), 1)
             self.assertEqual(r.count("desactivado"), 1)
             unresolved = {c.old for c in r.changes if c.kind == "sin_resolver"}

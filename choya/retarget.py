@@ -381,6 +381,9 @@ def retarget_text(text: str, rel: str, res: _Resolver, registered: dict[int, str
     lines = text.split("\n")
     dead = disabled_lines(text)
     anchors = _anchors(lines, dead)
+    # func_XXXXXXXX definidas en este mismo archivo (p. ej. `static void func_801A6D30(CpuContext*) {}`):
+    # son del runtime, no del juego, y no se tocan.
+    local_defs = {int(a, 16) for a in re.findall(r"\bfunc_(8[0-9A-Fa-f]{7})\s*\([^;{)]*\)\s*(?:const\s*)?\{", text)}
     for i, raw in enumerate(lines, 1):
         s = raw.strip()
         if i in dead or s.startswith(("//", "*", "/*", "#")) or _STATEMENTS.search(raw) or "choya:" in raw:
@@ -391,6 +394,8 @@ def retarget_text(text: str, rel: str, res: _Resolver, registered: dict[int, str
 
         def sub_func(m, i=i, s=s):
             old = int(m.group("addr"), 16)
+            if old in local_defs:
+                return m.group(0)
             hit = res.moved.get(old)
             kind = "funcion"
             if hit is None:
