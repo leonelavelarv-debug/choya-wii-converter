@@ -565,3 +565,40 @@ def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0,
     m.b.extend(b"\x00" * ((-len(m.b)) % 32))
     m.put(">I", 4, len(m.b))
     return bytes(m.b)
+
+
+# --- main.dol sintético ------------------------------------------------------------
+
+def ppc_lis(rd, v):
+    return (15 << 26) | (rd << 21) | (v & 0xFFFF)
+
+
+def ppc_ori(ra, rs, v):
+    return (24 << 26) | (rs << 21) | (ra << 16) | (v & 0xFFFF)
+
+
+def ppc_addi(rd, ra, v):
+    return (14 << 26) | (rd << 21) | (ra << 16) | (v & 0xFFFF)
+
+
+def ppc_bl(pc, target):
+    return (18 << 26) | ((target - pc) & 0x03FFFFFC) | 1
+
+
+def build_dol(code: dict, text_base=0x80004000, text_size=0x3000, entry=0x80006124,
+              data_base=0x80300000, data=b"\0" * 0x100):
+    """code = {dirección: [instrucciones]} dentro de la única sección de código."""
+    import struct as st
+    text = bytearray(text_size)
+    for addr, words in code.items():
+        for i, w in enumerate(words):
+            st.pack_into(">I", text, addr - text_base + 4 * i, w)
+    hdr = bytearray(0x100)
+    offs, addrs, sizes = [0] * 18, [0] * 18, [0] * 18
+    offs[0], addrs[0], sizes[0] = 0x100, text_base, text_size
+    offs[7], addrs[7], sizes[7] = 0x100 + text_size, data_base, len(data)
+    st.pack_into(">18I", hdr, 0x00, *offs)
+    st.pack_into(">18I", hdr, 0x48, *addrs)
+    st.pack_into(">18I", hdr, 0x90, *sizes)
+    st.pack_into(">3I", hdr, 0xD8, 0x80400000, 0x1000, entry)
+    return bytes(hdr) + bytes(text) + data

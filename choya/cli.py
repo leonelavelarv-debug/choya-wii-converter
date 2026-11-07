@@ -91,6 +91,28 @@ def cmd_package(a):
     print(f"Port armado en {port}")
 
 
+def cmd_recomp_prep(a):
+    from . import recomp
+    r = recomp.prep(a.src, a.out, simbolos=a.simbolos, force=a.forzar)
+    b = r.boot
+    print(f"main.dol:          {r.dol_path}")
+    print(f"SHA-1:             {r.sha1}  ({'Wii Sports USA Rev 1' if r.ogws_match else 'NO coincide con ogws'})")
+    print(f"Entrada:           {b.entry:08X}")
+    print(f"__init_registers:  {b.init_registers:08X}")
+    print(f"SDA  (r13):        {b.sda_base:08X}")
+    print(f"SDA2 (r2):         {b.sda2_base:08X}")
+    if b.stack is not None:
+        print(f"Pila (r1):         {b.stack:08X}")
+    print(f"Funciones:         {r.functions}  ({r.symbols_source})")
+    if r.coverage is not None:
+        ok = sum(1 for e in r.coverage if e.new_address is not None)
+        print(f"Nativas WiiCompiled con equivalente en Wii Sports: {ok} de {len(r.coverage)}"
+              " (ver hle_cobertura.md)")
+    for w in r.warnings:
+        print(f"AVISO: {w}")
+    print(f"Proyecto escrito en {r.project_dir}")
+
+
 def cmd_profiles(_a):
     for p in profiles.PROFILES.values():
         print(f"{p.name:10s} {p.description}")
@@ -137,6 +159,13 @@ def main(argv=None):
     mo.add_argument("--items", type=int, default=12, help="huesos y objetos a mostrar por modelo")
     mo.add_argument("-a", "--archivo", help="guardar el diagnóstico en este archivo (UTF-8)")
     mo.set_defaults(fn=cmd_modelo)
+
+    rp = sub.add_parser("recomp-prep", help="prepara el proyecto de WiiCompiled para Wii Sports")
+    rp.add_argument("src", help="carpeta del disco extraído (con sys/main.dol) o el main.dol")
+    rp.add_argument("out", help="carpeta de WiiCompiled (se crea projects/wiisports dentro)")
+    rp.add_argument("--simbolos", help="symbols.txt de ogws o un MAP.txt (por defecto el incluido)")
+    rp.add_argument("--forzar", action="store_true", help="seguir aunque el main.dol no sea RSPE01 Rev 1")
+    rp.set_defaults(fn=cmd_recomp_prep)
 
     pr = sub.add_parser("profiles", help="lista los perfiles de optimización")
     pr.set_defaults(fn=cmd_profiles)

@@ -140,6 +140,27 @@ La clave es `crc32(nivel 0 GX) | ancho | alto | formato`, igual en Python (`pack
 
 Para audio: `pack.find_audio("Sound/strm/bgm.brstm")` y `wl::AudioStream` dan PCM16 listo para SDL. La música se guarda en su DSP-ADPCM original (3.5 veces más chica que PCM16) y se decodifica al vuelo, con bucle. `wl::dsp_decode` sirve también para lo que siga en BRSAR.
 
+## 8. Recompilar Wii Sports con WiiCompiled (puerta 3)
+
+[WiiCompiled](https://github.com/patchzyy/Wiicompiled) traduce el código PowerPC del `main.dol` a C++. Choya no trae nada de WiiCompiled (es GPLv3): solo le prepara el proyecto.
+
+```powershell
+choya recomp-prep D:\Wii\RSPE01 C:\choya\BrawlRecompiled\wiicompiled
+```
+
+Escribe en `projects\wiisports\`:
+
+| Archivo | Qué es |
+|---|---|
+| `recomp.yml` | manifiesto: bases SDA (r13/r2) leídas de `__init_registers`, entrada `__start` 0x80006124, SHA-256 de tu `main.dol` |
+| `MAP.txt` | 14 122 funciones con nombre, de los símbolos de [ogws](https://github.com/doldecomp/ogws) (CC0, incluidos en `choya/data`) |
+| `native\` | carpeta vacía para las funciones nativas propias de Wii Sports |
+| `hle_cobertura.md` | qué funciones nativas de WiiCompiled existen en Wii Sports y en qué dirección |
+
+Solo acepta Wii Sports USA Rev 1 (el mismo `main.dol` que ogws). Con `--simbolos` se le da otro `symbols.txt` o `MAP.txt`.
+
+Lo que genera el traductor (`build\wiisports\`) contiene código del juego: no lo subas a ningún repositorio.
+
 ## Formato `.wlpk`
 
 Little-endian, alineado a 16 bytes: cabecera de 64 bytes, tabla de entradas de 48 bytes ordenada por clave (búsqueda binaria), nombres, manifiesto JSON y datos. La especificación completa está en `choya/pack.py` y `runtime/include/wl/pack.h`.
@@ -150,7 +171,7 @@ Little-endian, alineado a 16 bytes: cabecera de 64 bytes, tabla de entradas de 4
 python -m unittest discover tests
 ```
 
-31 pruebas con datos sintéticos: Yaz0/LZ77, U8, BRRES, TPL, los 11 formatos GX, ETC2/EAC (calidad y que nunca desborde el modo diferencial), DSP-ADPCM, BRSTM con bloques entrelazados, respaldo por calidad, audio ADPCM con bucle decodificado en C++, modelos MDL0, TEV con la configuración de materiales reales compilado y dibujado en OpenGL ES por software (Mesa llvmpipe) con revisión de píxeles, conversión de punta a punta, y una prueba cruzada donde el runtime C++ lee el paquete de Python (claves, caché y audio idénticos).
+39 pruebas con datos sintéticos (7 necesitan el runtime compilado): Yaz0/LZ77, U8, BRRES, TPL, los 11 formatos GX, ETC2/EAC (calidad y que nunca desborde el modo diferencial), DSP-ADPCM, BRSTM con bloques entrelazados, respaldo por calidad, audio ADPCM con bucle decodificado en C++, modelos MDL0, TEV con la configuración de materiales reales compilado y dibujado en OpenGL ES por software (Mesa llvmpipe) con revisión de píxeles, conversión de punta a punta, una prueba cruzada donde el runtime C++ lee el paquete de Python (claves, caché y audio idénticos), y la lectura de `main.dol` y del arranque para WiiCompiled.
 
 ## Pendiente
 
