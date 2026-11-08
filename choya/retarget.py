@@ -965,6 +965,29 @@ AURORA_FILES = [("choya_gx.hpp", "lib/choya/choya_gx.hpp"), ("choya_gx.cpp", "li
                 ("choya_gx_core.hpp", "lib/choya/choya_gx_core.hpp"), ("choya_gx_core.cpp", "lib/choya/choya_gx_core.cpp")]
 
 
+def _capture_payloads() -> list[str]:
+    """Bloques de copia del cuadro que han insertado las versiones de Choya en common.cpp (actual y anteriores)."""
+    edit = next(e for e in AURORA_EDITS if e[3] == "motor de Choya (copia del cuadro)")
+    current = edit[2][len(edit[1]):]
+    v0120 = current.replace(
+        "        // La copia a pantalla (GXCopyDisp) termina el pase cuyo destino es la textura de la copia de pantalla.\n"
+        "        const bool displayCopy = pass.resolveTarget && pass.resolveTarget == gx::g_gxState.displayCopyTexture;\n"
+        "        choya::capture_pass(pass.targetSize.width, pass.targetSize.height, pass.clearColor, pass.clearDepth, rgba,\n"
+        "                            pass.clearDepthValue, displayCopy);\n",
+        "        choya::capture_pass(pass.targetSize.width, pass.targetSize.height, pass.clearColor, pass.clearDepth, rgba,\n"
+        "                            pass.clearDepthValue);\n")
+    assert v0120 != current
+    return [current, v0120]
+
+
+# Lo que versiones anteriores de Choya insertaron en aurora: se quita antes de aplicar los cambios actuales, para
+# que actualizar Choya no deje bloques repetidos o viejos (0.12.2 dejaba el bloque de la 0.12.0 junto al nuevo).
+AURORA_STRIPS = [("lib/gfx/common.cpp", s) for s in _capture_payloads()] + [
+    ("cmake/aurora_gx.cmake", "        lib/choya/choya_gx_core.cpp\n"),
+    ("cmake/aurora_gx.cmake", "        lib/choya/choya_gx.cpp\n"),
+]
+
+
 def patch_aurora(wiicompiled: str, changes: list[Change]) -> None:
     base = os.path.join(wiicompiled, "aurora-main")
     if not os.path.isdir(base):  # p. ej. un runtime ya compilado como paquete
@@ -973,26 +996,46 @@ def patch_aurora(wiicompiled: str, changes: list[Change]) -> None:
     for src, rel in AURORA_FILES:
         dst = os.path.join(base, rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copyfile(os.path.join(data, src), dst)
+        with open(os.path.join(data, src), "rb") as f:
+            content = f.read()
+        old_content = None
+        if os.path.isfile(dst):
+            with open(dst, "rb") as f:
+                old_content = f.read()
+        if content != old_content:  # sin reescribir si no cambió: no fuerza recompilar
+            with open(dst, "wb") as f:
+                f.write(content)
         changes.append(Change("aurora-main/" + rel, 0, "edicion", 0, None, "motor de Choya", "motor de Choya (archivo)"))
-    for rel, old, new, label in AURORA_EDITS:
+    files: dict[str, list] = {}
+    for edit in AURORA_EDITS:
+        files.setdefault(edit[0], []).append(edit)
+    for rel, edits in files.items():
         path = os.path.join(base, rel)
         shown = "aurora-main/" + rel
         if not os.path.isfile(path):
-            changes.append(Change(shown, 0, "parche_fallido", 0, None, label, "no encontré el archivo"))
+            for _r, _o, _n, label in edits:
+                changes.append(Change(shown, 0, "parche_fallido", 0, None, label, "no encontré el archivo"))
             continue
         with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
-            text = f.read()
-        if new in text:
-            changes.append(Change(shown, _line_of(text, text.index(new)), "edicion", 0, None, label, label + " (ya estaba)"))
-            continue
-        if text.count(old) != 1:
-            changes.append(Change(shown, 0, "parche_fallido", 0, None, label, "texto no encontrado (¿cambió aurora?)"))
-            continue
-        line = _line_of(text, text.index(old))
-        with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
-            f.write(text.replace(old, new, 1))
-        changes.append(Change(shown, line, "edicion", 0, None, label, label))
+            original = f.read()
+        text = original
+        for strip_rel, payload in AURORA_STRIPS:
+            if strip_rel == rel:
+                text = text.replace(payload, "")
+        for _r, old, new, label in edits:
+            if new in text:
+                changes.append(Change(shown, _line_of(text, text.index(new)), "edicion", 0, None, label,
+                                      label + " (ya estaba)"))
+                continue
+            if text.count(old) != 1:
+                changes.append(Change(shown, 0, "parche_fallido", 0, None, label, "texto no encontrado (¿cambió aurora?)"))
+                continue
+            line = _line_of(text, text.index(old))
+            text = text.replace(old, new, 1)
+            changes.append(Change(shown, line, "edicion", 0, None, label, label))
+        if text != original:
+            with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+                f.write(text)
 
 
 def apply_edits(text: str, rel: str, changes: list[Change]) -> str:

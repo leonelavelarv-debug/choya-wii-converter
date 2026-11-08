@@ -372,6 +372,36 @@ class TestPerfil(unittest.TestCase):
 
 
 class TestEdits(unittest.TestCase):
+    def test_aurora_actualiza_parches_viejos(self):
+        import os, shutil, tempfile
+        from choya import retarget as R
+        real = "/home/claude/ext/brawlrecomp/wiicompiled/aurora-main"
+        if not os.path.exists(real):
+            self.skipTest("sin aurora")
+        with tempfile.TemporaryDirectory() as d:
+            for rel in sorted({r for r, _o, _n, _l in R.AURORA_EDITS}):
+                os.makedirs(os.path.dirname(os.path.join(d, "aurora-main", rel)), exist_ok=True)
+                shutil.copy(os.path.join(real, rel), os.path.join(d, "aurora-main", rel))
+            common = os.path.join(d, "aurora-main/lib/gfx/common.cpp")
+            cmake = os.path.join(d, "aurora-main/cmake/aurora_gx.cmake")
+            current, v0120 = R._capture_payloads()
+            anchor = "  g_uniforms.append_zeroes(gx::MaxUniformSize); // Pad the end of the buffer\n"
+            text = open(common).read().replace(anchor, anchor + current + v0120)  # como lo dejó la 0.12.2
+            open(common, "w").write(text)
+            ctext = open(cmake).read().replace("        lib/gfx/common.cpp\n",
+                                               "        lib/gfx/common.cpp\n        lib/choya/choya_gx.cpp\n"
+                                               "        lib/choya/choya_gx.cpp\n")
+            open(cmake, "w").write(ctext)
+            changes = []
+            R.patch_aurora(d, changes)
+            self.assertNotIn("parche_fallido", [c.kind for c in changes])
+            text = open(common).read()
+            self.assertEqual(text.count("choya::capture_end();"), 1)
+            self.assertEqual(text.count("pass.clearDepthValue, displayCopy);"), 1)
+            ctext = open(cmake).read()
+            self.assertEqual(ctext.count("lib/choya/choya_gx.cpp"), 1)
+            self.assertEqual(ctext.count("lib/choya/choya_gx_core.cpp"), 1)
+
     def test_aurora_offscreen(self):
         import os, shutil, tempfile
         from choya import retarget as R
