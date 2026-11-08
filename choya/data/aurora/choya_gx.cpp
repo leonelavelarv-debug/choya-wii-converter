@@ -8,6 +8,7 @@
 #include "../gx/shader_info.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -289,6 +290,10 @@ void capture_discard() noexcept { core::capture_discard(); }
 
 } // namespace aurora::choya
 
+// Volcado a pedido (Select + R1 en modo diagnóstico): el siguiente cuadro dibujado va a cuadro-manual-<n>.bin.
+static std::atomic<bool> g_choyaDumpRequest{false};
+extern "C" void choya_gx_request_dump() { g_choyaDumpRequest.store(true); }
+
 extern "C" bool choya_gx_draw_frame(int screenWidth, int screenHeight) {
   namespace core = ::choya::gx;
   if (choya_gl_proc == nullptr) return false;
@@ -313,6 +318,14 @@ extern "C" bool choya_gx_draw_frame(int screenWidth, int screenHeight) {
                       core::dump_last_frame(path) ? "listo" : "falló");
         aurora::choya::log_to_runtime(line);
       }
+    }
+    if (g_choyaDumpRequest.exchange(false)) {
+      char path[64];
+      std::snprintf(path, sizeof(path), "cuadro-manual-%lu.bin", frames);
+      char line[160];
+      std::snprintf(line, sizeof(line), "motor: volcado a pedido del cuadro %lu en %s: %s", frames, path,
+                    core::dump_last_frame(path) ? "listo" : "falló (solo en modo diagnóstico)");
+      aurora::choya::log_to_runtime(line);
     }
   }
   return drawn;

@@ -35,6 +35,7 @@
 #include <SDL3/SDL.h>
 
 extern "C" bool choya_gx_draw_frame(int screenWidth, int screenHeight);  // motor de Choya (aurora)
+extern "C" void choya_gx_request_dump();  // volcado del siguiente cuadro (aurora)
 
 namespace {
 
@@ -399,12 +400,23 @@ void CheckGamepads() {
     if (frames == 1) std::thread(EvdevThread).detach();
     int count = 0;
     SDL_JoystickID* ids = SDL_GetGamepads(&count);
-    bool combo = false;
+    bool combo = false, dump = false;
+    static int dumpHeld = 0;
     for (int i = 0; ids && i < count; ++i) {
         SDL_Gamepad* pad = SDL_GetGamepadFromID(ids[i]);
         if (pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_BACK) && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_START)) {
             combo = true;
         }
+        if (pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_BACK) &&
+            SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) {
+            dump = true;
+        }
+    }
+    // Select + R1 sostenidos 1 s: vuelca el cuadro que se ve (cuadro-manual-<n>.bin; solo en modo diagnóstico).
+    dumpHeld = dump ? dumpHeld + 1 : 0;
+    if (dumpHeld == 60) {
+        Log("Select + R1: volcado del cuadro pedido");
+        choya_gx_request_dump();
     }
     if (frames == 1 || frames == 120 || frames == 1200 || count != lastCount) {
         lastCount = count;

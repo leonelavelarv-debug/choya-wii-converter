@@ -1,7 +1,7 @@
 #!/bin/bash
 # Choya Wii Converter - Wii Sports recompilado (WiiCompiled/BrawlRecompiled) con el motor GLES de Choya.
 # Para jugar. Select + Start sostenidos 1.5 s cierran el juego.
-# Modo diagnóstico (90 s, perfil, volcados de cuadros): "Wii Sports (Choya) - diagnostico.sh" o CHOYA_MODO=diagnostico.
+# Modo diagnóstico (3 min, perfil, volcados de cuadros; Select + R1 vuelca el cuadro que se ve): "Wii Sports (Choya) - diagnostico.sh" o CHOYA_MODO=diagnostico.
 # Deja run.log y resumen.txt en la carpeta wiisports-choya.
 
 DIR="$(cd "$(dirname "$0")" && pwd)/wiisports-choya"
@@ -88,7 +88,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
 escribir_resumen() {
   {
     echo "modo: $MODO"
-    echo "codigo de salida: ${STATUS:-sigue corriendo} (124 = siguio corriendo hasta el limite de 90 s)"
+    echo "codigo de salida: ${STATUS:-sigue corriendo} (124 = siguio corriendo hasta el limite del modo diagnostico)"
     [ -f "$DIR/perfil.txt" ] && echo "perfil.txt: $(head -2 "$DIR/perfil.txt" | tail -1)"
     cat "$DIR/cpu.txt"
     echo "--- cuadros volcados"
@@ -112,7 +112,7 @@ if [ "$MODO" = "diagnostico" ]; then
   # Vuelca estos cuadros del motor a cuadro-<n>.bin (aviso ~10 s, título ~40 s) para revisarlos en la PC.
   export CHOYA_GX_VOLCADO=600,2400
   rm -f "$DIR"/cuadro-*.bin "$DIR/perfil.txt"
-  timeout 90 ./WiiCompiled > "$DIR/run.log" 2>&1 &
+  timeout 180 ./WiiCompiled > "$DIR/run.log" 2>&1 &
   TPID=$!
   # A los 60 s: cuánto procesador gastó cada hilo (100 ticks = 1 s) y a qué frecuencia iba el procesador.
   sleep 60
