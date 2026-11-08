@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "choya-wii-converter"
-version = "0.13.4"
+version = "0.13.5"
 description = "Optimiza los recursos de juegos de Wii para la Anbernic RG35XX H con KNULLI"
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.22", "Pillow>=9.1"]

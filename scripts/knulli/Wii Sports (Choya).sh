@@ -39,6 +39,12 @@ if [ -n "$controlfolder" ]; then
   get_controls >/dev/null 2>&1
   [ -n "$sdl_controllerconfig" ] && export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
 fi
+# Se guarda el mapeo completo; si otro día no aparece PortMaster se usa el último bueno.
+if [ -n "$SDL_GAMECONTROLLERCONFIG" ]; then
+  printf "%s\n" "$SDL_GAMECONTROLLERCONFIG" > "$DIR/mapeo-sdl.txt"
+elif [ -s "$DIR/mapeo-sdl.txt" ]; then
+  export SDL_GAMECONTROLLERCONFIG="$(cat "$DIR/mapeo-sdl.txt")"
+fi
 cd "$DIR" || exit 1  # por si control.txt cambió de carpeta
 
 export XDG_DATA_HOME="$DIR/userdata"
@@ -58,9 +64,8 @@ CONF
 export LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"
 export SDL_VIDEO_DRIVER=offscreen
 export SDL_AUDIO_DRIVER=alsa
-# La ventana offscreen nunca tiene el foco del teclado y SDL descarta los botones del mando de una ventana sin
-# foco: con esto los acepta igual.
-export SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1
+# Ojo: no exportar SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS; aurora ya lo activa y si la variable existe su ventana falla.
+unset SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS
 export NSMBW_LOG_FPS=1
 export WIICOMPILED_NO_POPUP=1
 # Motor de Choya: pantalla GLES propia sobre el framebuffer de la Mali (anota choya-gles.txt).
