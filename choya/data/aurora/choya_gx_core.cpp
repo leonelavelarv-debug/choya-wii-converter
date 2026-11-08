@@ -75,7 +75,10 @@ constexpr GLenum kVertexShader = 0x8B31, kFragmentShader = 0x8B30, kCompileStatu
                  kFuncReverseSubtract = 0x800B, kMax = 0x8008, kUnpackAlignment = 0x0CF5,
                  kUniformBufferOffsetAlignment = 0x8A34, kInvalidIndex = 0xFFFFFFFFu, kFramebuffer = 0x8D40,
                  kReadFramebuffer = 0x8CA8, kDrawFramebuffer = 0x8CA9, kColorAttachment0 = 0x8CE0,
-                 kDepthStencilAttachment = 0x821A, kRenderbuffer = 0x8D41, kDepth24Stencil8 = 0x88F0, kRgba8 = 0x8058,
+                 kDepthStencilAttachment = 0x821A, kRenderbuffer = 0x8D41, kDepth24Stencil8 = 0x88F0, kRgba8 = 0x8058, kTextureWrapS = 0x2802, kTextureWrapT = 0x2803,
+                 kClampToEdge = 0x812F, kRepeat = 0x2901, kMirroredRepeat = 0x8370, kNearestMipmapNearest = 0x2700,
+                 kLinearMipmapNearest = 0x2701, kNearestMipmapLinear = 0x2702, kLinearMipmapLinear = 0x2703,
+                 kTextureMinLod = 0x813A, kTextureMaxLod = 0x813B, kRgba = 0x1908, kUnsignedByte = 0x1401,
                  kFramebufferComplete = 0x8CD5, kLinear = 0x2601;
 
 struct Gl {
@@ -127,6 +130,10 @@ struct Gl {
   void (*ClearDepthf)(GLfloat);
   void (*Clear)(GLbitfield);
   GLenum (*GetError)();
+  void (*GenSamplers)(GLsizei, GLuint*);
+  void (*BindSampler)(GLuint, GLuint);
+  void (*SamplerParameteri)(GLuint, GLenum, GLint);
+  void (*SamplerParameterf)(GLuint, GLenum, GLfloat);
   void (*GenFramebuffers)(GLsizei, GLuint*);
   void (*DeleteFramebuffers)(GLsizei, const GLuint*);
   void (*BindFramebuffer)(GLenum, GLuint);
@@ -202,6 +209,10 @@ bool load_gl() {
   CHOYA_GL(ClearDepthf);
   CHOYA_GL(Clear);
   CHOYA_GL(GetError);
+  CHOYA_GL(GenSamplers);
+  CHOYA_GL(BindSampler);
+  CHOYA_GL(SamplerParameteri);
+  CHOYA_GL(SamplerParameterf);
   CHOYA_GL(GenFramebuffers);
   CHOYA_GL(DeleteFramebuffers);
   CHOYA_GL(BindFramebuffer);
@@ -236,6 +247,7 @@ struct Item {
     struct {
       uint64_t pipeline;
       uint32_t idxOffset, indexCount, instanceCount, uniformOffset, dstAlpha, pad;
+      uint64_t bindGroup;
     } draw;
     struct {
       uint64_t pipeline;
@@ -261,6 +273,49 @@ std::mutex g_frameMutex;
 std::mutex g_pipelineMutex;
 std::unordered_map<uint64_t, PipelineDesc> g_pipelines;
 std::unordered_map<uint64_t, ClearDesc> g_clears;
+
+struct Stats {
+  uint64_t frames = 0, draws = 0, clears = 0, skippedLine = 0, skippedConfig = 0, skippedAlign = 0,
+           skippedProgram = 0, passes = 0;
+  uint64_t bytesVerts = 0, bytesUniforms = 0, bytesIndices = 0, bytesStorage = 0;
+  uint64_t texUploads = 0, missingTextures = 0;
+  double cpuMs = 0;
+} g_stats;
+
+std::unordered_map<uint64_t, BindDesc> g_bindGroups;
+
+struct TexUpload {
+  uint64_t id;
+  uint32_t width, height, mips;
+  std::vector<uint8_t> data;
+};
+struct GlTexture {
+  GLuint id = 0;
+  uint32_t width = 0, height = 0, mips = 0;
+};
+// Compartido entre el juego y el motor. En el heap y sin destruir: aurora libera texturas hasta el final.
+struct TexShared {
+  std::mutex mutex;
+  std::vector<TexUpload> pending;                 // del juego al hilo del motor
+  std::vector<uint64_t> released;
+  std::unordered_map<uint64_t, TexUpload> kept;   // copias para volcados (CHOYA_GX_VOLCADO)
+  bool keep = false;
+};
+TexShared& texs() {
+  static TexShared* s = new TexShared;
+  return *s;
+}
+std::unordered_map<uint64_t, GlTexture> g_textures;  // solo en el hilo del motor
+GLuint g_whiteTexture = 0;
+std::unordered_map<uint64_t, GLuint> g_samplers;
+
+bool find_bind_group(uint64_t ref, BindDesc& out) {
+  std::lock_guard lock(g_pipelineMutex);
+  auto it = g_bindGroups.find(ref);
+  if (it == g_bindGroups.end()) return false;
+  out = it->second;
+  return true;
+}
 
 bool find_pipeline(uint64_t ref, PipelineDesc& out) {
   std::lock_guard lock(g_pipelineMutex);
@@ -437,62 +492,184 @@ bool debug_colors() {
   return on;
 }
 
-// Desplazamientos (en palabras de 32 bits) de los uniformes que usa el paso 2a, siguiendo build_uniform.
-struct UniformLayout {
-  u32 proj = 20;
-  u32 postex = 36;
-  u32 chanMat[2] = {0, 0};    // material de color del canal i (0 = viene del vértice)
-  u32 chanMatA[2] = {0, 0};   // material de alfa del canal i
-};
-
-UniformLayout uniform_layout(const PipelineDesc& cfg) {
-  UniformLayout l;
-  u32 w = 20;  // vtx_start, current_pnmtx, 2 tamaños de viewport, pad, array_start[12]
-  if (cfg.lineMode != 0) w += 4;
-  l.proj = w;
-  w += 16;
-  l.postex = w;
-  w += 12u * cfg.postexCount;
-  w += 12u * cfg.nrmCount;
-  w += 4u * cfg.tevRegLoads;
-  if (cfg.lightingEnabled) w += 20u * 8u + 4u;  // 8 luces de 80 bytes + 4 palabras
-  for (int i = 0; i < 2; ++i) {
-    if (((cfg.sampledChannels >> i) & 1) == 0) continue;
-    const auto& cc = cfg.chans[i];
-    const auto& cca = cfg.chans[i + GX_ALPHA0];
-    if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) w += 4;
-    if (cc.matSrc == GX_SRC_REG) {
-      l.chanMat[i] = w;
-      w += 4;
-    }
-    if (cca.lightingEnabled && cca.ambSrc == GX_SRC_REG) w += 4;
-    if (cca.matSrc == GX_SRC_REG) {
-      l.chanMatA[i] = w;
-      w += 4;
-    }
-  }
-  return l;
-}
-
 std::string vertex_color(const PipelineDesc& cfg, u32 channel) {
   const int attr = vertex_color_attr(cfg, channel);
   return attr >= 0 ? color_attr(cfg, static_cast<GXAttr>(attr)) : "vec4(1.0)";
 }
 
-void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
-  const auto l = uniform_layout(cfg);
+std::string num(u32 v) { return std::to_string(v) + "u"; }
+std::string uvec(u32 word) { return "uv4(" + num(word) + ")"; }
 
+// Componente de un canal según la tabla de intercambio (GX_CH_RED..GX_CH_ALPHA).
+char swz(u8 ch) { return "rgba"[ch & 3]; }
+
+// --- TEV en flotante (motor de Choya). El TEV exacto en enteros llega en el paso 2b-2. ---
+std::string tev_kc(u8 sel) {
+  if (sel <= GX_TEV_KCSEL_1_8) return "vec3(" + std::to_string(8 - sel) + ".0 / 8.0)";
+  if (sel >= GX_TEV_KCSEL_K0 && sel <= GX_TEV_KCSEL_K3) return "k" + std::to_string(sel - GX_TEV_KCSEL_K0) + ".rgb";
+  if (sel >= GX_TEV_KCSEL_K0_R && sel <= GX_TEV_KCSEL_K3_A) {
+    const int k = (sel - GX_TEV_KCSEL_K0_R) & 3, c = (sel - GX_TEV_KCSEL_K0_R) >> 2;
+    return std::string("vec3(k") + std::to_string(k) + "." + "rgba"[c] + ")";
+  }
+  return "vec3(1.0)";
+}
+std::string tev_ka(u8 sel) {
+  if (sel <= GX_TEV_KASEL_1_8) return "(" + std::to_string(8 - sel) + ".0 / 8.0)";
+  if (sel >= GX_TEV_KASEL_K0_R && sel <= GX_TEV_KASEL_K3_A) {
+    const int k = (sel - GX_TEV_KASEL_K0_R) & 3, c = (sel - GX_TEV_KASEL_K0_R) >> 2;
+    return std::string("k") + std::to_string(k) + "." + "rgba"[c];
+  }
+  return "1.0";
+}
+
+std::string tev_color_arg(const PipelineDesc& cfg, const TevStageDesc& s, u32 idx, u8 arg) {
+  const bool hasTex = s.texMap != 0xFF;
+  const u8* tsw = cfg.swap[s.swapTex & 3];
+  const u8* rsw = cfg.swap[s.swapRas & 3];
+  const std::string ras = s.channel == GX_COLOR1A1 || s.channel == GX_COLOR1 || s.channel == GX_ALPHA1 ? "rast1" : "rast0";
+  const bool noRas = s.channel == GX_COLOR_ZERO || s.channel == GX_COLOR_NULL || s.channel == GX_ALPHA_BUMP ||
+                     s.channel == GX_ALPHA_BUMPN;
+  const std::string si = "s" + std::to_string(idx);
+  switch (arg) {
+  case GX_CC_CPREV: return "prev.rgb";
+  case GX_CC_APREV: return "vec3(prev.a)";
+  case GX_CC_C0: return "r0.rgb";
+  case GX_CC_A0: return "vec3(r0.a)";
+  case GX_CC_C1: return "r1.rgb";
+  case GX_CC_A1: return "vec3(r1.a)";
+  case GX_CC_C2: return "r2.rgb";
+  case GX_CC_A2: return "vec3(r2.a)";
+  case GX_CC_TEXC:
+    if (!hasTex) return cfg.numTexGens == 0 ? "vec3(0.0)" : "vec3(1.0)";
+    return si + "." + swz(tsw[0]) + swz(tsw[1]) + swz(tsw[2]);
+  case GX_CC_TEXA:
+    if (!hasTex) return cfg.numTexGens == 0 ? "vec3(0.0)" : "vec3(1.0)";
+    return "vec3(" + si + "." + swz(tsw[3]) + ")";
+  case GX_CC_RASC:
+    if (noRas) return "vec3(0.0)";
+    return ras + "." + swz(rsw[0]) + swz(rsw[1]) + swz(rsw[2]);
+  case GX_CC_RASA:
+    if (noRas) return "vec3(0.0)";
+    return "vec3(" + ras + "." + swz(rsw[3]) + ")";
+  case GX_CC_ONE: return "vec3(1.0)";
+  case GX_CC_HALF: return "vec3(0.5)";
+  case GX_CC_KONST: return tev_kc(s.kcSel);
+  default: return "vec3(0.0)";
+  }
+}
+
+std::string tev_alpha_arg(const PipelineDesc& cfg, const TevStageDesc& s, u32 idx, u8 arg) {
+  const bool hasTex = s.texMap != 0xFF;
+  const u8* tsw = cfg.swap[s.swapTex & 3];
+  const u8* rsw = cfg.swap[s.swapRas & 3];
+  const std::string ras = s.channel == GX_COLOR1A1 || s.channel == GX_COLOR1 || s.channel == GX_ALPHA1 ? "rast1" : "rast0";
+  const bool noRas = s.channel == GX_COLOR_ZERO || s.channel == GX_COLOR_NULL || s.channel == GX_ALPHA_BUMP ||
+                     s.channel == GX_ALPHA_BUMPN;
+  switch (arg) {
+  case GX_CA_APREV: return "prev.a";
+  case GX_CA_A0: return "r0.a";
+  case GX_CA_A1: return "r1.a";
+  case GX_CA_A2: return "r2.a";
+  case GX_CA_TEXA:
+    if (!hasTex) return cfg.numTexGens == 0 ? "0.0" : "1.0";
+    return "s" + std::to_string(idx) + "." + swz(tsw[3]);
+  case GX_CA_RASA:
+    if (noRas) return "0.0";
+    return ras + "." + swz(rsw[3]);
+  case GX_CA_KONST: return tev_ka(s.kaSel);
+  default: return "0.0";
+  }
+}
+
+const char* tev_reg(u8 r) {
+  switch (r) {
+  case GX_TEVREG0: return "r0";
+  case GX_TEVREG1: return "r1";
+  case GX_TEVREG2: return "r2";
+  default: return "prev";
+  }
+}
+
+std::string tev_bias(u8 bias) { return bias == GX_TB_ADDHALF ? " + 0.5" : bias == GX_TB_SUBHALF ? " - 0.5" : ""; }
+std::string tev_scale(u8 scale) {
+  switch (scale) {
+  case GX_CS_SCALE_2: return " * 2.0";
+  case GX_CS_SCALE_4: return " * 4.0";
+  case GX_CS_DIVIDE_2: return " * 0.5";
+  default: return "";
+  }
+}
+
+// Una operación TEV (color con vec3, alfa con float).
+std::string tev_op(bool alpha, u8 op, u8 bias, u8 scale, u8 clampOut, const std::string& a, const std::string& b,
+                   const std::string& c, const std::string& d) {
+  const std::string T = alpha ? "float" : "vec3";
+  std::string v;
+  if (op == GX_TEV_ADD || op == GX_TEV_SUB) {
+    const std::string lerp = "mix(" + a + ", " + b + ", " + c + ")";
+    v = "((" + d + (op == GX_TEV_SUB ? " - " : " + ") + lerp + ")" + tev_bias(bias) + ")" + tev_scale(scale);
+  } else {
+    // Comparaciones: d + (a ? b : 0) ? c : 0, con valores de 8 bits (sin escala ni sesgo).
+    auto q = [](const std::string& x) { return "floor(" + x + " * 255.0 + 0.5)"; };
+    std::string cond;
+    switch (op) {
+    case GX_TEV_COMP_R8_GT: cond = q(a + ".r") + " > " + q(b + ".r"); break;
+    case GX_TEV_COMP_R8_EQ: cond = q(a + ".r") + " == " + q(b + ".r"); break;
+    case GX_TEV_COMP_GR16_GT:
+      cond = "dot(" + q(a + ".rg") + ", vec2(1.0, 256.0)) > dot(" + q(b + ".rg") + ", vec2(1.0, 256.0))"; break;
+    case GX_TEV_COMP_GR16_EQ: cond = "all(equal(" + q(a + ".rg") + ", " + q(b + ".rg") + "))"; break;
+    case GX_TEV_COMP_BGR24_GT:
+      cond = "dot(" + q(a + ".rgb") + ", vec3(1.0, 256.0, 65536.0)) > dot(" + q(b + ".rgb") + ", vec3(1.0, 256.0, 65536.0))";
+      break;
+    case GX_TEV_COMP_BGR24_EQ: cond = "all(equal(" + q(a + ".rgb") + ", " + q(b + ".rgb") + "))"; break;
+    default:  // RGB8 / A8 por componente
+      if (alpha) {
+        cond = q(a) + (op == GX_TEV_COMP_A8_GT ? " > " : " == ") + q(b);
+      } else {
+        const std::string cmp = op == GX_TEV_COMP_RGB8_GT ? "greaterThan(" : "equal(";
+        return "(" + d + " + " + c + " * vec3(" + cmp + q(a) + ", " + q(b) + ")))";
+      }
+      break;
+    }
+    v = "(" + d + " + ((" + cond + ") ? " + c + " : " + T + "(0.0)))";
+  }
+  return clampOut ? "clamp(" + v + ", 0.0, 1.0)" : "clamp(" + v + ", -4.0, 4.0)";
+}
+
+std::string alpha_test(u8 comp, u8 ref) {
+  const std::string r = std::to_string(ref) + ".0";
+  const std::string a = "floor(prev.a * 255.0 + 0.5)";
+  switch (comp) {
+  case GX_NEVER: return "false";
+  case GX_LESS: return a + " < " + r;
+  case GX_EQUAL: return a + " == " + r;
+  case GX_LEQUAL: return a + " <= " + r;
+  case GX_GREATER: return a + " > " + r;
+  case GX_NEQUAL: return a + " != " + r;
+  case GX_GEQUAL: return a + " >= " + r;
+  default: return "true";
+  }
+}
+
+void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
+  // ---------------- vertex shader ----------------
   vs = "#version 320 es\nprecision highp float;\nprecision highp int;\n"
        "uniform highp usampler2D vbuf;\nuniform highp usampler2D abuf;\n"
-       "layout(std140) uniform U { uvec4 u[1024]; };\nout vec4 v_color;\n";
+       "layout(std140) uniform U { uvec4 u[1024]; };\nout vec4 v_color0;\nout vec4 v_color1;\n";
+  for (u32 i = 0; i < 8; ++i) {
+    if ((cfg.sampledTexCoords >> i) & 1) vs += "out vec3 v_tex" + std::to_string(i) + ";\n";
+  }
   vs += kHelpers;
   vs += "void main() {\n  uint vidx = uint(gl_VertexID);\n  uint vtx_start = uw(0u);\n";
-  if (cfg.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE) {
+  auto raw_u8 = [&](GXAttr attr) {
     char buf;
     std::string offs;
     bool le;
-    attr_address(cfg, GX_VA_PNMTXIDX, buf, offs, le);
-    vs += "  uint pnmtx = lb_" + std::string(1, buf) + "(" + offs + ") / 3u;\n";
+    attr_address(cfg, attr, buf, offs, le);
+    return "lb_" + std::string(1, buf) + "(" + offs + ")";
+  };
+  if (cfg.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE) {
+    vs += "  uint pnmtx = " + raw_u8(GX_VA_PNMTXIDX) + " / 3u;\n";
   } else {
     vs += "  uint pnmtx = uw(1u);\n";
   }
@@ -502,35 +679,135 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
   } else {
     vs += "  vec3 in_pos = " + vec_attr(cfg, GX_VA_POS, 3) + ";\n";
   }
-  vs += "  uint m = " + std::to_string(l.postex) + "u + pnmtx * 12u;\n"
+  vs += "  uint m = " + num(cfg.offPostex) + " + pnmtx * 12u;\n"
         "  vec4 p = vec4(in_pos, 1.0);\n"
         "  vec4 mv = vec4(dot(p, uv4(m)), dot(p, uv4(m + 4u)), dot(p, uv4(m + 8u)), 1.0);\n"
-        "  gl_Position = vec4(dot(mv, uv4(" + std::to_string(l.proj) + "u)), dot(mv, uv4(" +
-        std::to_string(l.proj + 4) + "u)), dot(mv, uv4(" + std::to_string(l.proj + 8) + "u)), dot(mv, uv4(" +
-        std::to_string(l.proj + 12) + "u)));\n";
+        "  gl_Position = vec4(dot(mv, " + uvec(cfg.offProj) + "), dot(mv, " + uvec(cfg.offProj + 4u) + "), dot(mv, " +
+        uvec(cfg.offProj + 8u) + "), dot(mv, " + uvec(cfg.offProj + 12u) + "));\n";
 
-  // Color del rasterizador del canal 0 (sin iluminación todavía): material o color del vértice.
-  if ((cfg.sampledChannels & 1) != 0) {
-    const auto& cc = cfg.chans[0];
-    const auto& cca = cfg.chans[GX_ALPHA0];
-    const bool needVtx = cc.matSrc == GX_SRC_VTX || cca.matSrc == GX_SRC_VTX;
-    if (needVtx) vs += "  vec4 vc = " + vertex_color(cfg, 0) + ";\n";
-    const std::string rgb = cc.matSrc == GX_SRC_VTX ? "vc.rgb" : "uv4(" + std::to_string(l.chanMat[0]) + "u).rgb";
-    const std::string a = cca.matSrc == GX_SRC_VTX ? "vc.a" : "uv4(" + std::to_string(l.chanMatA[0]) + "u).a";
-    vs += "  v_color = vec4(" + rgb + ", " + a + ");\n";
-  } else {
-    // El TEV no lee el rasterizador (normalmente solo textura): gris para ver la forma.
-    vs += "  v_color = vec4(0.6, 0.6, 0.6, 1.0);\n";
+  // Canales de color (sin iluminación todavía): material o color del vértice.
+  for (u32 ch = 0; ch < 2; ++ch) {
+    const std::string out = "v_color" + std::to_string(ch);
+    if (((cfg.sampledChannels >> ch) & 1) == 0) {
+      vs += "  " + out + " = vec4(1.0);\n";
+      continue;
+    }
+    const auto& cc = cfg.chans[ch];
+    const auto& cca = cfg.chans[ch + GX_ALPHA0];
+    std::string vc = "vc" + std::to_string(ch);
+    if (cc.matSrc == GX_SRC_VTX || cca.matSrc == GX_SRC_VTX) vs += "  vec4 " + vc + " = " + vertex_color(cfg, ch) + ";\n";
+    const std::string rgb = cc.matSrc == GX_SRC_VTX ? vc + ".rgb" : uvec(cfg.offChanMat[ch]) + ".rgb";
+    const std::string a = cca.matSrc == GX_SRC_VTX ? vc + ".a" : uvec(cfg.offChanMatA[ch]) + ".a";
+    vs += "  " + out + " = vec4(" + rgb + ", " + a + ");\n";
+  }
+
+  // Coordenadas de textura.
+  for (u32 i = 0; i < 8; ++i) {
+    if (((cfg.sampledTexCoords >> i) & 1) == 0) continue;
+    const auto& tg = cfg.texgens[i];
+    const std::string tc = "tc" + std::to_string(i);
+    auto tex_src = [&](u32 n) {
+      const GXAttr attr = static_cast<GXAttr>(GX_VA_TEX0 + n);
+      const auto& a = cfg.attrs[attr];
+      if (a.attrType == GX_NONE) return std::string("vec4(0.0, 0.0, 1.0, 1.0)");
+      if (a.cnt == 1) return "vec4(" + vec_attr(cfg, attr, 1) + ".x, 0.0, 1.0, 1.0)";
+      return "vec4(" + vec_attr(cfg, attr, 2) + ", 1.0, 1.0)";
+    };
+    if (tg.src >= GX_TG_TEX0 && tg.src <= GX_TG_TEX7) {
+      vs += "  vec4 " + tc + " = " + tex_src(tg.src - GX_TG_TEX0) + ";\n";
+    } else if (tg.src == GX_MAX_TEXGENSRC) {
+      vs += "  vec4 " + tc + " = " + tex_src(i) + ";\n";
+    } else if (tg.src == GX_TG_COLOR0 || tg.src == GX_TG_COLOR1) {
+      vs += "  vec4 " + tc + " = vec4(" + vertex_color(cfg, tg.src - GX_TG_COLOR0) + ".rgb, 1.0);\n";
+    } else {  // posición (y por ahora también normales y tangentes)
+      vs += "  vec4 " + tc + " = vec4(in_pos, 1.0);\n";
+    }
+    std::string tmp;
+    if (tg.type == GX_TG_MTX2x4 || tg.type == GX_TG_MTX3x4) {
+      std::string base;
+      if (tg.mtxSlot == 0xFE) {
+        vs += "  uint tm" + std::to_string(i) + " = " + num(cfg.offPostex) + " + (" +
+              raw_u8(static_cast<GXAttr>(GX_VA_TEX0MTXIDX + i)) + " / 3u) * 12u;\n";
+        base = "tm" + std::to_string(i);
+      } else if (tg.mtxSlot != 0xFF) {
+        base = num(cfg.offPostex + 12u * tg.mtxSlot);
+      }
+      if (base.empty()) {
+        tmp = tc + ".xyz";
+      } else {
+        tmp = "vec3(dot(" + tc + ", uv4(" + base + ")), dot(" + tc + ", uv4(" + base + " + 4u)), dot(" + tc + ", uv4(" +
+              base + " + 8u)))";
+      }
+      if (tg.type == GX_TG_MTX2x4) tmp = "vec3((" + tmp + ").xy, 1.0)";
+    } else {  // SRTG y otros
+      tmp = "vec3(" + tc + ".xy, 1.0)";
+    }
+    const std::string out = "v_tex" + std::to_string(i);
+    vs += "  " + out + " = " + tmp + ";\n";
+    if (tg.type == GX_TG_MTX2x4 || tg.type == GX_TG_MTX3x4) {
+      vs += "  if (" + out + ".z == 0.0) { " + out + ".xy = clamp(" + out + ".xy / 2.0, -1.0, 1.0); }\n";
+    }
   }
   vs += "}\n";
 
-  if (debug_colors()) {
-    fs = "#version 320 es\nprecision highp float;\nin vec4 v_color;\nuniform vec4 u_debug;\n"
-         "layout(location = 0) out vec4 o_color;\nvoid main() { o_color = u_debug; }\n";
-  } else {
-    fs = "#version 320 es\nprecision highp float;\nin vec4 v_color;\nlayout(location = 0) out vec4 o_color;\n"
-         "void main() { o_color = clamp(v_color, 0.0, 1.0); }\n";
+  // ---------------- fragment shader ----------------
+  fs = "#version 320 es\nprecision highp float;\nprecision highp int;\n"
+       "layout(std140) uniform U { uvec4 u[1024]; };\nin vec4 v_color0;\nin vec4 v_color1;\n";
+  for (u32 i = 0; i < 8; ++i) {
+    if ((cfg.sampledTexCoords >> i) & 1) fs += "in vec3 v_tex" + std::to_string(i) + ";\n";
   }
+  for (u32 i = 0; i < 8; ++i) fs += "uniform sampler2D tex" + std::to_string(i) + ";\n";
+  fs += "uniform vec4 u_debug;\nlayout(location = 0) out vec4 o_color;\n"
+        "vec4 uv4(uint w) { return uintBitsToFloat(u[w >> 2u]); }\n"
+        "void main() {\n  vec4 rast0 = v_color0;\n  vec4 rast1 = v_color1;\n";
+  for (u32 r = 0; r < 4; ++r) {
+    const std::string name = r == 0 ? "prev" : "r" + std::to_string(r - 1);
+    fs += "  vec4 " + name + " = " + (cfg.offTevReg[r] ? uvec(cfg.offTevReg[r]) : std::string("vec4(0.0)")) + ";\n";
+  }
+  for (u32 k = 0; k < 4; ++k) {
+    fs += "  vec4 k" + std::to_string(k) + " = " + (cfg.offKColor[k] ? uvec(cfg.offKColor[k]) : std::string("vec4(1.0)")) +
+          ";\n";
+  }
+  for (u32 i = 0; i < cfg.tevStageCount && i < 16; ++i) {
+    const auto& s = cfg.stages[i];
+    const std::string si = "s" + std::to_string(i);
+    if (s.texMap != 0xFF && s.texCoord < 8) {
+      const std::string tci = std::to_string(s.texCoord), tmi = std::to_string(s.texMap);
+      const std::string scale = cfg.offTexScale[s.texCoord] ? uvec(cfg.offTexScale[s.texCoord]) + ".xy" : "vec2(1.0)";
+      const std::string size = cfg.offTexSize[s.texMap] ? uvec(cfg.offTexSize[s.texMap]) : "vec4(1.0, 1.0, 0.0, 0.0)";
+      const auto& tg = cfg.texgens[s.texCoord];
+      const std::string uv = tg.type == GX_TG_MTX3x4
+                                 ? "(v_tex" + tci + ".xy / (v_tex" + tci + ".z == 0.0 ? 1.0 : v_tex" + tci + ".z))"
+                                 : "v_tex" + tci + ".xy";
+      fs += "  vec4 sz" + std::to_string(i) + " = " + size + ";\n";
+      fs += "  vec4 " + si + " = texture(tex" + tmi + ", " + uv + " * " + scale + " / sz" + std::to_string(i) +
+            ".xy, sz" + std::to_string(i) + ".z);\n";
+    } else {
+      fs += "  vec4 " + si + " = vec4(1.0);\n";
+    }
+    const std::string ca = tev_color_arg(cfg, s, i, s.ca), cb = tev_color_arg(cfg, s, i, s.cb),
+                      cc = tev_color_arg(cfg, s, i, s.cc), cd = tev_color_arg(cfg, s, i, s.cd);
+    const std::string aa = tev_alpha_arg(cfg, s, i, s.aa), ab = tev_alpha_arg(cfg, s, i, s.ab),
+                      ac = tev_alpha_arg(cfg, s, i, s.ac), ad = tev_alpha_arg(cfg, s, i, s.ad);
+    // Las dos operaciones leen los registros de antes de la etapa.
+    fs += "  {\n    vec3 c_out = " + tev_op(false, s.cop, s.cbias, s.cscale, s.cclamp, ca, cb, cc, cd) + ";\n";
+    fs += "    float a_out = " + tev_op(true, s.aop, s.abias, s.ascale, s.aclamp, aa, ab, ac, ad) + ";\n";
+    fs += std::string("    ") + tev_reg(s.cout) + ".rgb = c_out;\n    " + tev_reg(s.aout) + ".a = a_out;\n  }\n";
+  }
+  // Comparación de alfa.
+  if (cfg.alphaComp0 != GX_ALWAYS || cfg.alphaComp1 != GX_ALWAYS) {
+    const std::string t0 = "(" + alpha_test(cfg.alphaComp0, cfg.alphaRef0) + ")";
+    const std::string t1 = "(" + alpha_test(cfg.alphaComp1, cfg.alphaRef1) + ")";
+    std::string pass;
+    switch (cfg.alphaOp) {
+    case GX_AOP_OR: pass = t0 + " || " + t1; break;
+    case GX_AOP_XOR: pass = t0 + " != " + t1; break;
+    case GX_AOP_XNOR: pass = t0 + " == " + t1; break;
+    default: pass = t0 + " && " + t1; break;
+    }
+    fs += "  if (!(" + pass + ")) discard;\n";
+  }
+  fs += debug_colors() ? "  o_color = u_debug;\n}\n" : "  o_color = clamp(prev, 0.0, 1.0);\n}\n";
 }
 
 GLuint compile(GLenum type, const std::string& src, std::string& err) {
@@ -581,6 +858,10 @@ const Program& program_for(const PipelineDesc& cfg) {
       gl.Uniform1i(gl.GetUniformLocation(prog.id, "vbuf"), 0);
       gl.Uniform1i(gl.GetUniformLocation(prog.id, "abuf"), 1);
       prog.debugLoc = gl.GetUniformLocation(prog.id, "u_debug");
+      for (int i = 0; i < 8; ++i) {
+        const std::string name = "tex" + std::to_string(i);
+        gl.Uniform1i(gl.GetUniformLocation(prog.id, name.c_str()), 2 + i);  // unidades 2..9 (0 y 1: vbuf, abuf)
+      }
       const GLuint block = gl.GetUniformBlockIndex(prog.id, "U");
       if (block != kInvalidIndex) gl.UniformBlockBinding(prog.id, block, 0);
     }
@@ -590,6 +871,7 @@ const Program& program_for(const PipelineDesc& cfg) {
   if (!prog.ok && g_programErrors++ < 3) {
     log_line("motor: programa %016llx no compiló: %s", static_cast<unsigned long long>(key), err.c_str());
     log_line("motor: vertex shader:\n%s", vs.c_str());
+    log_line("motor: fragment shader:\n%s", fs.c_str());
   }
   return g_programs.emplace(key, prog).first->second;
 }
@@ -740,6 +1022,101 @@ bool upload_words(WordTexture& t, const std::vector<uint8_t>& bytes) {
   return true;
 }
 
+void process_textures() {
+  std::vector<TexUpload> pending;
+  std::vector<uint64_t> released;
+  {
+    auto& s = texs();
+    std::lock_guard lock(s.mutex);
+    pending.swap(s.pending);
+    released.swap(s.released);
+  }
+  for (uint64_t id : released) {
+    auto it = g_textures.find(id);
+    if (it != g_textures.end()) {
+      gl.DeleteTextures(1, &it->second.id);
+      g_textures.erase(it);
+    }
+  }
+  if (pending.empty()) return;
+  gl.ActiveTexture(kTexture0 + 2);
+  for (auto& up : pending) {
+    GlTexture& tex = g_textures[up.id];
+    if (tex.id == 0 || tex.width != up.width || tex.height != up.height || tex.mips != up.mips) {
+      if (tex.id != 0) gl.DeleteTextures(1, &tex.id);
+      gl.GenTextures(1, &tex.id);
+      gl.BindTexture(kTexture2D, tex.id);
+      gl.TexStorage2D(kTexture2D, static_cast<GLsizei>(up.mips), kRgba8, static_cast<GLsizei>(up.width),
+                      static_cast<GLsizei>(up.height));
+      tex.width = up.width;
+      tex.height = up.height;
+      tex.mips = up.mips;
+    } else {
+      gl.BindTexture(kTexture2D, tex.id);
+    }
+    size_t offset = 0;
+    for (uint32_t mip = 0; mip < up.mips; ++mip) {
+      const uint32_t w = std::max(up.width >> mip, 1u), h = std::max(up.height >> mip, 1u);
+      const size_t bytes = static_cast<size_t>(w) * h * 4;
+      if (offset + bytes > up.data.size()) break;
+      gl.TexSubImage2D(kTexture2D, static_cast<GLint>(mip), 0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h),
+                       kRgba, kUnsignedByte, up.data.data() + offset);
+      offset += bytes;
+    }
+    ++g_stats.texUploads;
+  }
+}
+
+GLuint sampler_for(const SamplerDesc& s) {
+  uint64_t key = 0;
+  std::memcpy(&key, &s, 8);
+  uint32_t lods[2];
+  std::memcpy(lods, &s.minLod, 8);
+  key ^= (static_cast<uint64_t>(lods[0]) * 0x9E3779B97F4A7C15ull) ^ (static_cast<uint64_t>(lods[1]) << 1);
+  auto it = g_samplers.find(key);
+  if (it != g_samplers.end()) return it->second;
+  GLuint id = 0;
+  gl.GenSamplers(1, &id);
+  auto wrap = [](uint8_t w) { return static_cast<GLint>(w == 1 ? kRepeat : w == 2 ? kMirroredRepeat : kClampToEdge); };
+  gl.SamplerParameteri(id, kTextureWrapS, wrap(s.wrapS));
+  gl.SamplerParameteri(id, kTextureWrapT, wrap(s.wrapT));
+  gl.SamplerParameteri(id, kTextureMagFilter, static_cast<GLint>(s.magFilter ? kLinear : kNearest));
+  GLenum minf;
+  if (s.mipFilter == 0) {
+    minf = s.minFilter ? kLinear : kNearest;
+  } else if (s.mipFilter == 1) {
+    minf = s.minFilter ? kLinearMipmapNearest : kNearestMipmapNearest;
+  } else {
+    minf = s.minFilter ? kLinearMipmapLinear : kNearestMipmapLinear;
+  }
+  gl.SamplerParameteri(id, kTextureMinFilter, static_cast<GLint>(minf));
+  gl.SamplerParameterf(id, kTextureMinLod, s.minLod);
+  gl.SamplerParameterf(id, kTextureMaxLod, s.mipFilter == 0 ? 0.f : s.maxLod);
+  g_samplers.emplace(key, id);
+  return id;
+}
+
+void bind_textures(uint64_t bindGroup) {
+  BindDesc bd;
+  const bool has = bindGroup != 0 && find_bind_group(bindGroup, bd);
+  for (int i = 0; i < 8; ++i) {
+    GLuint tex = g_whiteTexture;
+    GLuint samp = 0;
+    if (has && bd.tex[i] != 0) {
+      auto it = g_textures.find(bd.tex[i]);
+      if (it != g_textures.end()) {
+        tex = it->second.id;
+      } else {
+        ++g_stats.missingTextures;  // copia del EFB o paleta: todavía no
+      }
+      samp = sampler_for(bd.samp[i]);
+    }
+    gl.ActiveTexture(kTexture0 + 2 + static_cast<GLenum>(i));
+    gl.BindTexture(kTexture2D, tex);
+    gl.BindSampler(static_cast<GLuint>(2 + i), samp);
+  }
+}
+
 bool init_gl() {
   if (!load_gl()) return false;
   for (auto& r : g_ring) {
@@ -750,16 +1127,18 @@ bool init_gl() {
   gl.GetIntegerv(kUniformBufferOffsetAlignment, &g_uboAlign);
   if (g_uboAlign <= 0) g_uboAlign = 256;
   gl.PixelStorei(kUnpackAlignment, 4);
+  {
+    const uint32_t white = 0xFFFFFFFFu;
+    gl.GenTextures(1, &g_whiteTexture);
+    gl.ActiveTexture(kTexture0 + 2);
+    gl.BindTexture(kTexture2D, g_whiteTexture);
+    gl.TexStorage2D(kTexture2D, 1, kRgba8, 1, 1);
+    gl.TexSubImage2D(kTexture2D, 0, 0, 0, 1, 1, kRgba, kUnsignedByte, &white);
+  }
   log_line("motor: listo (alineación de UBO %d)", g_uboAlign);
   return true;
 }
 
-struct Stats {
-  uint64_t frames = 0, draws = 0, clears = 0, skippedLine = 0, skippedConfig = 0, skippedAlign = 0,
-           skippedProgram = 0, passes = 0;
-  uint64_t bytesVerts = 0, bytesUniforms = 0, bytesIndices = 0, bytesStorage = 0;
-  double cpuMs = 0;
-} g_stats;
 
 // Framebuffer del EFB (color RGBA8 + profundidad/estencil).
 struct Efb {
@@ -833,6 +1212,38 @@ bool has_clear(uint64_t ref) noexcept {
   return g_clears.contains(ref);
 }
 
+void register_bind_group(uint64_t ref, const BindDesc& desc) noexcept {
+  std::lock_guard lock(g_pipelineMutex);
+  g_bindGroups[ref] = desc;  // el mismo hash es el mismo contenido; se reemplaza por si cambió la textura
+}
+bool has_bind_group(uint64_t ref) noexcept {
+  std::lock_guard lock(g_pipelineMutex);
+  return g_bindGroups.contains(ref);
+}
+
+void texture_data(uint64_t id, uint32_t width, uint32_t height, uint32_t mips, const uint8_t* rgba,
+                  size_t size) noexcept {
+  if (width == 0 || height == 0 || mips == 0 || rgba == nullptr) return;
+  TexUpload up{id, width, height, mips, std::vector<uint8_t>(rgba, rgba + size)};
+  auto& s = texs();
+  std::lock_guard lock(s.mutex);
+  if (s.keep) s.kept[id] = up;
+  s.pending.push_back(std::move(up));
+}
+
+void texture_released(uint64_t id) noexcept {
+  auto& s = texs();
+  std::lock_guard lock(s.mutex);
+  s.released.push_back(id);
+  s.kept.erase(id);
+}
+
+void set_keep_textures(bool keep) noexcept {
+  auto& s = texs();
+  std::lock_guard lock(s.mutex);
+  s.keep = keep;
+}
+
 static std::chrono::steady_clock::time_point g_captureStart;
 static std::atomic<uint64_t> g_captureUs{0};
 
@@ -884,7 +1295,7 @@ void capture_scissor(const Rect& rect) noexcept {
 }
 
 void capture_draw(uint64_t pipeline, uint32_t idxOffset, uint32_t indexCount, uint32_t instanceCount,
-                  uint32_t uniformOffset, uint32_t dstAlpha) noexcept {
+                  uint32_t uniformOffset, uint32_t dstAlpha, uint64_t bindGroup) noexcept {
   if (!g_recordingActive) return;
   Item it{};
   it.op = Op::Draw;
@@ -894,6 +1305,7 @@ void capture_draw(uint64_t pipeline, uint32_t idxOffset, uint32_t indexCount, ui
   it.draw.instanceCount = instanceCount;
   it.draw.uniformOffset = uniformOffset;
   it.draw.dstAlpha = dstAlpha;
+  it.draw.bindGroup = bindGroup;
   g_recording.items.push_back(it);
 }
 
@@ -923,7 +1335,7 @@ void capture_discard() noexcept { g_recordingActive = false; }
 
 // --- Volcado ------------------------------------------------------------------------------------------------
 namespace {
-constexpr char kDumpMagic[8] = {'C', 'H', 'O', 'Y', 'A', 'G', 'X', '1'};
+constexpr char kDumpMagic[8] = {'C', 'H', 'O', 'Y', 'A', 'G', 'X', '2'};
 
 void write_blob(FILE* f, const std::vector<uint8_t>& v) {
   const uint64_t n = v.size();
@@ -977,6 +1389,38 @@ bool dump_last_frame(const char* path) noexcept {
     std::fwrite(&ref, sizeof(ref), 1, out);
     std::fwrite(&d, sizeof(d), 1, out);
   }
+  // Grupos de texturas y texturas que usa el cuadro.
+  std::vector<std::pair<uint64_t, BindDesc>> groups;
+  for (const Item& it : f.items) {
+    if (it.op != Op::Draw || it.draw.bindGroup == 0) continue;
+    auto g = g_bindGroups.find(it.draw.bindGroup);
+    if (g != g_bindGroups.end()) groups.emplace_back(g->first, g->second);
+  }
+  const uint64_t ng = groups.size();
+  std::fwrite(&ng, sizeof(ng), 1, out);
+  std::vector<uint64_t> texIds;
+  for (const auto& [ref, d] : groups) {
+    std::fwrite(&ref, sizeof(ref), 1, out);
+    std::fwrite(&d, sizeof(d), 1, out);
+    for (uint64_t id : d.tex) {
+      if (id != 0 && std::find(texIds.begin(), texIds.end(), id) == texIds.end()) texIds.push_back(id);
+    }
+  }
+  auto& s = texs();
+  std::lock_guard tlock(s.mutex);
+  std::vector<const TexUpload*> texs_out;
+  for (uint64_t id : texIds) {
+    auto k = s.kept.find(id);
+    if (k != s.kept.end()) texs_out.push_back(&k->second);
+  }
+  const uint64_t nt = texs_out.size();
+  std::fwrite(&nt, sizeof(nt), 1, out);
+  for (const TexUpload* up : texs_out) {
+    const uint32_t hdr[3] = {up->width, up->height, up->mips};
+    std::fwrite(&up->id, sizeof(up->id), 1, out);
+    std::fwrite(hdr, sizeof(hdr), 1, out);
+    write_blob(out, up->data);
+  }
   std::fclose(out);
   return true;
 }
@@ -1010,6 +1454,22 @@ bool load_frame(const char* path) noexcept {
     ClearDesc d;
     ok = std::fread(&ref, sizeof(ref), 1, in) == 1 && std::fread(&d, sizeof(d), 1, in) == 1;
     if (ok) register_clear(ref, d);
+  }
+  uint64_t ng = 0, nt = 0;
+  ok = ok && std::fread(&ng, sizeof(ng), 1, in) == 1;
+  for (uint64_t i = 0; ok && i < ng; ++i) {
+    uint64_t ref;
+    BindDesc d;
+    ok = std::fread(&ref, sizeof(ref), 1, in) == 1 && std::fread(&d, sizeof(d), 1, in) == 1;
+    if (ok) register_bind_group(ref, d);
+  }
+  ok = ok && std::fread(&nt, sizeof(nt), 1, in) == 1;
+  for (uint64_t i = 0; ok && i < nt; ++i) {
+    uint64_t id;
+    uint32_t hdr[3];
+    std::vector<uint8_t> data;
+    ok = std::fread(&id, sizeof(id), 1, in) == 1 && std::fread(hdr, sizeof(hdr), 1, in) == 1 && read_blob(in, data);
+    if (ok) texture_data(id, hdr[0], hdr[1], hdr[2], data.data(), data.size());
   }
   std::fclose(in);
   if (!ok) return false;
@@ -1058,6 +1518,8 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
   }
   if (!ensure_efb(efbW, efbH)) return false;
   gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+  process_textures();
+  uint64_t lastBindGroup = ~0ull;
   g_stats.bytesVerts += f.verts.size();
   g_stats.bytesUniforms += f.uniforms.size();
   g_stats.bytesIndices += f.indices.size();
@@ -1205,6 +1667,10 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
       }
       gl.UseProgram(prog.id);
       gl.BindBufferRange(kUniformBuffer, 0, ubo, static_cast<GLintptr>(it.draw.uniformOffset), 16384);
+      if (it.draw.bindGroup != lastBindGroup) {
+        bind_textures(it.draw.bindGroup);
+        lastBindGroup = it.draw.bindGroup;
+      }
       apply_state(pc, it.draw.dstAlpha);
       if (debug_colors()) {
         static const float kPalette[12][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 1, 0}, {1, 0, 1}, {0, 1, 1},
@@ -1238,6 +1704,9 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
              "por cuadro (copia %.2f ms)",
              g_stats.bytesVerts / 300.0 / 1024, g_stats.bytesUniforms / 300.0 / 1024, g_stats.bytesIndices / 300.0 / 1024,
              g_stats.bytesStorage / 300.0 / 1024, g_stats.cpuMs / 300.0, g_captureUs.exchange(0) / 300.0 / 1000.0);
+    log_line("motor: texturas: %zu en GL, %llu subidas, %llu enlaces sin textura (copias del EFB o paletas)",
+             g_textures.size(), static_cast<unsigned long long>(g_stats.texUploads),
+             static_cast<unsigned long long>(g_stats.missingTextures));
     log_line("motor: %llu cuadros, por cuadro: %.1f dibujos, %.1f borrados, %.1f pases; saltados: %llu sin config, "
          "%llu líneas/puntos, %llu alineación, %llu sin programa; programas %zu; error GL 0x%04X",
          static_cast<unsigned long long>(g_stats.frames), g_stats.draws / 300.0, g_stats.clears / 300.0,

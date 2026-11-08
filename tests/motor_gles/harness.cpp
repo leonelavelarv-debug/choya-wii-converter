@@ -51,6 +51,16 @@ static int pixel(int x, int y) {
 static gx::PipelineDesc base_desc() {
   gx::PipelineDesc d{};
   d.sampledChannels = 1; d.postexCount = 1;
+  d.offProj = 20; d.offPostex = 36; d.offChanMat[0] = 48; d.offChanMatA[0] = 48;
+  // Una etapa TEV que deja pasar el color del rasterizador (canal 0).
+  d.tevStageCount = 1;
+  auto& s = d.stages[0];
+  s.ca = s.cb = s.cc = GX_CC_ZERO; s.cd = GX_CC_RASC; s.cop = GX_TEV_ADD; s.cclamp = 1; s.cout = GX_TEVPREV;
+  s.aa = s.ab = s.ac = GX_CA_ZERO; s.ad = GX_CA_RASA; s.aop = GX_TEV_ADD; s.aclamp = 1; s.aout = GX_TEVPREV;
+  s.channel = GX_COLOR0A0; s.texCoord = 0xFF; s.texMap = 0xFF; s.kcSel = GX_TEV_KCSEL_1; s.kaSel = GX_TEV_KASEL_1;
+  for (int i = 0; i < 4; ++i) { d.swap[i][0] = 0; d.swap[i][1] = 1; d.swap[i][2] = 2; d.swap[i][3] = 3; }
+  d.alphaComp0 = d.alphaComp1 = GX_ALWAYS;
+  for (auto& tg : d.texgens) { tg.type = GX_TG_MTX2x4; tg.src = GX_MAX_TEXGENSRC; tg.mtxSlot = 0xFF; }
   d.depthFunc = GX_ALWAYS; d.cullMode = GX_CULL_NONE; d.blendMode = GX_BM_NONE; d.pixelFmt = GX_PF_RGB8_Z24;
   d.colorUpdate = 1; d.alphaUpdate = 1; d.depthUpdate = 1;
   for (auto& a : d.attrs) a.attrType = GX_NONE;
@@ -118,8 +128,8 @@ int main(int argc, char** argv) {
   gx::capture_pass(640, 480, true, true, blue, 0.f, true, gx::Rect{0, 0, 640, 480});
   gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
   gx::capture_scissor(gx::Rect{0, 0, 640, 480});
-  gx::capture_draw(1, 0, 3, 1, 0, UINT32_MAX);
-  gx::capture_draw(2, 6, 3, 1, 256, UINT32_MAX);
+  gx::capture_draw(1, 0, 3, 1, 0, UINT32_MAX, 0);
+  gx::capture_draw(2, 6, 3, 1, 256, UINT32_MAX, 0);
   // Un segundo pase (el EFB del cuadro siguiente) borra en negro: no debe verse, la pantalla es la copia.
   const float black[4] = {0, 0, 0, 1};
   gx::capture_pass(640, 480, true, true, black, 0.f, false, gx::Rect{0, 0, 0, 0});
@@ -150,11 +160,48 @@ int main(int argc, char** argv) {
   // viewport en la mitad superior del EFB (528 de alto): en pantalla debe quedar arriba.
   gx::capture_viewport(gx::Viewport{0, 0, 640, 264, 0, 1});
   gx::capture_scissor(gx::Rect{0, 0, 640, 528});
-  gx::capture_draw(3, 0, 3, 1, 0, UINT32_MAX);
+  gx::capture_draw(3, 0, 3, 1, 0, UINT32_MAX, 0);
   gx::capture_end();
   gx::draw_frame(640, 480);
   int top = pixel(320, 400), bottom = pixel(320, 100);
   ok = ok && top == 0xFFFF00 && bottom == 0x000000;
+
+  // Cuadro 3: textura 2x2 (rojo, verde / azul, blanco) en un cuadro a pantalla completa, TEV = TEXC.
+  gx::PipelineDesc p4 = base_desc();
+  p4.vtxStride = 20;
+  p4.attrs[GX_VA_POS] = {GX_DIRECT, 3, GX_F32, 0, 0, 0, 0, 0};
+  p4.attrs[GX_VA_TEX0] = {GX_DIRECT, 2, GX_F32, 12, 0, 0, 0, 0};
+  p4.sampledChannels = 0; p4.offChanMat[0] = 0; p4.offChanMatA[0] = 0;
+  p4.numTexGens = 1; p4.sampledTexCoords = 1;
+  p4.texgens[0] = {GX_TG_MTX2x4, GX_TG_TEX0, 0xFF, 0};
+  p4.stages[0].cd = GX_CC_TEXC; p4.stages[0].ad = GX_CA_TEXA; p4.stages[0].texCoord = 0; p4.stages[0].texMap = 0;
+  p4.offTexScale[0] = 48; p4.offTexSize[0] = 52;
+  gx::register_pipeline(4, p4);
+  const uint8_t texels[16] = {255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255};
+  gx::texture_data(77, 2, 2, 1, texels, sizeof(texels));
+  gx::BindDesc bd{};
+  bd.tex[0] = 77;
+  bd.samp[0] = {0, 0, 0, 0, 0, {0, 0, 0}, 0.f, 0.f};
+  gx::register_bind_group(99, bd);
+  std::vector<uint8_t> v4;
+  float q[4][5] = {{-1,1,.5f,0,0},{1,1,.5f,1,0},{-1,-1,.5f,0,1},{1,-1,.5f,1,1}};
+  for (auto& v : q) for (float f : v) put_be_f32(v4, f);
+  std::vector<uint8_t> u4(256, 0);
+  for (int r = 0; r < 4; ++r) put_f(u4, 20 + r * 4 + r, 1.f);
+  for (int r = 0; r < 3; ++r) put_f(u4, 36 + r * 4 + r, 1.f);
+  put_f(u4, 48, 1.f); put_f(u4, 49, 1.f);   // escala de coordenadas
+  put_f(u4, 52, 1.f); put_f(u4, 53, 1.f);   // tamaño de textura (normalizado)
+  std::vector<uint16_t> i4 = {0, 1, 2, 2, 1, 3};
+  gx::capture_begin(v4.data(), v4.size(), u4.data(), u4.size(), (const uint8_t*)i4.data(), 12, nullptr, 0);
+  gx::capture_pass(640, 480, true, true, black, 0.f, false, gx::Rect{0, 0, 0, 0});
+  gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+  gx::capture_scissor(gx::Rect{0, 0, 640, 480});
+  gx::capture_draw(4, 0, 6, 1, 0, UINT32_MAX, 99);
+  gx::capture_end();
+  gx::draw_frame(640, 480);
+  // Arriba a la izquierda (v=0) rojo, arriba a la derecha verde, abajo azul y blanco (GL lee desde abajo).
+  int tl = pixel(100, 400), tr = pixel(540, 400), bl = pixel(100, 80), br = pixel(540, 80);
+  ok = ok && tl == 0xFF0000 && tr == 0x00FF00 && bl == 0x0000FF && br == 0xFFFFFF;
   std::puts(ok ? "PRUEBA OK" : "PRUEBA FALLÓ");
   return ok ? 0 : 1;
 }

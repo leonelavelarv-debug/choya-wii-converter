@@ -3,9 +3,11 @@
 
 #include "choya_gx_core.hpp"
 
+#include "../gfx/texture.hpp"
 #include "../gx/gx.hpp"
 #include "../gx/shader_info.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -42,6 +44,109 @@ core::PipelineDesc describe(const gx::PipelineConfig& c) {
   d.nrmCount = info.matrixLayout.nrmCount;
   d.tevRegLoads = static_cast<uint8_t>((info.loadsTevRegRgb | info.loadsTevRegAlpha).count());
   d.lightingEnabled = info.lightingEnabled ? 1 : 0;
+  d.numTexGens = s.numTexGens;
+  d.sampledTexCoords = static_cast<uint8_t>(info.sampledTexCoords.to_ulong());
+
+  // TEV.
+  d.tevStageCount = static_cast<uint8_t>(std::min<u32>(s.tevStageCount, 16));
+  for (u32 i = 0; i < d.tevStageCount; ++i) {
+    const auto& st = s.tevStages[i];
+    auto& o = d.stages[i];
+    o.ca = st.colorPass.a; o.cb = st.colorPass.b; o.cc = st.colorPass.c; o.cd = st.colorPass.d;
+    o.cop = st.colorOp.op; o.cbias = st.colorOp.bias; o.cscale = st.colorOp.scale;
+    o.cclamp = st.colorOp.clamp ? 1 : 0; o.cout = st.colorOp.outReg;
+    o.aa = st.alphaPass.a; o.ab = st.alphaPass.b; o.ac = st.alphaPass.c; o.ad = st.alphaPass.d;
+    o.aop = st.alphaOp.op; o.abias = st.alphaOp.bias; o.ascale = st.alphaOp.scale;
+    o.aclamp = st.alphaOp.clamp ? 1 : 0; o.aout = st.alphaOp.outReg;
+    o.kcSel = st.kcSel; o.kaSel = st.kaSel;
+    o.channel = static_cast<uint8_t>(st.channelId);
+    o.swapRas = st.tevSwapRas; o.swapTex = st.tevSwapTex;
+    o.texCoord = 0xFF;
+    o.texMap = 0xFF;
+    const auto dep = gx::tev_stage_texture_dependency(s, i);
+    if (dep.canSampleTexture && dep.texMapId < 8 && dep.texCoordId < 8 && info.sampledTextures.test(dep.texMapId)) {
+      o.texCoord = static_cast<uint8_t>(dep.texCoordId);
+      o.texMap = static_cast<uint8_t>(dep.texMapId);
+    }
+  }
+  for (size_t i = 0; i < 4; ++i) {
+    const auto& sw = s.tevSwapTable[i];
+    d.swap[i][0] = sw.red; d.swap[i][1] = sw.green; d.swap[i][2] = sw.blue; d.swap[i][3] = sw.alpha;
+  }
+  d.alphaComp0 = s.alphaCompare.comp0;
+  d.alphaRef0 = static_cast<uint8_t>(s.alphaCompare.ref0);
+  d.alphaOp = s.alphaCompare.op;
+  d.alphaComp1 = s.alphaCompare.comp1;
+  d.alphaRef1 = static_cast<uint8_t>(s.alphaCompare.ref1);
+  for (u32 i = 0; i < 8; ++i) {
+    const auto& tcg = s.tcgs[i];
+    auto& tg = d.texgens[i];
+    tg.type = tcg.type;
+    tg.src = tcg.src;
+    tg.mtxSlot = 0xFF;
+    if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
+      tg.mtxSlot = 0xFE;
+    } else if (tcg.mtx != GX_IDENTITY) {
+      const u32 slot = static_cast<u32>(tcg.mtx) / 3;
+      const u32 idx = slot < gx::MaxPostexMtx ? info.matrixLayout.postexRemap[slot] : slot;
+      if (idx < gx::MaxPostexMtx) tg.mtxSlot = static_cast<uint8_t>(idx);
+    }
+  }
+
+  // Desplazamientos de los uniformes, en el mismo orden y tamaños que gx::build_uniform.
+  const auto& gs = gx::g_gxState;
+  size_t b = 32 + 4 * gx::MaxIndexAttr;  // vtx_start, pnmtx, 4 flotantes, relleno, array_start[]
+  auto word = [&]() { return static_cast<uint16_t>(b / 4); };
+  if (s.lineMode != 0) b += 16;
+  d.offProj = word();
+  b += sizeof(Mat4x4<float>);
+  d.offPostex = word();
+  b += sizeof(Mat3x4<float>) * (info.matrixLayout.postexCount + info.matrixLayout.nrmCount);
+  const auto loads = info.loadsTevRegRgb | info.loadsTevRegAlpha;
+  for (size_t i = 0; i < 4; ++i) {
+    if (loads.test(i)) {
+      d.offTevReg[i] = word();
+      b += sizeof(gs.colorRegs[0]);
+    }
+  }
+  if (info.lightingEnabled) b += sizeof(gs.preparedLights) + 4 * sizeof(u32);
+  for (size_t i = 0; i < 2; ++i) {
+    if (!info.sampledColorChannels.test(i)) continue;
+    const auto& cc = gs.colorChannelConfig[i];
+    const auto& cca = gs.colorChannelConfig[i + GX_ALPHA0];
+    if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) b += sizeof(gs.colorChannelState[0].ambColor);
+    if (cc.matSrc == GX_SRC_REG) {
+      d.offChanMat[i] = word();
+      b += sizeof(gs.colorChannelState[0].matColor);
+    }
+    if (cca.lightingEnabled && cca.ambSrc == GX_SRC_REG) b += sizeof(gs.colorChannelState[0].ambColor);
+    if (cca.matSrc == GX_SRC_REG) {
+      d.offChanMatA[i] = word();
+      b += sizeof(gs.colorChannelState[0].matColor);
+    }
+  }
+  for (size_t i = 0; i < 4; ++i) {
+    if (info.sampledKColors.test(i)) {
+      d.offKColor[i] = word();
+      b += sizeof(gs.kcolors[0]);
+    }
+  }
+  if (info.usesPTTexMtx.any()) b += sizeof(gs.ptTexMtxs);
+  if (info.usesFog) b += sizeof(gx::Fog);
+  if (info.usedIndTexMtxs.any()) b += gx::MaxIndTexMtxs * 2 * sizeof(Vec4<s32>);
+  for (size_t i = 0; i < 8; ++i) {
+    if (info.sampledTexCoords.test(i)) {
+      d.offTexScale[i] = word();
+      b += sizeof(Vec4<float>);
+    }
+  }
+  for (size_t i = 0; i < 8; ++i) {
+    if (info.sampledTextures.test(i)) {
+      d.offTexSize[i] = word();
+      b += sizeof(Vec4<float>);
+    }
+  }
+
   d.depthCompare = c.depthCompare;
   d.depthUpdate = c.depthUpdate;
   d.colorUpdate = c.colorUpdate;
@@ -54,6 +159,10 @@ core::PipelineDesc describe(const gx::PipelineConfig& c) {
   d.blendOp = static_cast<uint8_t>(c.blendOp);
   d.pixelFmt = static_cast<uint8_t>(c.pixelFmt);
   return d;
+}
+
+uint8_t wrap_mode(wgpu::AddressMode m) {
+  return m == wgpu::AddressMode::Repeat ? 1 : m == wgpu::AddressMode::MirrorRepeat ? 2 : 0;
 }
 
 // CHOYA_GX_VOLCADO="600,1800": vuelca esos cuadros a cuadro-<n>.bin para revisarlos en la PC.
@@ -89,9 +198,44 @@ bool enabled() noexcept {
     if (v == nullptr || std::strcmp(v, "1") != 0) return false;
     core::set_reversed_z(gx::UseReversedZ);
     core::set_logger(log_to_runtime);
+    // Los volcados llevan las texturas: hay que guardarlas desde que se crean.
+    const char* dumps = std::getenv("CHOYA_GX_VOLCADO");
+    core::set_keep_textures(dumps != nullptr && *dumps != '\0');
     return true;
   }();
   return on;
+}
+
+void texture_uploaded(const gfx::TextureRef& ref, const uint8_t* data, size_t size) noexcept {
+  if (!enabled() || ref.format != wgpu::TextureFormat::RGBA8Unorm) return;  // índices de paleta: todavía no
+  core::texture_data(reinterpret_cast<uintptr_t>(&ref), ref.size.width, ref.size.height, ref.mipCount, data, size);
+}
+
+void texture_released(const void* ref) noexcept {
+  if (!enabled()) return;
+  core::texture_released(reinterpret_cast<uintptr_t>(ref));
+}
+
+void register_texture_bind_group(gfx::BindGroupRef ref, const gx::ShaderInfo& info) noexcept {
+  if (!enabled()) return;
+  core::BindDesc d{};
+  for (u32 i = 0; i < gx::MaxTextures && i < 8; ++i) {
+    const auto& tex = gx::g_gxState.textures[i];
+    if (!tex || !(info.sampledTextures[i] || info.sampledIndTextures[i])) continue;
+    d.tex[i] = reinterpret_cast<uintptr_t>(tex.ref.get());
+    const auto sd = tex.get_descriptor();
+    auto& o = d.samp[i];
+    o.wrapS = wrap_mode(sd.addressModeU);
+    o.wrapT = wrap_mode(sd.addressModeV);
+    o.minFilter = sd.minFilter == wgpu::FilterMode::Linear ? 1 : 0;
+    o.magFilter = sd.magFilter == wgpu::FilterMode::Linear ? 1 : 0;
+    o.mipFilter = sd.mipmapFilter == wgpu::MipmapFilterMode::Linear    ? 2
+                  : sd.mipmapFilter == wgpu::MipmapFilterMode::Nearest ? 1
+                                                                       : 0;
+    o.minLod = sd.lodMinClamp;
+    o.maxLod = sd.lodMaxClamp;
+  }
+  core::register_bind_group(ref, d);
 }
 
 void register_gx_pipeline(gfx::PipelineRef ref, const gx::PipelineConfig& config) noexcept {
@@ -129,7 +273,7 @@ void capture_scissor(const gfx::ClipRect& rect) noexcept {
 
 void capture_gx_draw(const gx::DrawData& draw) noexcept {
   core::capture_draw(draw.pipeline, draw.idxRange.offset, draw.indexCount, draw.instanceCount,
-                     draw.uniformRange.offset, draw.dstAlpha);
+                     draw.uniformRange.offset, draw.dstAlpha, draw.bindGroups.textureBindGroup);
 }
 
 void capture_clear(const gfx::clear::DrawData& draw) noexcept {
@@ -173,3 +317,6 @@ extern "C" bool choya_gx_draw_frame(int screenWidth, int screenHeight) {
   }
   return drawn;
 }
+
+// Aviso de liberación de texturas (declarado en gfx/texture.hpp por el parche de Choya).
+aurora::gfx::TextureRef::~TextureRef() { aurora::choya::texture_released(this); }

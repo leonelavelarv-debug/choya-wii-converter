@@ -14,9 +14,19 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace aurora::gfx {
+struct TextureRef;
+}
+
 namespace aurora::choya {
 
 bool enabled() noexcept;
+
+// Texturas: datos ya decodificados (RGBA8) al crearse o escribirse, y aviso cuando se liberan.
+void texture_uploaded(const gfx::TextureRef& ref, const uint8_t* data, size_t size) noexcept;
+void texture_released(const void* ref) noexcept;
+// Grupo de texturas recién creado por gx (ranuras que muestrea el shader y su muestreo).
+void register_texture_bind_group(gfx::BindGroupRef ref, const gx::ShaderInfo& info) noexcept;
 
 void register_gx_pipeline(gfx::PipelineRef ref, const gx::PipelineConfig& config) noexcept;
 void register_clear_pipeline(gfx::PipelineRef ref, const gfx::clear::PipelineConfig& config) noexcept;

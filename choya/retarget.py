@@ -958,6 +958,31 @@ AURORA_EDITS = [
   }
 """,
      "motor de Choya (copia del cuadro)"),
+    # Paso 2b-1: texturas. Los datos ya decodificados (RGBA8) van al motor al crearse o escribirse, el motor sabe
+    # cuándo se liberan, y gx avisa qué texturas y muestreo tiene cada grupo de texturas.
+    ("lib/gfx/texture.hpp", "  , gxFormat(gxFormat) {}\n};\n",
+     "  , gxFormat(gxFormat) {}\n  ~TextureRef();  // choya: avisa al motor de Choya (lib/choya/choya_gx.cpp)\n};\n",
+     "motor de Choya (texturas liberadas)"),
+    ("lib/gfx/texture.cpp", '#include "texture_convert.hpp"\n',
+     '#include "texture_convert.hpp"\n#include "../choya/choya_gx.hpp"  // choya: motor GLES de Choya\n',
+     "motor de Choya (cabecera en texturas)"),
+    ("lib/gfx/texture.cpp",
+     "      ref.hasArbitraryMips = converted.hasArbitraryMips;\n    }\n  }\n\n  uint32_t offset = 0;\n",
+     "      ref.hasArbitraryMips = converted.hasArbitraryMips;\n    }\n  }\n"
+     "  choya::texture_uploaded(ref, data.data(), data.size());  // choya\n\n  uint32_t offset = 0;\n",
+     "motor de Choya (texturas nuevas)"),
+    ("lib/gfx/texture.cpp",
+     "    if (!converted.data.empty()) {\n      data = converted.data;\n    }\n  }\n\n  uint32_t offset = 0;\n",
+     "    if (!converted.data.empty()) {\n      data = converted.data;\n    }\n  }\n"
+     "  choya::texture_uploaded(ref, data.data(), data.size());  // choya\n\n  uint32_t offset = 0;\n",
+     "motor de Choya (texturas reescritas)"),
+    ("lib/gx/gx.cpp", '#include "pipeline.hpp"\n',
+     '#include "pipeline.hpp"\n#include "../choya/choya_gx.hpp"  // choya: motor GLES de Choya\n',
+     "motor de Choya (cabecera en gx)"),
+    ("lib/gx/gx.cpp", "  const auto ref = gfx::bind_group_ref(textureBindGroupDescriptor);\n",
+     "  const auto ref = gfx::bind_group_ref(textureBindGroupDescriptor);\n"
+     "  choya::register_texture_bind_group(ref, info);  // choya\n",
+     "motor de Choya (grupos de texturas)"),
 ]
 
 # Archivos del motor de Choya que se copian dentro de aurora (siempre se reemplazan: son de Choya).
