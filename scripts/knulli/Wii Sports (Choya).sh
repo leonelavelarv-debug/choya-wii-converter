@@ -31,6 +31,8 @@ export WIICOMPILED_NO_POPUP=1
 export CHOYA_PERFIL=20,35
 # Motor de Choya, paso 1: pantalla GLES propia sobre el framebuffer de la Mali (anota choya-gles.txt).
 export CHOYA_GLES=1
+# Diagnóstico del paso 2a: cada dibujo de un color distinto (0 = colores reales del rasterizador).
+export CHOYA_GX_COLORES=1
 rm -f "$DIR/choya-gles.txt"
 rm -f "$DIR/perfil.txt"
 

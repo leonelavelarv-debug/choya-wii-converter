@@ -62,6 +62,7 @@ int main() {
     verts.push_back(255); verts.push_back(0); verts.push_back(0); verts.push_back(255); }
   const uint32_t vtx2 = static_cast<uint32_t>(verts.size());
   verts.push_back(2); verts.push_back(0); verts.push_back(1);  // índices u8 al arreglo
+  verts.resize(20000, 0);  // más de una fila de la textura (16 KiB): prueba la subida por filas completas
   std::vector<uint8_t> storage;
   float tri2[3][3] = {{0.5f,0.5f,0.5f},{0.1f,-0.5f,0.5f},{0.9f,-0.5f,0.5f}};
   for (auto& v : tri2) { put_le_f32(storage, v[0]); put_le_f32(storage, v[1]); put_le_f32(storage, v[2]); }

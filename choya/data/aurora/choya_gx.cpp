@@ -16,6 +16,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -82,6 +83,7 @@ struct Gl {
   void (*UseProgram)(GLuint);
   GLint (*GetUniformLocation)(GLuint, const GLchar*);
   void (*Uniform1i)(GLint, GLint);
+  void (*Uniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
   GLuint (*GetUniformBlockIndex)(GLuint, const GLchar*);
   void (*UniformBlockBinding)(GLuint, GLuint, GLuint);
   void (*GenBuffers)(GLsizei, GLuint*);
@@ -145,6 +147,7 @@ bool load_gl() {
   CHOYA_GL(UseProgram);
   CHOYA_GL(GetUniformLocation);
   CHOYA_GL(Uniform1i);
+  CHOYA_GL(Uniform4f);
   CHOYA_GL(GetUniformBlockIndex);
   CHOYA_GL(UniformBlockBinding);
   CHOYA_GL(GenBuffers);
@@ -348,8 +351,17 @@ std::string color_attr(const gx::ShaderConfig& cfg, GXAttr attr) {
 
 struct Program {
   GLuint id = 0;
+  GLint debugLoc = -1;
   bool ok = false;
 };
+
+bool debug_colors() {
+  static const bool on = [] {
+    const char* v = std::getenv("CHOYA_GX_COLORES");
+    return v != nullptr && std::strcmp(v, "1") == 0;
+  }();
+  return on;
+}
 
 // Desplazamientos (en palabras de 32 bits) de los uniformes que usa el paso 2a, siguiendo build_uniform.
 struct UniformLayout {
@@ -440,8 +452,13 @@ void build_sources(const gx::ShaderConfig& cfg, std::string& vs, std::string& fs
   }
   vs += "}\n";
 
-  fs = "#version 320 es\nprecision highp float;\nin vec4 v_color;\nlayout(location = 0) out vec4 o_color;\n"
-       "void main() { o_color = clamp(v_color, 0.0, 1.0); }\n";
+  if (debug_colors()) {
+    fs = "#version 320 es\nprecision highp float;\nin vec4 v_color;\nuniform vec4 u_debug;\n"
+         "layout(location = 0) out vec4 o_color;\nvoid main() { o_color = u_debug; }\n";
+  } else {
+    fs = "#version 320 es\nprecision highp float;\nin vec4 v_color;\nlayout(location = 0) out vec4 o_color;\n"
+         "void main() { o_color = clamp(v_color, 0.0, 1.0); }\n";
+  }
 }
 
 GLuint compile(GLenum type, const std::string& src, std::string& err) {
@@ -491,6 +508,7 @@ const Program& program_for(const gx::ShaderConfig& cfg) {
       gl.UseProgram(prog.id);
       gl.Uniform1i(gl.GetUniformLocation(prog.id, "vbuf"), 0);
       gl.Uniform1i(gl.GetUniformLocation(prog.id, "abuf"), 1);
+      prog.debugLoc = gl.GetUniformLocation(prog.id, "u_debug");
       const GLuint block = gl.GetUniformBlockIndex(prog.id, "U");
       if (block != kInvalidIndex) gl.UniformBlockBinding(prog.id, block, 0);
     }
@@ -602,16 +620,22 @@ void apply_state(const gx::PipelineConfig& c, uint32_t dstAlpha) {
 
 // --- Recursos -------------------------------------------------------------------------------------------------
 constexpr int kTexWidth = 4096;
+constexpr int kRing = 3;  // recursos por cuadro en anillo: la Mali no espera a que la GPU suelte el cuadro anterior
 struct WordTexture {
   GLuint id = 0;
   int rows = 0;
 };
-WordTexture g_vtex, g_atex;
-GLuint g_ubo = 0, g_ebo = 0, g_vao = 0;
-size_t g_uboSize = 0, g_eboSize = 0;
+struct FrameResources {
+  WordTexture vtex, atex;
+  GLuint ubo = 0, ebo = 0;
+  size_t uboSize = 0, eboSize = 0;
+};
+FrameResources g_ring[kRing];
+int g_ringIndex = 0;
+GLuint g_vao = 0;
 GLint g_uboAlign = 16;
 bool g_glReady = false, g_glFailed = false;
-std::vector<uint8_t> g_padded;
+std::vector<uint8_t> g_tail;
 
 bool upload_words(WordTexture& t, const std::vector<uint8_t>& bytes) {
   const size_t words = (bytes.size() + 3) / 4;
@@ -623,23 +647,35 @@ bool upload_words(WordTexture& t, const std::vector<uint8_t>& bytes) {
     if (t.id != 0) gl.DeleteTextures(1, &t.id);
     gl.GenTextures(1, &t.id);
     gl.BindTexture(kTexture2D, t.id);
-    const int alloc = std::max(rows * 2, 64);
-    gl.TexStorage2D(kTexture2D, 1, kR32ui, kTexWidth, std::min(alloc, 8192));
+    const int alloc = std::min(std::max(rows * 2, 64), 8192);
+    gl.TexStorage2D(kTexture2D, 1, kR32ui, kTexWidth, alloc);
     gl.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
     gl.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
-    t.rows = std::min(alloc, 8192);
+    t.rows = alloc;
   }
-  g_padded.assign(static_cast<size_t>(rows) * kTexWidth * 4, 0);
-  std::memcpy(g_padded.data(), bytes.data(), bytes.size());
   gl.BindTexture(kTexture2D, t.id);
-  gl.TexSubImage2D(kTexture2D, 0, 0, 0, kTexWidth, rows, kRedInteger, kUnsignedInt, g_padded.data());
+  // Filas completas directo de los datos; la última fila (incompleta) desde un búfer pequeño.
+  const size_t rowBytes = static_cast<size_t>(kTexWidth) * 4;
+  const int fullRows = static_cast<int>(bytes.size() / rowBytes);
+  if (fullRows > 0) {
+    gl.TexSubImage2D(kTexture2D, 0, 0, 0, kTexWidth, fullRows, kRedInteger, kUnsignedInt, bytes.data());
+  }
+  const size_t rest = bytes.size() - static_cast<size_t>(fullRows) * rowBytes;
+  if (rest > 0) {
+    const int restWords = static_cast<int>((rest + 3) / 4);
+    g_tail.assign(static_cast<size_t>(restWords) * 4, 0);
+    std::memcpy(g_tail.data(), bytes.data() + static_cast<size_t>(fullRows) * rowBytes, rest);
+    gl.TexSubImage2D(kTexture2D, 0, 0, fullRows, restWords, 1, kRedInteger, kUnsignedInt, g_tail.data());
+  }
   return true;
 }
 
 bool init_gl() {
   if (!load_gl()) return false;
-  gl.GenBuffers(1, &g_ubo);
-  gl.GenBuffers(1, &g_ebo);
+  for (auto& r : g_ring) {
+    gl.GenBuffers(1, &r.ubo);
+    gl.GenBuffers(1, &r.ebo);
+  }
   gl.GenVertexArrays(1, &g_vao);
   gl.GetIntegerv(kUniformBufferOffsetAlignment, &g_uboAlign);
   if (g_uboAlign <= 0) g_uboAlign = 256;
@@ -651,6 +687,8 @@ bool init_gl() {
 struct Stats {
   uint64_t frames = 0, draws = 0, clears = 0, skippedLine = 0, skippedConfig = 0, skippedAlign = 0,
            skippedProgram = 0, passes = 0;
+  uint64_t bytesVerts = 0, bytesUniforms = 0, bytesIndices = 0, bytesStorage = 0;
+  double cpuMs = 0, captureMs = 0;
 } g_stats;
 
 } // namespace
@@ -675,9 +713,12 @@ void register_clear_pipeline(gfx::PipelineRef ref, const gfx::clear::PipelineCon
   g_clearConfigs.try_emplace(ref, config);
 }
 
+static std::chrono::steady_clock::time_point g_captureStart;
+
 void capture_begin(const uint8_t* verts, size_t vertsSize, const uint8_t* uniforms, size_t uniformsSize,
                    const uint8_t* indices, size_t indicesSize, const uint8_t* storage, size_t storageSize) noexcept {
   if (!enabled()) return;
+  g_captureStart = std::chrono::steady_clock::now();
   copy_bytes(g_recording.verts, verts, vertsSize);
   copy_bytes(g_recording.uniforms, uniforms, uniformsSize);
   // Relleno: cada dibujo enlaza 16 KiB de uniformes a partir de su desplazamiento.
@@ -749,6 +790,8 @@ void capture_clear(const gfx::clear::DrawData& draw) noexcept {
 void capture_end() noexcept {
   if (!g_recordingActive) return;
   g_recordingActive = false;
+  g_stats.captureMs +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_captureStart).count();
   std::lock_guard lock(g_frameMutex);
   std::swap(g_ready, g_recording);
   g_ready.ready = true;
@@ -776,30 +819,43 @@ bool draw_frame_impl(int screenWidth, int screenHeight) {
   if (!f.ready) return false;
   f.ready = false;
 
-  // Subir los datos del cuadro.
-  if (!upload_words(g_vtex, f.verts) || !upload_words(g_atex, f.storage)) {
-    log_line("motor: cuadro demasiado grande para las texturas de vértices");
+  const auto cpuStart = std::chrono::steady_clock::now();
+  g_stats.bytesVerts += f.verts.size();
+  g_stats.bytesUniforms += f.uniforms.size();
+  g_stats.bytesIndices += f.indices.size();
+  g_stats.bytesStorage += f.storage.size();
+
+  // Subir los datos del cuadro a los recursos que tocan en el anillo.
+  FrameResources& res = g_ring[g_ringIndex];
+  g_ringIndex = (g_ringIndex + 1) % kRing;
+  gl.ActiveTexture(kTexture0);
+  if (!upload_words(res.vtex, f.verts)) {
+    log_line("motor: cuadro demasiado grande para la textura de vértices");
     return false;
   }
-  gl.BindBuffer(kUniformBuffer, g_ubo);
-  if (f.uniforms.size() > g_uboSize) {
-    g_uboSize = f.uniforms.size() * 2;
-    gl.BufferData(kUniformBuffer, static_cast<GLsizeiptr>(g_uboSize), nullptr, kStreamDraw);
+  gl.ActiveTexture(kTexture0 + 1);
+  if (!upload_words(res.atex, f.storage)) {
+    log_line("motor: cuadro demasiado grande para la textura de arreglos");
+    return false;
   }
+  // Uniformes y elementos: se "huérfana" el búfer completo (BufferData nuevo) para no esperar a la GPU.
+  gl.BindBuffer(kUniformBuffer, res.ubo);
+  res.uboSize = std::max(res.uboSize, f.uniforms.size());
+  gl.BufferData(kUniformBuffer, static_cast<GLsizeiptr>(res.uboSize), nullptr, kStreamDraw);
   gl.BufferSubData(kUniformBuffer, 0, static_cast<GLsizeiptr>(f.uniforms.size()), f.uniforms.data());
   gl.BindVertexArray(g_vao);
-  gl.BindBuffer(kElementArrayBuffer, g_ebo);
-  if (f.indices.size() > g_eboSize) {
-    g_eboSize = std::max<size_t>(f.indices.size() * 2, 4096);
-    gl.BufferData(kElementArrayBuffer, static_cast<GLsizeiptr>(g_eboSize), nullptr, kStreamDraw);
-  }
+  gl.BindBuffer(kElementArrayBuffer, res.ebo);
   if (!f.indices.empty()) {
+    res.eboSize = std::max(res.eboSize, f.indices.size());
+    gl.BufferData(kElementArrayBuffer, static_cast<GLsizeiptr>(res.eboSize), nullptr, kStreamDraw);
     gl.BufferSubData(kElementArrayBuffer, 0, static_cast<GLsizeiptr>(f.indices.size()), f.indices.data());
   }
   gl.ActiveTexture(kTexture0);
-  gl.BindTexture(kTexture2D, g_vtex.id);
+  gl.BindTexture(kTexture2D, res.vtex.id);
   gl.ActiveTexture(kTexture0 + 1);
-  gl.BindTexture(kTexture2D, g_atex.id);
+  gl.BindTexture(kTexture2D, res.atex.id);
+  const GLuint ubo = res.ubo;
+  uint32_t drawIndex = 0;
 
   // Pase actual: escala de su tamaño al de la pantalla (y hacia arriba en GL).
   float sx = 1.f, sy = 1.f;
@@ -897,8 +953,18 @@ bool draw_frame_impl(int screenWidth, int screenHeight) {
         break;
       }
       gl.UseProgram(prog.id);
-      gl.BindBufferRange(kUniformBuffer, 0, g_ubo, static_cast<GLintptr>(it.draw.uniformOffset), 16384);
+      gl.BindBufferRange(kUniformBuffer, 0, ubo, static_cast<GLintptr>(it.draw.uniformOffset), 16384);
       apply_state(pc, it.draw.dstAlpha);
+      if (debug_colors()) {
+        static const float kPalette[12][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 1, 0}, {1, 0, 1}, {0, 1, 1},
+                                              {1, .5f, 0}, {.5f, 0, 1}, {0, .6f, .3f}, {.6f, .3f, 0}, {.3f, .3f, .3f},
+                                              {1, 1, 1}};
+        const float* c = kPalette[drawIndex % 12];
+        gl.Uniform4f(prog.debugLoc, c[0], c[1], c[2], 1.f);
+        gl.Disable(kBlend);
+        gl.ColorMask(1, 1, 1, 1);
+      }
+      ++drawIndex;
       gl.DrawElements(kTriangles, static_cast<GLsizei>(it.draw.indexCount), kUnsignedShort,
                       reinterpret_cast<const void*>(static_cast<uintptr_t>(it.draw.idxOffset)));
       ++g_stats.draws;
@@ -910,7 +976,12 @@ bool draw_frame_impl(int screenWidth, int screenHeight) {
   gl.ColorMask(1, 1, 1, 1);
   gl.DepthMask(1);
 
+  g_stats.cpuMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count();
   if (++g_stats.frames % 300 == 0) {
+    log_line("motor: KB por cuadro: vértices %.0f, uniformes %.0f, índices %.0f, arreglos %.0f; CPU del motor %.2f ms "
+             "por cuadro (copia %.2f ms)",
+             g_stats.bytesVerts / 300.0 / 1024, g_stats.bytesUniforms / 300.0 / 1024, g_stats.bytesIndices / 300.0 / 1024,
+             g_stats.bytesStorage / 300.0 / 1024, g_stats.cpuMs / 300.0, g_stats.captureMs / 300.0);
     log_line("motor: %llu cuadros, por cuadro: %.1f dibujos, %.1f borrados, %.1f pases; saltados: %llu sin config, "
          "%llu líneas/puntos, %llu alineación, %llu sin programa; programas %zu; error GL 0x%04X",
          static_cast<unsigned long long>(g_stats.frames), g_stats.draws / 300.0, g_stats.clears / 300.0,
