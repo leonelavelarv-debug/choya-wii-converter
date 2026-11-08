@@ -113,8 +113,10 @@ void capture_begin(const uint8_t* verts, size_t vertsSize, const uint8_t* unifor
 }
 
 void capture_pass(uint32_t width, uint32_t height, bool clearColor, bool clearDepth, const float clearRgba[4],
-                  float clearDepthValue, bool isDisplayCopy) noexcept {
-  core::capture_pass(width, height, clearColor, clearDepth, clearRgba, clearDepthValue, isDisplayCopy);
+                  float clearDepthValue, bool isDisplayCopy, const gfx::ClipRect& copyRect) noexcept {
+  const core::Rect rect = isDisplayCopy ? core::Rect{copyRect.x, copyRect.y, copyRect.width, copyRect.height}
+                                        : core::Rect{0, 0, 0, 0};
+  core::capture_pass(width, height, clearColor, clearDepth, clearRgba, clearDepthValue, isDisplayCopy, rect);
 }
 
 void capture_viewport(const gfx::Viewport& vp) noexcept {

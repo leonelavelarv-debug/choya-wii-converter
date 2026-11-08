@@ -54,8 +54,9 @@ bool has_clear(uint64_t ref) noexcept;
 // Captura de un cuadro, en orden: capture_begin, pases con sus comandos, capture_end.
 void capture_begin(const uint8_t* verts, size_t vertsSize, const uint8_t* uniforms, size_t uniformsSize,
                    const uint8_t* indices, size_t indicesSize, const uint8_t* storage, size_t storageSize) noexcept;
+// hasResolve: el pase termina con la copia a pantalla; copyRect es la zona del EFB que se copia.
 void capture_pass(uint32_t width, uint32_t height, bool clearColor, bool clearDepth, const float clearRgba[4],
-                  float clearDepthValue, bool hasResolve) noexcept;
+                  float clearDepthValue, bool hasResolve, const Rect& copyRect) noexcept;
 void capture_viewport(const Viewport& vp) noexcept;
 void capture_scissor(const Rect& rect) noexcept;
 void capture_draw(uint64_t pipeline, uint32_t idxOffset, uint32_t indexCount, uint32_t instanceCount,

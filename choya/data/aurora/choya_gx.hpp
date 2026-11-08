@@ -23,9 +23,9 @@ void register_clear_pipeline(gfx::PipelineRef ref, const gfx::clear::PipelineCon
 
 void capture_begin(const uint8_t* verts, size_t vertsSize, const uint8_t* uniforms, size_t uniformsSize,
                    const uint8_t* indices, size_t indicesSize, const uint8_t* storage, size_t storageSize) noexcept;
-// isDisplayCopy: el pase termina con la copia a pantalla (GXCopyDisp).
+// isDisplayCopy: el pase termina con la copia a pantalla (GXCopyDisp); copyRect es la zona del EFB copiada.
 void capture_pass(uint32_t width, uint32_t height, bool clearColor, bool clearDepth, const float clearRgba[4],
-                  float clearDepthValue, bool isDisplayCopy) noexcept;
+                  float clearDepthValue, bool isDisplayCopy, const gfx::ClipRect& copyRect) noexcept;
 void capture_viewport(const gfx::Viewport& vp) noexcept;
 void capture_scissor(const gfx::ClipRect& rect) noexcept;
 void capture_gx_draw(const gx::DrawData& draw) noexcept;

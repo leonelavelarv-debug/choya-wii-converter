@@ -115,14 +115,14 @@ int main(int argc, char** argv) {
   gx::capture_begin(verts.data(), verts.size(), uni.data(), uni.size(), (const uint8_t*)idx.data(), idx.size()*2,
                     storage.data(), storage.size());
   const float blue[4] = {0, 0, 1, 1};
-  gx::capture_pass(640, 480, true, true, blue, 0.f, true);
+  gx::capture_pass(640, 480, true, true, blue, 0.f, true, gx::Rect{0, 0, 640, 480});
   gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
   gx::capture_scissor(gx::Rect{0, 0, 640, 480});
   gx::capture_draw(1, 0, 3, 1, 0, UINT32_MAX);
   gx::capture_draw(2, 6, 3, 1, 256, UINT32_MAX);
   // Un segundo pase (el EFB del cuadro siguiente) borra en negro: no debe verse, la pantalla es la copia.
   const float black[4] = {0, 0, 0, 1};
-  gx::capture_pass(640, 480, true, true, black, 0.f, false);
+  gx::capture_pass(640, 480, true, true, black, 0.f, false, gx::Rect{0, 0, 0, 0});
   gx::capture_end();
   if (!gx::draw_frame(640, 480)) { std::puts("no dibujó"); return 1; }
   int a = pixel(160, 240), b = pixel(480, 240), z = pixel(320, 470);
@@ -146,7 +146,7 @@ int main(int argc, char** argv) {
   for (int r = 0; r < 3; ++r) put_f(u3, 36 + r * 4 + r, 1.f);
   std::vector<uint16_t> i3 = {0, 1, 2};
   gx::capture_begin(v3.data(), v3.size(), u3.data(), u3.size(), (const uint8_t*)i3.data(), 6, nullptr, 0);
-  gx::capture_pass(640, 528, true, true, black, 0.f, false);
+  gx::capture_pass(640, 528, true, true, black, 0.f, false, gx::Rect{0, 0, 0, 0});
   // viewport en la mitad superior del EFB (528 de alto): en pantalla debe quedar arriba.
   gx::capture_viewport(gx::Viewport{0, 0, 640, 264, 0, 1});
   gx::capture_scissor(gx::Rect{0, 0, 640, 528});

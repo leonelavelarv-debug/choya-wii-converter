@@ -13,6 +13,9 @@
 // Las bibliotecas se cargan con dlopen: el ejecutable no depende de libEGL/libGLESv2 para arrancar.
 #if defined(__linux__)
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -277,24 +280,53 @@ extern "C" void* choya_gl_proc(const char* name) {
 extern "C" void choya_gles_log(const char* line) { Log("%s", line); }
 
 // Se llama una vez por cada cuadro presentado del juego (desde el VI del runtime, en el hilo del juego).
+// Hilo de la pantalla: tiene el contexto EGL, dibuja con el motor y presenta. Así el hilo del juego solo copia el
+// cuadro (unos 0.1 ms) y no espera al dibujo ni a la GPU.
+namespace {
+std::mutex g_threadMutex;
+std::condition_variable g_threadCv;
+uint64_t g_requested = 0;  // cuadros que el juego ya terminó
+bool g_threadStarted = false;
+
+void RenderThread() {
+    g.ok = Init();
+    if (!g.ok) {
+        Log("la pantalla de Choya quedó apagada; el juego sigue");
+        return;
+    }
+    uint64_t done = 0;
+    for (;;) {
+        {
+            std::unique_lock lock(g_threadMutex);
+            g_threadCv.wait(lock, [&] { return g_requested != done; });
+            done = g_requested;  // si el juego se adelantó, se dibuja solo el más reciente
+        }
+        ++g.frames;
+        if (choya_gx_draw_frame(g.window.width, g.window.height)) {
+            ++g.motorFrames;
+        } else {
+            ++g.patternFrames;
+            DrawPattern();
+        }
+        Present();
+    }
+}
+} // namespace
+
 extern "C" void choya_gles_frame() {
     if (!g.tried) {
         g.tried = true;
         const char* on = std::getenv("CHOYA_GLES");
         if (!on || std::strcmp(on, "1") != 0) return;
-        g.ok = Init();
-        if (!g.ok) Log("la pantalla de Choya quedó apagada; el juego sigue");
+        g_threadStarted = true;
+        std::thread(RenderThread).detach();
     }
-    if (!g.ok) return;
-
-    ++g.frames;
-    if (choya_gx_draw_frame(g.window.width, g.window.height)) {
-        ++g.motorFrames;
-    } else {
-        ++g.patternFrames;
-        DrawPattern();
+    if (!g_threadStarted) return;
+    {
+        std::lock_guard lock(g_threadMutex);
+        ++g_requested;
     }
-    Present();
+    g_threadCv.notify_one();
 }
 
 namespace {

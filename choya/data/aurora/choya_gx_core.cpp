@@ -15,6 +15,7 @@
 #include <dolphin/gx/GXEnum.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -228,6 +229,7 @@ struct Item {
       uint8_t clearColor, clearDepth, hasResolve, pad;
       float rgba[4];
       float depth;
+      Rect copy;  // zona del EFB que se copia a pantalla (ancho 0 = todo el pase; volcados viejos)
     } pass;
     Viewport viewport;
     Rect scissor;
@@ -259,6 +261,22 @@ std::mutex g_frameMutex;
 std::mutex g_pipelineMutex;
 std::unordered_map<uint64_t, PipelineDesc> g_pipelines;
 std::unordered_map<uint64_t, ClearDesc> g_clears;
+
+bool find_pipeline(uint64_t ref, PipelineDesc& out) {
+  std::lock_guard lock(g_pipelineMutex);
+  auto it = g_pipelines.find(ref);
+  if (it == g_pipelines.end()) return false;
+  out = it->second;
+  return true;
+}
+
+bool find_clear(uint64_t ref, ClearDesc& out) {
+  std::lock_guard lock(g_pipelineMutex);
+  auto it = g_clears.find(ref);
+  if (it == g_clears.end()) return false;
+  out = it->second;
+  return true;
+}
 
 void copy_bytes(std::vector<uint8_t>& dst, const uint8_t* src, size_t size) {
   dst.resize(size);
@@ -740,7 +758,7 @@ struct Stats {
   uint64_t frames = 0, draws = 0, clears = 0, skippedLine = 0, skippedConfig = 0, skippedAlign = 0,
            skippedProgram = 0, passes = 0;
   uint64_t bytesVerts = 0, bytesUniforms = 0, bytesIndices = 0, bytesStorage = 0;
-  double cpuMs = 0, captureMs = 0;
+  double cpuMs = 0;
 } g_stats;
 
 // Framebuffer del EFB (color RGBA8 + profundidad/estencil).
@@ -779,13 +797,14 @@ bool ensure_efb(int width, int height) {
   return true;
 }
 
-// Copia la zona (0,0,w,h) del EFB a la pantalla, escalada.
-void present_efb(int w, int h, int screenWidth, int screenHeight) {
+// Copia una zona del EFB (coordenadas del pase, origen arriba a la izquierda) a toda la pantalla, escalada.
+void present_efb(const Rect& r, int screenWidth, int screenHeight) {
   gl.Disable(kScissorTest);
   gl.BindFramebuffer(kReadFramebuffer, g_efb.fbo);
   gl.BindFramebuffer(kDrawFramebuffer, 0);
   // El EFB se dibuja con y hacia arriba en GL (como la pantalla): la copia no voltea.
-  gl.BlitFramebuffer(0, g_efb.height - h, w, g_efb.height, 0, 0, screenWidth, screenHeight, kColorBufferBit, kLinear);
+  const int y0 = g_efb.height - r.y - r.height;
+  gl.BlitFramebuffer(r.x, y0, r.x + r.width, y0 + r.height, 0, 0, screenWidth, screenHeight, kColorBufferBit, kLinear);
   gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
 }
 
@@ -815,6 +834,7 @@ bool has_clear(uint64_t ref) noexcept {
 }
 
 static std::chrono::steady_clock::time_point g_captureStart;
+static std::atomic<uint64_t> g_captureUs{0};
 
 void capture_begin(const uint8_t* verts, size_t vertsSize, const uint8_t* uniforms, size_t uniformsSize,
                    const uint8_t* indices, size_t indicesSize, const uint8_t* storage, size_t storageSize) noexcept {
@@ -832,7 +852,7 @@ void capture_begin(const uint8_t* verts, size_t vertsSize, const uint8_t* unifor
 bool capturing() noexcept { return g_recordingActive; }
 
 void capture_pass(uint32_t width, uint32_t height, bool clearColor, bool clearDepth, const float clearRgba[4],
-                  float clearDepthValue, bool hasResolve) noexcept {
+                  float clearDepthValue, bool hasResolve, const Rect& copyRect) noexcept {
   if (!g_recordingActive) return;
   Item it{};
   it.op = Op::Pass;
@@ -843,6 +863,7 @@ void capture_pass(uint32_t width, uint32_t height, bool clearColor, bool clearDe
   it.pass.hasResolve = hasResolve;
   std::memcpy(it.pass.rgba, clearRgba, sizeof(it.pass.rgba));
   it.pass.depth = clearDepthValue;
+  it.pass.copy = copyRect;
   g_recording.items.push_back(it);
 }
 
@@ -891,8 +912,8 @@ void capture_clear(uint64_t pipeline, const float rgba[4], float depth, bool use
 void capture_end() noexcept {
   if (!g_recordingActive) return;
   g_recordingActive = false;
-  g_stats.captureMs +=
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_captureStart).count();
+  g_captureUs += static_cast<uint64_t>(
+      std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - g_captureStart).count());
   std::lock_guard lock(g_frameMutex);
   std::swap(g_ready, g_recording);
   g_ready.ready = true;
@@ -1009,11 +1030,18 @@ bool draw_frame(int screenWidth, int screenHeight) noexcept {
     }
     g_glReady = true;
   }
-  std::lock_guard lock(g_frameMutex);
-  if (!g_ready.ready) return false;
-  g_ready.ready = false;
-  const bool drawn = draw_frame_locked(g_ready, screenWidth, screenHeight);
-  std::swap(g_last, g_ready);
+  static Frame drawing;
+  {
+    std::lock_guard lock(g_frameMutex);
+    if (!g_ready.ready) return false;
+    g_ready.ready = false;
+    std::swap(drawing, g_ready);  // el juego puede capturar el siguiente mientras se dibuja este
+  }
+  const bool drawn = draw_frame_locked(drawing, screenWidth, screenHeight);
+  {
+    std::lock_guard lock(g_frameMutex);
+    std::swap(g_last, drawing);
+  }
   return drawn;
 }
 
@@ -1070,6 +1098,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
 
   // Coordenadas del pase (origen arriba a la izquierda) -> GL (origen abajo) dentro del EFB.
   int passW = efbW, passH = efbH;
+  Rect passCopy{0, 0, efbW, efbH};
   auto to_gl_rect = [&](float x, float y, float w, float h, GLint out[4]) {
     out[0] = static_cast<GLint>(x);
     out[1] = static_cast<GLint>(static_cast<float>(g_efb.height) - y - h);
@@ -1083,12 +1112,10 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
   auto end_pass = [&]() {
     // La copia a pantalla (XFB) es el EFB al terminar el pase que se copia (GXCopyDisp u otra copia).
     if (passOpen && passResolves) {
-      present_efb(passW, passH, screenWidth, screenHeight);
+      present_efb(passCopy, screenWidth, screenHeight);
       presented = true;
     }
   };
-  std::unique_lock pipeLock(g_pipelineMutex);
-
   for (const Item& it : f.items) {
     switch (it.op) {
     case Op::Pass: {
@@ -1098,6 +1125,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
       passResolves = it.pass.hasResolve != 0;
       passW = it.pass.width ? static_cast<int>(it.pass.width) : efbW;
       passH = it.pass.height ? static_cast<int>(it.pass.height) : efbH;
+      passCopy = it.pass.copy.width > 0 && it.pass.copy.height > 0 ? it.pass.copy : Rect{0, 0, passW, passH};
       gl.Viewport(0, g_efb.height - passH, passW, passH);
       gl.Disable(kScissorTest);
       GLbitfield bits = 0;
@@ -1133,12 +1161,11 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
       gl.Scissor(scissorRect[0], scissorRect[1], std::max(0, scissorRect[2]), std::max(0, scissorRect[3]));
     } break;
     case Op::Clear: {
-      auto cit = g_clears.find(it.clear.pipeline);
-      if (cit == g_clears.end()) {
+      ClearDesc cc;
+      if (!find_clear(it.clear.pipeline, cc)) {
         ++g_stats.skippedConfig;
         break;
       }
-      const auto& cc = cit->second;
       GLint r[4] = {scissorRect[0], scissorRect[1], scissorRect[2], scissorRect[3]};
       if (it.clear.useScissor) {
         to_gl_rect(static_cast<float>(it.clear.scissor.x), static_cast<float>(it.clear.scissor.y),
@@ -1157,12 +1184,11 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
       ++g_stats.clears;
     } break;
     case Op::Draw: {
-      auto pit = g_pipelines.find(it.draw.pipeline);
-      if (pit == g_pipelines.end()) {
+      PipelineDesc pc;
+      if (!find_pipeline(it.draw.pipeline, pc)) {
         ++g_stats.skippedConfig;
         break;
       }
-      const auto& pc = pit->second;
       if (pc.lineMode != 0 || it.draw.instanceCount != 1 || pc.cullMode == GX_CULL_ALL) {
         ++g_stats.skippedLine;
         break;
@@ -1197,10 +1223,9 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
     }
   }
   end_pass();
-  pipeLock.unlock();
   if (!presented) {
     // Ningún pase se copió: se muestra cómo quedó el último.
-    present_efb(passW, passH, screenWidth, screenHeight);
+    present_efb(Rect{0, 0, passW, passH}, screenWidth, screenHeight);
   }
   gl.BindFramebuffer(kFramebuffer, 0);
   gl.Disable(kScissorTest);
@@ -1212,7 +1237,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
     log_line("motor: KB por cuadro: vértices %.0f, uniformes %.0f, índices %.0f, arreglos %.0f; CPU del motor %.2f ms "
              "por cuadro (copia %.2f ms)",
              g_stats.bytesVerts / 300.0 / 1024, g_stats.bytesUniforms / 300.0 / 1024, g_stats.bytesIndices / 300.0 / 1024,
-             g_stats.bytesStorage / 300.0 / 1024, g_stats.cpuMs / 300.0, g_stats.captureMs / 300.0);
+             g_stats.bytesStorage / 300.0 / 1024, g_stats.cpuMs / 300.0, g_captureUs.exchange(0) / 300.0 / 1000.0);
     log_line("motor: %llu cuadros, por cuadro: %.1f dibujos, %.1f borrados, %.1f pases; saltados: %llu sin config, "
          "%llu líneas/puntos, %llu alineación, %llu sin programa; programas %zu; error GL 0x%04X",
          static_cast<unsigned long long>(g_stats.frames), g_stats.draws / 300.0, g_stats.clears / 300.0,
