@@ -379,15 +379,18 @@ class TestEdits(unittest.TestCase):
         if not os.path.exists(real):
             self.skipTest("sin aurora")
         with tempfile.TemporaryDirectory() as d:
-            for rel in ("lib/dawn/BackendBinding.cpp", "lib/webgpu/gpu.cpp", "lib/imgui.cpp"):
+            for rel in sorted({r for r, _o, _n, _l in R.AURORA_EDITS}):
                 os.makedirs(os.path.dirname(os.path.join(d, "aurora-main", rel)), exist_ok=True)
                 shutil.copy(os.path.join(real, rel), os.path.join(d, "aurora-main", rel))
             for _ in range(2):  # la segunda vez no debe duplicar nada
                 changes = []
                 R.patch_aurora(d, changes)
-                self.assertEqual([c.kind for c in changes], ["edicion"] * len(R.AURORA_EDITS))
+                self.assertEqual([c.kind for c in changes], ["edicion"] * (len(R.AURORA_EDITS) + len(R.AURORA_FILES)))
             text = open(os.path.join(d, "aurora-main/lib/dawn/BackendBinding.cpp")).read()
             self.assertEqual(text.count("choyaDisplay;"), 1)
+            common = open(os.path.join(d, "aurora-main/lib/gfx/common.cpp")).read()
+            self.assertEqual(common.count("choya::capture_end();"), 1)
+            self.assertTrue(os.path.isfile(os.path.join(d, "aurora-main/lib/choya/choya_gx.cpp")))
             gpu = open(os.path.join(d, "aurora-main/lib/webgpu/gpu.cpp")).read()
             self.assertEqual(gpu.count("Null solo admite RenderAttachment"), 1)
 

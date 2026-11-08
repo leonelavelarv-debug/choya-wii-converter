@@ -892,13 +892,85 @@ AURORA_EDITS = [
      "    }\n"
      "    SDL_Renderer* renderer = window::get_sdl_renderer();\n    SDL_RenderClear(renderer);\n",
      "ImGui sin dibujar en la ventana offscreen"),
+    # Motor de Choya, paso 2a: el cuadro que arma aurora se copia al motor GLES de Choya (lib/choya/choya_gx.cpp).
+    ("cmake/aurora_gx.cmake", "        lib/gfx/common.cpp\n",
+     "        lib/gfx/common.cpp\n        lib/choya/choya_gx.cpp\n", "motor de Choya en aurora_gx"),
+    ("lib/gfx/common.cpp", '#include "../window.hpp"\n',
+     '#include "../window.hpp"\n#include "../choya/choya_gx.hpp"  // choya: motor GLES de Choya\n',
+     "motor de Choya (cabecera)"),
+    ("lib/gfx/common.cpp",
+     "PipelineRef pipeline_ref(const gx::PipelineConfig& config) {\n"
+     "  return find_pipeline(ShaderType::GX, config, [=] { return create_pipeline(config); });\n}\n",
+     "PipelineRef pipeline_ref(const gx::PipelineConfig& config) {\n"
+     "  const PipelineRef ref = find_pipeline(ShaderType::GX, config, [=] { return create_pipeline(config); });\n"
+     "  choya::register_gx_pipeline(ref, config);  // choya\n"
+     "  return ref;\n}\n",
+     "motor de Choya (pipelines GX)"),
+    ("lib/gfx/common.cpp",
+     "PipelineRef pipeline_ref(const clear::PipelineConfig& config) {\n"
+     "  return find_pipeline(ShaderType::Clear, config, [=] { return create_pipeline(config); });\n}\n",
+     "PipelineRef pipeline_ref(const clear::PipelineConfig& config) {\n"
+     "  const PipelineRef ref = find_pipeline(ShaderType::Clear, config, [=] { return create_pipeline(config); });\n"
+     "  choya::register_clear_pipeline(ref, config);  // choya\n"
+     "  return ref;\n}\n",
+     "motor de Choya (pipelines de borrado)"),
+    ("lib/gfx/common.cpp",
+     "  g_uniforms.append_zeroes(gx::MaxUniformSize); // Pad the end of the buffer\n",
+     "  g_uniforms.append_zeroes(gx::MaxUniformSize); // Pad the end of the buffer\n" + """\
+  // choya: copia del cuadro (vértices, uniformes, índices, arreglos y pases) para el motor GLES de Choya.
+  // Los lotes partidos a mitad de cuadro (copias del EFB a RAM) todavía no se copian.
+  if (choya::enabled()) {
+    if (advanceFrame) {
+      choya::capture_begin(g_verts.data(), g_verts.size(), g_uniforms.data(), g_uniforms.size(), g_indices.data(),
+                           g_indices.size(), g_storage.data(), g_storage.size());
+      for (const auto& pass : g_renderPasses) {
+        const float rgba[4] = {pass.clearColorValue.x(), pass.clearColorValue.y(), pass.clearColorValue.z(),
+                               pass.clearColorValue.w()};
+        choya::capture_pass(pass.targetSize.width, pass.targetSize.height, pass.clearColor, pass.clearDepth, rgba,
+                            pass.clearDepthValue);
+        for (const auto& command : pass.commands) {
+          switch (command.type) {
+          case CommandType::SetViewport:
+            choya::capture_viewport(command.data.setViewport);
+            break;
+          case CommandType::SetScissor:
+            choya::capture_scissor(command.data.setScissor);
+            break;
+          case CommandType::Draw:
+            if (command.data.draw.type == ShaderType::GX) {
+              choya::capture_gx_draw(command.data.draw.gx);
+            } else {
+              choya::capture_clear(command.data.draw.clear);
+            }
+            break;
+          default:
+            break;
+          }
+        }
+      }
+      choya::capture_end();
+    } else {
+      choya::capture_discard();
+    }
+  }
+""",
+     "motor de Choya (copia del cuadro)"),
 ]
+
+# Archivos del motor de Choya que se copian dentro de aurora (siempre se reemplazan: son de Choya).
+AURORA_FILES = [("choya_gx.hpp", "lib/choya/choya_gx.hpp"), ("choya_gx.cpp", "lib/choya/choya_gx.cpp")]
 
 
 def patch_aurora(wiicompiled: str, changes: list[Change]) -> None:
     base = os.path.join(wiicompiled, "aurora-main")
     if not os.path.isdir(base):  # p. ej. un runtime ya compilado como paquete
         return
+    data = os.path.join(os.path.dirname(__file__), "data", "aurora")
+    for src, rel in AURORA_FILES:
+        dst = os.path.join(base, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(os.path.join(data, src), dst)
+        changes.append(Change("aurora-main/" + rel, 0, "edicion", 0, None, "motor de Choya", "motor de Choya (archivo)"))
     for rel, old, new, label in AURORA_EDITS:
         path = os.path.join(base, rel)
         shown = "aurora-main/" + rel

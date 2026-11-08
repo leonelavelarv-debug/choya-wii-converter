@@ -222,6 +222,15 @@ Compila con Docker (Ubuntu 24.04, glibc 2.39, Clang 21, `-mcpu=cortex-a53`, libs
 
 `scripts/knulli/Choya-Info.sh` (desde Ports) escribe `choya-info.txt` con el sistema, la GPU, Vulkan/GLES y el espacio libre.
 
+#### Motor de Choya (gráficos en la consola)
+
+En la consola los gráficos los dibuja el motor GLES de Choya en vez de Dawn. aurora sigue leyendo el GX del juego y armando cada cuadro; Choya copia ese cuadro (vértices crudos, uniformes, índices, arreglos y pases) y lo dibuja con OpenGL ES 3.2 sobre el framebuffer de la Mali (EGL fbdev, sin X11/Wayland/DRM). Se activa con `CHOYA_GLES=1`, que ya pone el lanzador.
+
+- `choya/data/choya_gles.cpp` (runtime): pantalla EGL, presentación y registro `choya-gles.txt`.
+- `choya/data/aurora/choya_gx.{hpp,cpp}` (se copian a `aurora-main/lib/choya/`): copia del cuadro, generador GLSL ES 3.20 a partir del `ShaderConfig` de aurora y reproducción del cuadro. Los vértices y arreglos se leen de texturas R32UI porque la Mali no permite buffers de almacenamiento en el vertex shader.
+- Pasos: 1 pantalla (listo) · 2a geometría con el color del rasterizador · 2b TEV y texturas · 3 copias del EFB, profundidad y mezcla · 4 quitar Dawn.
+- `tests/test_motor_gles.py` dibuja cuadros sintéticos con Mesa (llvmpipe) para probar el motor en la PC.
+
 
 Lo que genera el traductor (`generated\`, `build-wiisports\`) contiene código del juego: no lo subas a ningún repositorio.
 

@@ -6,6 +6,9 @@
 // contexto GLES y el ritmo de presentación funcionan dentro del proceso del juego, y anota en choya-gles.txt qué
 // versión de OpenGL ES y qué extensiones ofrece el driver (de eso depende cómo se arma el motor).
 //
+// Desde el paso 2a, cada cuadro lo dibuja el motor de Choya dentro de aurora (lib/choya/choya_gx.cpp) con los
+// datos del cuadro que armó aurora; la pantalla de prueba solo sale mientras todavía no hay cuadro.
+//
 // Solo se activa con CHOYA_GLES=1. Si algo falla lo anota y se apaga; el juego sigue corriendo.
 // Las bibliotecas se cargan con dlopen: el ejecutable no depende de libEGL/libGLESv2 para arrancar.
 #if defined(__linux__)
@@ -20,6 +23,8 @@
 #include <string>
 #include <sys/ioctl.h>
 #include <unistd.h>
+
+extern "C" bool choya_gx_draw_frame(int screenWidth, int screenHeight);  // motor de Choya (aurora)
 
 namespace {
 
@@ -83,6 +88,8 @@ struct FbdevWindow {  // ventana nativa del EGL de Mali para fbdev
 };
 
 struct State {
+    void* glesLib = nullptr;
+    uint64_t motorFrames = 0, patternFrames = 0;
     bool tried = false;
     bool ok = false;
     Egl egl{};
@@ -97,6 +104,8 @@ struct State {
     FILE* log = nullptr;
 };
 State g;
+void DrawPattern();
+void Present();
 
 void Log(const char* fmt, const char* a = "", const char* b = "") {
     std::fprintf(stderr, "[choya-gles] ");
@@ -136,6 +145,7 @@ bool Init() {
     static const char* const kGles[] = {"libGLESv2.so.2", "libGLESv2.so", "libmali.so.0", "libmali.so", nullptr};
     void* egl = OpenFirst(kEgl);
     void* gles = OpenFirst(kGles);
+    g.glesLib = gles;
     if (!egl) {
         Log("no pude abrir libEGL (%s)", dlerror());
         return false;
@@ -257,6 +267,15 @@ bool Init() {
 
 } // namespace
 
+// Para el motor de Choya: funciones de GLES del contexto activo y el registro choya-gles.txt.
+extern "C" void* choya_gl_proc(const char* name) {
+    void* p = g.glesLib ? dlsym(g.glesLib, name) : nullptr;
+    if (!p && g.egl.GetProcAddress) p = g.egl.GetProcAddress(name);
+    return p;
+}
+
+extern "C" void choya_gles_log(const char* line) { Log("%s", line); }
+
 // Se llama una vez por cada cuadro presentado del juego (desde el VI del runtime, en el hilo del juego).
 extern "C" void choya_gles_frame() {
     if (!g.tried) {
@@ -269,6 +288,17 @@ extern "C" void choya_gles_frame() {
     if (!g.ok) return;
 
     ++g.frames;
+    if (choya_gx_draw_frame(g.window.width, g.window.height)) {
+        ++g.motorFrames;
+    } else {
+        ++g.patternFrames;
+        DrawPattern();
+    }
+    Present();
+}
+
+namespace {
+void DrawPattern() {
     // Prueba visible: el color de fondo cambia poco a poco y una barra blanca recorre la pantalla.
     const float t = static_cast<float>(g.frames % 360) / 360.0f;
     const float r = t < 0.5f ? t * 2 : (1 - t) * 2;
@@ -281,7 +311,9 @@ extern "C" void choya_gles_frame() {
     g.gl.ClearColor(1, 1, 1, 1);
     g.gl.Clear(GL_COLOR_BUFFER_BIT);
     g.gl.Disable(GL_SCISSOR_TEST);
+}
 
+void Present() {
     const auto swapStart = std::chrono::steady_clock::now();
     g.egl.SwapBuffers(g.display, g.surface);
     const double swapMs =
@@ -293,11 +325,14 @@ extern "C" void choya_gles_frame() {
         const double secs =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - g.windowStart).count();
         char line[160];
-        std::snprintf(line, sizeof(line), "%.1f cuadros/s, intercambio promedio %.2f ms, peor %.2f ms",
-                      300.0 / secs, g.swapMsTotal / 300.0, g.swapMsWorst);
+        std::snprintf(line, sizeof(line),
+                      "%.1f cuadros/s, intercambio promedio %.2f ms, peor %.2f ms; del motor %llu, de prueba %llu",
+                      300.0 / secs, g.swapMsTotal / 300.0, g.swapMsWorst,
+                      static_cast<unsigned long long>(g.motorFrames), static_cast<unsigned long long>(g.patternFrames));
         Log("presentación: %s", line);
         g.swapMsTotal = g.swapMsWorst = 0;
         g.windowStart = std::chrono::steady_clock::now();
     }
 }
+} // namespace
 #endif
