@@ -6,8 +6,22 @@
 
 DIR="$(cd "$(dirname "$0")" && pwd)/wiisports-choya"
 cd "$DIR" || exit 1
+rm -f "$DIR/resumen.txt"  # que nunca quede uno viejo de otra corrida
+# La carpeta del disco puede llamarse DATA, data o venir anidada (game/DATA/DATA): se busca sys/boot.bin.
 GAME="$DIR/game/DATA"
-[ -f "$GAME/sys/boot.bin" ] || { echo "Falta $GAME (copia la carpeta DATA de tu disco)" > "$DIR/resumen.txt"; exit 1; }
+if [ ! -f "$GAME/sys/boot.bin" ]; then
+  BOOT="$(find "$DIR/game" -maxdepth 4 -type f -iname boot.bin -ipath '*/sys/boot.bin' 2>/dev/null | head -1)"
+  [ -n "$BOOT" ] && GAME="$(dirname "$(dirname "$BOOT")")"
+fi
+if [ ! -f "$GAME/sys/boot.bin" ] && [ ! -f "$GAME/SYS/BOOT.BIN" ]; then
+  {
+    echo "Falta el juego: copia la carpeta DATA de tu disco (la que tiene files y sys) en $DIR/game/"
+    echo "Debe quedar: $DIR/game/DATA/sys/boot.bin"
+    echo "Lo que hay ahora en game/:"
+    find "$DIR/game" -maxdepth 3 2>/dev/null | sed "s|$DIR/||" | head -30
+  } > "$DIR/resumen.txt"
+  exit 1
+fi
 MODO="${CHOYA_MODO:-jugar}"
 
 # Perfil de controles de PortMaster (igual que cualquier port): da SDL_GAMECONTROLLERCONFIG con el mapeo del
@@ -44,6 +58,9 @@ CONF
 export LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"
 export SDL_VIDEO_DRIVER=offscreen
 export SDL_AUDIO_DRIVER=alsa
+# La ventana offscreen nunca tiene el foco del teclado y SDL descarta los botones del mando de una ventana sin
+# foco: con esto los acepta igual.
+export SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1
 export NSMBW_LOG_FPS=1
 export WIICOMPILED_NO_POPUP=1
 # Motor de Choya: pantalla GLES propia sobre el framebuffer de la Mali (anota choya-gles.txt).
@@ -56,9 +73,30 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
 {
   echo "--- procesador"
   echo "gobernador: $(cat $CPUF/scaling_governor 2>/dev/null)  MHz actual/max: $(( $(cat $CPUF/scaling_cur_freq 2>/dev/null || echo 0) / 1000 ))/$(( $(cat $CPUF/cpuinfo_max_freq 2>/dev/null || echo 0) / 1000 ))"
+  echo "juego: $GAME"
   echo "PortMaster: ${controlfolder:-no encontrado}  dispositivo: ${DEVICE_NAME:-?}  CFW: ${CFW_NAME:-?}"
   echo "mapeo del mando: ${SDL_GAMECONTROLLERCONFIG:-ninguno}" | cut -c1-200
+  echo "dispositivos de entrada: $(grep -h "^N: Name=" /proc/bus/input/devices 2>/dev/null | cut -d= -f2- | tr "\n" " ")"
 } > "$DIR/cpu.txt" 2>&1
+
+escribir_resumen() {
+  {
+    echo "modo: $MODO"
+    echo "codigo de salida: ${STATUS:-sigue corriendo} (124 = siguio corriendo hasta el limite de 90 s)"
+    [ -f "$DIR/perfil.txt" ] && echo "perfil.txt: $(head -2 "$DIR/perfil.txt" | tail -1)"
+    cat "$DIR/cpu.txt"
+    echo "--- cuadros volcados"
+    ls -la "$DIR"/cuadro-*.bin 2>/dev/null || echo "ninguno"
+    echo "--- pantalla GLES de Choya"
+    [ -f "$DIR/choya-gles.txt" ] && grep -v "extensiones:" "$DIR/choya-gles.txt" | tail -40 || echo "choya-gles.txt no se escribio"
+    echo "--- cuadros por segundo"
+    grep -E "\[vi\] fps" "$DIR/run.log" | tail -15
+    echo "--- errores"
+    grep -iE "fatal|error|abort|AccessViolation|choya\]|not found|cannot open" "$DIR/run.log" | head -20
+    echo "--- final del log"
+    tail -15 "$DIR/run.log"
+  } > "$DIR/resumen.txt" 2>&1
+}
 
 if [ "$MODO" = "diagnostico" ]; then
   # Perfil: a los 20 s empieza a tomar muestras durante 35 s y deja perfil.txt (en la PC: choya perfil perfil.txt).
@@ -89,24 +127,14 @@ if [ "$MODO" = "diagnostico" ]; then
   wait $TPID
   STATUS=$?
 else
-  ./WiiCompiled > "$DIR/run.log" 2>&1
+  ./WiiCompiled > "$DIR/run.log" 2>&1 &
+  JPID=$!
+  # Un resumen a los 10 s, por si el juego se cierra con la tecla de salida del sistema (mata este script).
+  sleep 10
+  escribir_resumen; sync
+  wait $JPID
   STATUS=$?
 fi
 
-{
-  echo "modo: $MODO"
-  echo "codigo de salida: $STATUS (124 = siguio corriendo hasta el limite de 90 s)"
-  [ -f "$DIR/perfil.txt" ] && echo "perfil.txt: $(head -2 "$DIR/perfil.txt" | tail -1)"
-  cat "$DIR/cpu.txt"
-  echo "--- cuadros volcados"
-  ls -la "$DIR"/cuadro-*.bin 2>/dev/null || echo "ninguno"
-  echo "--- pantalla GLES de Choya"
-  [ -f "$DIR/choya-gles.txt" ] && grep -v "extensiones:" "$DIR/choya-gles.txt" | tail -40 || echo "choya-gles.txt no se escribio"
-  echo "--- cuadros por segundo"
-  grep -E "\[vi\] fps" "$DIR/run.log" | tail -15
-  echo "--- errores"
-  grep -iE "fatal|error|abort|AccessViolation|choya\]|not found|cannot open" "$DIR/run.log" | head -20
-  echo "--- final del log"
-  tail -15 "$DIR/run.log"
-} > "$DIR/resumen.txt" 2>&1
+escribir_resumen
 sync
