@@ -31,8 +31,11 @@ export WIICOMPILED_NO_POPUP=1
 export CHOYA_PERFIL=20,35
 # Motor de Choya, paso 1: pantalla GLES propia sobre el framebuffer de la Mali (anota choya-gles.txt).
 export CHOYA_GLES=1
-# Diagnóstico del paso 2a: cada dibujo de un color distinto (0 = colores reales del rasterizador).
-export CHOYA_GX_COLORES=1
+# Diagnóstico: 1 = cada dibujo de un color distinto; 0 = colores reales del rasterizador.
+export CHOYA_GX_COLORES=0
+# Vuelca estos cuadros del motor a cuadro-<n>.bin (aviso de salud ~10 s, título ~40 s) para revisarlos en la PC.
+export CHOYA_GX_VOLCADO=600,2400
+rm -f "$DIR"/cuadro-*.bin
 rm -f "$DIR/choya-gles.txt"
 rm -f "$DIR/perfil.txt"
 
@@ -68,6 +71,8 @@ STATUS=$?
   echo "codigo de salida: $STATUS (124 = siguio corriendo hasta el limite de 90 s)"
   [ -f "$DIR/perfil.txt" ] && echo "perfil.txt: $(head -2 "$DIR/perfil.txt" | tail -1)" || echo "perfil.txt: no se escribio"
   cat "$DIR/cpu.txt"
+  echo "--- cuadros volcados"
+  ls -la "$DIR"/cuadro-*.bin 2>/dev/null || echo "ninguno"
   echo "--- pantalla GLES de Choya"
   [ -f "$DIR/choya-gles.txt" ] && cat "$DIR/choya-gles.txt" || echo "choya-gles.txt no se escribio"
   echo "--- cuadros por segundo"

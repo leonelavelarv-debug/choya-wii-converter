@@ -227,7 +227,9 @@ Compila con Docker (Ubuntu 24.04, glibc 2.39, Clang 21, `-mcpu=cortex-a53`, libs
 En la consola los gráficos los dibuja el motor GLES de Choya en vez de Dawn. aurora sigue leyendo el GX del juego y armando cada cuadro; Choya copia ese cuadro (vértices crudos, uniformes, índices, arreglos y pases) y lo dibuja con OpenGL ES 3.2 sobre el framebuffer de la Mali (EGL fbdev, sin X11/Wayland/DRM). Se activa con `CHOYA_GLES=1`, que ya pone el lanzador.
 
 - `choya/data/choya_gles.cpp` (runtime): pantalla EGL, presentación y registro `choya-gles.txt`.
-- `choya/data/aurora/choya_gx.{hpp,cpp}` (se copian a `aurora-main/lib/choya/`): copia del cuadro, generador GLSL ES 3.20 a partir del `ShaderConfig` de aurora y reproducción del cuadro. Los vértices y arreglos se leen de texturas R32UI porque la Mali no permite buffers de almacenamiento en el vertex shader.
+- `choya/data/aurora/choya_gx_core.{hpp,cpp}`: el núcleo del motor, sin nada de aurora. Generador GLSL ES 3.20, reproducción del cuadro en un framebuffer del tamaño del EFB y presentación de la copia a pantalla (GXCopyDisp). Los vértices y arreglos se leen de texturas R32UI porque la Mali no permite buffers de almacenamiento en el vertex shader.
+- `choya/data/aurora/choya_gx.{hpp,cpp}`: adaptador que traduce los pipelines y cuadros de aurora al núcleo. Los cuatro archivos se copian a `aurora-main/lib/choya/`.
+- `CHOYA_GX_VOLCADO=600,2400` vuelca esos cuadros a `cuadro-<n>.bin`; `tests/motor_gles/harness.cpp cuadro.bin salida.ppm` los vuelve a dibujar en la PC con Mesa. `CHOYA_GX_COLORES=1` pinta cada dibujo de un color distinto.
 - Pasos: 1 pantalla (listo) · 2a geometría con el color del rasterizador · 2b TEV y texturas · 3 copias del EFB, profundidad y mezcla · 4 quitar Dawn.
 - `tests/test_motor_gles.py` dibuja cuadros sintéticos con Mesa (llvmpipe) para probar el motor en la PC.
 

@@ -23,21 +23,26 @@ class TestMotorGles(unittest.TestCase):
         if not ctypes.util.find_library("EGL") or not ctypes.util.find_library("GLESv2"):
             self.skipTest("sin Mesa EGL/GLES")
         with tempfile.TemporaryDirectory() as d:
-            shutil.copytree(os.path.join(AQUI, "motor_gles"), d, dirs_exist_ok=True)
-            os.makedirs(os.path.join(d, "lib", "choya"))
-            for name in ("choya_gx.hpp", "choya_gx.cpp"):
-                shutil.copy(os.path.join(REPO, "choya", "data", "aurora", name), os.path.join(d, "lib", "choya"))
-            os.makedirs(os.path.join(d, "test"))
-            shutil.move(os.path.join(d, "harness.cpp"), os.path.join(d, "test", "harness.cpp"))
             exe = os.path.join(d, "harness")
-            subprocess.run(["clang++", "-std=c++20", "-DTARGET_PC", "-I", os.path.join(d, "inc"), "-I", AURORA_INCLUDE,
-                            os.path.join(d, "test", "harness.cpp"), os.path.join(d, "lib", "choya", "choya_gx.cpp"),
+            data = os.path.join(REPO, "choya", "data", "aurora")
+            subprocess.run(["clang++", "-std=c++20", "-I", data, "-I", AURORA_INCLUDE,
+                            os.path.join(AQUI, "motor_gles", "harness.cpp"), os.path.join(data, "choya_gx_core.cpp"),
                             "-o", exe, "-ldl"], check=True, capture_output=True)
-            env = dict(os.environ, CHOYA_GLES="1", EGL_PLATFORM="surfaceless")
+            dump = os.path.join(d, "cuadro.bin")
+            env = dict(os.environ, EGL_PLATFORM="surfaceless", CHOYA_PRUEBA_VOLCADO=dump)
             out = subprocess.run([exe], env=env, capture_output=True, text=True)
             if out.returncode == 2:
                 self.skipTest("Mesa no dio contexto GLES 3.2: " + out.stdout.strip())
             self.assertIn("PRUEBA OK", out.stdout, out.stdout + out.stderr)
+            # El volcado se vuelve a dibujar igual (rojo, verde, fondo azul; el segundo pase no se ve).
+            ppm = os.path.join(d, "cuadro.ppm")
+            out = subprocess.run([exe, dump, ppm], env=env, capture_output=True, text=True)
+            self.assertIn("listo", out.stdout, out.stdout + out.stderr)
+            with open(ppm, "rb") as f:
+                raw = f.read()
+            pix = raw[raw.index(b"255\n") + 4:]
+            at = lambda x, y: tuple(pix[(y * 640 + x) * 3:(y * 640 + x) * 3 + 3])
+            self.assertEqual((at(160, 240), at(480, 240), at(320, 10)), ((255, 0, 0), (0, 255, 0), (0, 0, 255)))
 
 
 if __name__ == "__main__":

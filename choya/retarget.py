@@ -894,7 +894,8 @@ AURORA_EDITS = [
      "ImGui sin dibujar en la ventana offscreen"),
     # Motor de Choya, paso 2a: el cuadro que arma aurora se copia al motor GLES de Choya (lib/choya/choya_gx.cpp).
     ("cmake/aurora_gx.cmake", "        lib/gfx/common.cpp\n",
-     "        lib/gfx/common.cpp\n        lib/choya/choya_gx.cpp\n", "motor de Choya en aurora_gx"),
+     "        lib/gfx/common.cpp\n        lib/choya/choya_gx.cpp\n        lib/choya/choya_gx_core.cpp\n",
+     "motor de Choya en aurora_gx"),
     ("lib/gfx/common.cpp", '#include "../window.hpp"\n',
      '#include "../window.hpp"\n#include "../choya/choya_gx.hpp"  // choya: motor GLES de Choya\n',
      "motor de Choya (cabecera)"),
@@ -926,8 +927,10 @@ AURORA_EDITS = [
       for (const auto& pass : g_renderPasses) {
         const float rgba[4] = {pass.clearColorValue.x(), pass.clearColorValue.y(), pass.clearColorValue.z(),
                                pass.clearColorValue.w()};
+        // La copia a pantalla (GXCopyDisp) termina el pase cuyo destino es la textura de la copia de pantalla.
+        const bool displayCopy = pass.resolveTarget && pass.resolveTarget == gx::g_gxState.displayCopyTexture;
         choya::capture_pass(pass.targetSize.width, pass.targetSize.height, pass.clearColor, pass.clearDepth, rgba,
-                            pass.clearDepthValue);
+                            pass.clearDepthValue, displayCopy);
         for (const auto& command : pass.commands) {
           switch (command.type) {
           case CommandType::SetViewport:
@@ -958,7 +961,8 @@ AURORA_EDITS = [
 ]
 
 # Archivos del motor de Choya que se copian dentro de aurora (siempre se reemplazan: son de Choya).
-AURORA_FILES = [("choya_gx.hpp", "lib/choya/choya_gx.hpp"), ("choya_gx.cpp", "lib/choya/choya_gx.cpp")]
+AURORA_FILES = [("choya_gx.hpp", "lib/choya/choya_gx.hpp"), ("choya_gx.cpp", "lib/choya/choya_gx.cpp"),
+                ("choya_gx_core.hpp", "lib/choya/choya_gx_core.hpp"), ("choya_gx_core.cpp", "lib/choya/choya_gx_core.cpp")]
 
 
 def patch_aurora(wiicompiled: str, changes: list[Change]) -> None:
