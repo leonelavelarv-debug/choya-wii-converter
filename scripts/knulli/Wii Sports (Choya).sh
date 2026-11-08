@@ -81,6 +81,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "juego: $GAME"
   echo "PortMaster: ${controlfolder:-no encontrado}  dispositivo: ${DEVICE_NAME:-?}  CFW: ${CFW_NAME:-?}"
   echo "mapeo del mando: ${SDL_GAMECONTROLLERCONFIG:-ninguno}" | cut -c1-200
+  echo "gptokeyb: ${GPTOKEYB:-no}"
   echo "dispositivos de entrada: $(grep -h "^N: Name=" /proc/bus/input/devices 2>/dev/null | cut -d= -f2- | tr "\n" " ")"
 } > "$DIR/cpu.txt" 2>&1
 
@@ -96,6 +97,8 @@ escribir_resumen() {
     [ -f "$DIR/choya-gles.txt" ] && grep -v "extensiones:" "$DIR/choya-gles.txt" | tail -40 || echo "choya-gles.txt no se escribio"
     echo "--- cuadros por segundo"
     grep -E "\[vi\] fps" "$DIR/run.log" | tail -15
+    echo "--- mandos"
+    grep -hE "evdev|mandos|gamepad|joystick|Select \+ Start" "$DIR/choya-gles.txt" "$DIR/run.log" 2>/dev/null | grep -v "^\[choya-gles\]" | head -60
     echo "--- errores"
     grep -iE "fatal|error|abort|AccessViolation|choya\]|not found|cannot open" "$DIR/run.log" | head -20
     echo "--- final del log"
@@ -134,11 +137,21 @@ if [ "$MODO" = "diagnostico" ]; then
 else
   ./WiiCompiled > "$DIR/run.log" 2>&1 &
   JPID=$!
-  # Un resumen a los 10 s, por si el juego se cierra con la tecla de salida del sistema (mata este script).
-  sleep 10
-  escribir_resumen; sync
+  # Salida de PortMaster (gptokeyb): Select + Start cierra el juego aunque SDL no vea el mando.
+  GPID=""
+  if [ -n "$GPTOKEYB" ]; then
+    $GPTOKEYB "WiiCompiled" > "$DIR/gptokeyb.log" 2>&1 &
+    GPID=$!
+  fi
+  # Resumen cada 10 s mientras corre, por si el juego se cierra con la tecla de salida del sistema.
+  while kill -0 $JPID 2>/dev/null; do
+    sleep 10
+    kill -0 $JPID 2>/dev/null && { escribir_resumen; sync; }
+  done
   wait $JPID
   STATUS=$?
+  [ -n "$GPID" ] && kill $GPID 2>/dev/null
+  pkill -f gptokeyb 2>/dev/null
 fi
 
 escribir_resumen

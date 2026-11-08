@@ -22,7 +22,12 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <linux/fb.h>
+#include <linux/input.h>
+#include <poll.h>
+#include <cerrno>
+#include <vector>
 #include <string>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -321,10 +326,77 @@ void RenderThread() {
 // Controles en la consola: Select + Start sostenidos 1.5 s cierran el juego (no hay otra forma de salir), y a
 // los 2 s se anota en choya-gles.txt qué mandos ve SDL (para revisar el mapeo de botones).
 namespace {
+// Lee los botones de la consola directo del kernel (/dev/input/eventN), sin SDL: anota qué dispositivos hay, si
+// otro programa los tiene agarrados (EVIOCGRAB) y los primeros botones que se aprietan. Select + Start sostenidos
+// 1.5 s cierran el juego aunque SDL no vea el mando.
+void EvdevThread() {
+    std::this_thread::sleep_for(std::chrono::seconds(3));  // que choya-gles.txt ya esté abierto
+    std::vector<pollfd> fds;
+    for (int n = 0; n < 32; ++n) {
+        char path[64];
+        std::snprintf(path, sizeof(path), "/dev/input/event%d", n);
+        const int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) continue;
+        char name[128] = "?";
+        ioctl(fd, EVIOCGNAME(sizeof(name)), name);
+        const char* grab = "libre";
+        if (ioctl(fd, EVIOCGRAB, 1) == 0) {
+            ioctl(fd, EVIOCGRAB, 0);
+        } else if (errno == EBUSY) {
+            grab = "AGARRADO por otro programa (SDL no recibe sus botones)";
+        } else {
+            grab = "no se pudo revisar";
+        }
+        char line[320];
+        std::snprintf(line, sizeof(line), "evdev: %s '%s' %s", path, name, grab);
+        Log("%s", line);
+        fds.push_back({fd, POLLIN, 0});
+    }
+    if (fds.empty()) {
+        Log("evdev: no se pudo abrir ningun /dev/input/event (%s)", std::strerror(errno));
+        return;
+    }
+    int logged = 0;
+    bool select = false, start = false;
+    std::chrono::steady_clock::time_point since{};
+    for (;;) {
+        if (poll(fds.data(), fds.size(), 100) < 0 && errno != EINTR) return;
+        for (pollfd& p : fds) {
+            if (!(p.revents & POLLIN)) continue;
+            input_event ev[32];
+            const ssize_t r = read(p.fd, ev, sizeof(ev));
+            for (ssize_t i = 0; r > 0 && i < r / static_cast<ssize_t>(sizeof(input_event)); ++i) {
+                if (ev[i].type != EV_KEY && ev[i].type != EV_ABS) continue;
+                if (logged < 40 && (ev[i].type == EV_KEY || (ev[i].code >= ABS_HAT0X && ev[i].code <= ABS_HAT0Y))) {
+                    ++logged;
+                    char line[96];
+                    std::snprintf(line, sizeof(line), "evdev: fd %d %s %d = %d", p.fd, ev[i].type == EV_KEY ? "boton" : "eje",
+                                  ev[i].code, ev[i].value);
+                    Log("%s", line);
+                }
+                if (ev[i].type == EV_KEY && ev[i].code == BTN_SELECT) select = ev[i].value != 0;
+                if (ev[i].type == EV_KEY && ev[i].code == BTN_START) start = ev[i].value != 0;
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!(select && start)) {
+            since = {};
+        } else if (since == std::chrono::steady_clock::time_point{}) {
+            since = now;
+        } else if (now - since > std::chrono::milliseconds(1500)) {
+            Log("Select + Start (evdev): cerrando el juego");
+            std::fflush(stderr);
+            _exit(0);
+        }
+    }
+}
+
 void CheckGamepads() {
     static uint64_t frames = 0;
     static int held = 0;
+    static int lastCount = -1;
     ++frames;
+    if (frames == 1) std::thread(EvdevThread).detach();
     int count = 0;
     SDL_JoystickID* ids = SDL_GetGamepads(&count);
     bool combo = false;
@@ -334,11 +406,13 @@ void CheckGamepads() {
             combo = true;
         }
     }
-    if (frames == 120) {
+    if (frames == 1 || frames == 120 || frames == 1200 || count != lastCount) {
+        lastCount = count;
         int njoy = 0;
         SDL_JoystickID* joys = SDL_GetJoysticks(&njoy);
         char line[256];
-        std::snprintf(line, sizeof(line), "mandos: %d joystick(s), %d como gamepad", njoy, count);
+        std::snprintf(line, sizeof(line), "mandos (cuadro %llu): %d joystick(s), %d como gamepad",
+                      static_cast<unsigned long long>(frames), njoy, count);
         Log("%s", line);
         for (int i = 0; joys && i < njoy; ++i) {
             const char* name = SDL_GetJoystickNameForID(joys[i]);
