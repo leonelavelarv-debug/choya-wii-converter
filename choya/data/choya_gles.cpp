@@ -304,9 +304,12 @@ void RenderThread() {
         ++g.frames;
         if (choya_gx_draw_frame(g.window.width, g.window.height)) {
             ++g.motorFrames;
-        } else {
-            ++g.patternFrames;
+        } else if (g.motorFrames == 0) {
+            ++g.patternFrames;  // todavía no hay cuadros del juego: pantalla de prueba
             DrawPattern();
+        } else {
+            ++g.patternFrames;  // aviso sin cuadro nuevo: se queda el último en pantalla (antes parpadeaba la prueba)
+            continue;
         }
         Present();
     }
@@ -358,7 +361,7 @@ void Present() {
             std::chrono::duration<double>(std::chrono::steady_clock::now() - g.windowStart).count();
         char line[160];
         std::snprintf(line, sizeof(line),
-                      "%.1f cuadros/s, intercambio promedio %.2f ms, peor %.2f ms; del motor %llu, de prueba %llu",
+                      "%.1f cuadros/s, intercambio promedio %.2f ms, peor %.2f ms; del motor %llu, sin cuadro nuevo %llu",
                       300.0 / secs, g.swapMsTotal / 300.0, g.swapMsWorst,
                       static_cast<unsigned long long>(g.motorFrames), static_cast<unsigned long long>(g.patternFrames));
         Log("presentación: %s", line);
