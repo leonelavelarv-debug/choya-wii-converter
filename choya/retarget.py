@@ -789,7 +789,17 @@ EDITS = [
     ("src/virtual_remote.cpp",
      '    {"back,leftshoulder,lefttrigger", "back,touchpad,leftshoulder,lefttrigger", "back,leftshoulder,lefttrigger"},\n};',
      '    {"back,leftshoulder,lefttrigger", "back,touchpad,leftshoulder,lefttrigger", "back,leftshoulder,lefttrigger"},\n'
-     '    {"righttrigger", "righttrigger", "righttrigger"},' + _B_NOTE + '\n};', "botón B en el mando"),
+     '    {"a,righttrigger", "a,righttrigger", "a,righttrigger"},' + _B_NOTE + '\n};', "botón B en el mando"),
+    # Wii Sports se juega con el Wii Remote: el Remote 1 lo hacen el teclado y los mandos. BrawlRecompiled los deja
+    # solo como mandos de GameCube (Present() siempre falso) y entonces ningún botón llegaba al juego.
+    ("src/virtual_remote.cpp", "    (void)chan;\n    return false;\n}",
+     "    return chan == 0;  // choya: Wii Sports solo lee el Wii Remote; teclado y mandos hacen de Remote 1\n}",
+     "mandos como Wii Remote 1"),
+    # Botones con las letras de la consola: A = A, B = B (o R2), Y = 1, X = 2, R1 = agitar (posiciones de SDL:
+    # a = abajo, b = derecha, x = izquierda, y = arriba).
+    ("src/virtual_remote.cpp", '    {"a", "a", "a,b"},\n    {"b,x", "b,x", "x"},\n    {"y", "y", "y"},',
+     '    {"y", "y", "y"},  // choya: 2 arriba\n    {"x", "x", "x"},  // choya: 1 izquierda\n'
+     '    {"b", "b", "b"},  // choya: A a la derecha (la A de la consola)', "botones como en la consola"),
     ("src/virtual_remote.cpp", '"plus", "minus",\n};', '"plus", "minus", "b",' + _B_NOTE + '\n};',
      "botón B en el mando"),
     # Wii Sports registra su función de apagado en cada cuadro: anotarlo solo cuando cambia.
