@@ -27,6 +27,8 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#include <SDL3/SDL.h>
+
 extern "C" bool choya_gx_draw_frame(int screenWidth, int screenHeight);  // motor de Choya (aurora)
 
 namespace {
@@ -316,7 +318,47 @@ void RenderThread() {
 }
 } // namespace
 
+// Controles en la consola: Select + Start sostenidos 1.5 s cierran el juego (no hay otra forma de salir), y a
+// los 2 s se anota en choya-gles.txt qué mandos ve SDL (para revisar el mapeo de botones).
+namespace {
+void CheckGamepads() {
+    static uint64_t frames = 0;
+    static int held = 0;
+    ++frames;
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    bool combo = false;
+    for (int i = 0; ids && i < count; ++i) {
+        SDL_Gamepad* pad = SDL_GetGamepadFromID(ids[i]);
+        if (pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_BACK) && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_START)) {
+            combo = true;
+        }
+    }
+    if (frames == 120) {
+        int njoy = 0;
+        SDL_JoystickID* joys = SDL_GetJoysticks(&njoy);
+        char line[256];
+        std::snprintf(line, sizeof(line), "mandos: %d joystick(s), %d como gamepad", njoy, count);
+        Log("%s", line);
+        for (int i = 0; joys && i < njoy; ++i) {
+            const char* name = SDL_GetJoystickNameForID(joys[i]);
+            Log(SDL_IsGamepad(joys[i]) ? "  gamepad: %s" : "  joystick sin mapeo de gamepad: %s", name ? name : "?");
+        }
+        SDL_free(joys);
+    }
+    SDL_free(ids);
+    held = combo ? held + 1 : 0;
+    if (held == 90) {
+        Log("Select + Start: cerrando el juego");
+        if (g.log) std::fflush(g.log);
+        std::fflush(stderr);
+        _exit(0);
+    }
+}
+} // namespace
+
 extern "C" void choya_gles_frame() {
+    CheckGamepads();
     if (!g.tried) {
         g.tried = true;
         const char* on = std::getenv("CHOYA_GLES");

@@ -68,7 +68,7 @@ find "$B" -maxdepth 3 -name "*.so*" -type f -not -path "*/CMakeFiles/*" | while 
 done
 for f in dsp_coef.bin initial_pipeline_cache.db cacert.pem; do [ -f "$B/$f" ] && cp "$B/$f" "$PORT/wiisports-choya/"; done
 [ -d "$B/wii_bootstrap" ] && cp -r "$B/wii_bootstrap" "$PORT/wiisports-choya/"
-cp "$CHOYA/scripts/knulli/Wii Sports (Choya).sh" "$PORT/"
+cp "$CHOYA/scripts/knulli/Wii Sports (Choya).sh" "$CHOYA/scripts/knulli/Wii Sports (Choya) - diagnostico.sh" "$PORT/"
 echo "Copia aquí la carpeta DATA de tu disco (la que tiene files y sys)." > "$PORT/wiisports-choya/game/LEEME.txt"
 ls -la "$PORT/wiisports-choya" "$PORT/wiisports-choya/lib" | tee -a "$LOG"
 du -sh "$PORT" | tee -a "$LOG"
