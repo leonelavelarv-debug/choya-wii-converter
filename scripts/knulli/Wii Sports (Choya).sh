@@ -10,6 +10,23 @@ GAME="$DIR/game/DATA"
 [ -f "$GAME/sys/boot.bin" ] || { echo "Falta $GAME (copia la carpeta DATA de tu disco)" > "$DIR/resumen.txt"; exit 1; }
 MODO="${CHOYA_MODO:-jugar}"
 
+# Perfil de controles de PortMaster (igual que cualquier port): da SDL_GAMECONTROLLERCONFIG con el mapeo del
+# mando de la consola. Se busca antes de cambiar XDG_DATA_HOME (en KNULLI PortMaster vive en ~/.local/share).
+PM_XDG="${XDG_DATA_HOME:-$HOME/.local/share}"
+controlfolder=""
+for cf in /opt/system/Tools/PortMaster /opt/tools/PortMaster "$PM_XDG/PortMaster" /userdata/system/.local/share/PortMaster \
+          /roms/ports/PortMaster /userdata/roms/ports/PortMaster; do
+  [ -f "$cf/control.txt" ] && { controlfolder="$cf"; break; }
+done
+if [ -n "$controlfolder" ]; then
+  # shellcheck disable=SC1090,SC1091
+  source "$controlfolder/control.txt" >/dev/null 2>&1
+  [ -f "$controlfolder/mod_${CFW_NAME}.txt" ] && source "$controlfolder/mod_${CFW_NAME}.txt" >/dev/null 2>&1
+  get_controls >/dev/null 2>&1
+  [ -n "$sdl_controllerconfig" ] && export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
+fi
+cd "$DIR" || exit 1  # por si control.txt cambió de carpeta
+
 export XDG_DATA_HOME="$DIR/userdata"
 CFG="$XDG_DATA_HOME/WiiCompiled/Config.toml"
 mkdir -p "$(dirname "$CFG")"
@@ -23,19 +40,6 @@ widescreen = false
 force_16_9 = false
 resolution_multiplier = 1
 CONF
-
-# Mapeo del mando de la consola para SDL (el de PortMaster, si está instalado).
-for cf in /userdata/roms/ports/PortMaster /roms/ports/PortMaster "$XDG_DATA_HOME/PortMaster"; do
-  if [ -f "$cf/control.txt" ]; then
-    controlfolder="$cf"
-    # shellcheck disable=SC1091
-    source "$cf/control.txt" >/dev/null 2>&1
-    get_controls >/dev/null 2>&1
-    [ -n "$sdl_controllerconfig" ] && export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
-    break
-  fi
-done
-cd "$DIR" || exit 1  # por si control.txt cambió de carpeta
 
 export LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"
 export SDL_VIDEO_DRIVER=offscreen
@@ -52,7 +56,8 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
 {
   echo "--- procesador"
   echo "gobernador: $(cat $CPUF/scaling_governor 2>/dev/null)  MHz actual/max: $(( $(cat $CPUF/scaling_cur_freq 2>/dev/null || echo 0) / 1000 ))/$(( $(cat $CPUF/cpuinfo_max_freq 2>/dev/null || echo 0) / 1000 ))"
-  echo "mapeo del mando: ${SDL_GAMECONTROLLERCONFIG:+de PortMaster ($controlfolder)}${SDL_GAMECONTROLLERCONFIG:-sin mapeo (no encontré PortMaster)}"
+  echo "PortMaster: ${controlfolder:-no encontrado}  dispositivo: ${DEVICE_NAME:-?}  CFW: ${CFW_NAME:-?}"
+  echo "mapeo del mando: ${SDL_GAMECONTROLLERCONFIG:-ninguno}" | cut -c1-200
 } > "$DIR/cpu.txt" 2>&1
 
 if [ "$MODO" = "diagnostico" ]; then
