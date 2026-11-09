@@ -86,6 +86,9 @@ export WIICOMPILED_NO_POPUP=1
 export CHOYA_GLES=1
 # 1 = cada dibujo de un color distinto (diagnóstico); 0 = colores reales.
 export CHOYA_GX_COLORES=0
+# Caché de programas en disco (como los shaders listos de galaxy-vita): la primera vez se compilan, después se cargan.
+export CHOYA_GX_CACHE="${CHOYA_GX_CACHE:-$DIR/cache-shaders}"
+mkdir -p "$CHOYA_GX_CACHE"
 rm -f "$DIR/choya-gles.txt"
 
 CPUF=/sys/devices/system/cpu/cpu0/cpufreq
@@ -117,6 +120,9 @@ escribir_resumen() {
     tail -120 "$DIR/memoria.txt" 2>/dev/null
     echo "--- memoria del motor"
     grep -h "motor: memoria" "$DIR/choya-gles.txt" 2>/dev/null | tail -12
+    echo "--- motor: estado GL y programas"
+    grep -hE "motor: (estado GL|caché de programas|programas cargados)" "$DIR/choya-gles.txt" 2>/dev/null | tail -8
+    echo "programas en el caché: $(ls "$CHOYA_GX_CACHE" 2>/dev/null | grep -c '\.bin$')"
     echo "--- mandos"
     grep -hE "mando|gamepad|joystick|\[input\]|volcado" "$DIR/choya-gles.txt" "$DIR/run.log" 2>/dev/null | grep -v "^\[choya-gles\]" | head -80
     echo "--- errores"

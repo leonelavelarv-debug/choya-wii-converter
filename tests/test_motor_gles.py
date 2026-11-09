@@ -43,6 +43,19 @@ class TestMotorGles(unittest.TestCase):
             pix = raw[raw.index(b"255\n") + 4:]
             at = lambda x, y: tuple(pix[(y * 640 + x) * 3:(y * 640 + x) * 3 + 3])
             self.assertEqual((at(160, 240), at(480, 240), at(320, 10)), ((255, 0, 0), (0, 255, 0), (0, 0, 255)))
+            # Caché de programas en disco: la primera vez compila y guarda, la segunda carga los binarios y dibuja igual.
+            cache = os.path.join(d, "cache")
+            env_cache = dict(env, CHOYA_GX_CACHE=cache)
+            first = subprocess.run([exe], env=env_cache, capture_output=True, text=True)
+            self.assertIn("PRUEBA OK", first.stdout, first.stdout + first.stderr)
+            if "caché de programas apagado" in first.stdout:
+                self.skipTest("Mesa sin binarios de programas")
+            saved = sorted(os.listdir(cache))
+            self.assertTrue(saved and all(n.endswith(".bin") for n in saved), saved)
+            second = subprocess.run([exe], env=env_cache, capture_output=True, text=True)
+            self.assertIn("PRUEBA OK", second.stdout, second.stdout + second.stderr)
+            self.assertIn("programas cargados del caché de disco", second.stdout)
+            self.assertEqual(sorted(os.listdir(cache)), saved)
 
 
 if __name__ == "__main__":

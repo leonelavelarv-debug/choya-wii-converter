@@ -25,6 +25,11 @@
 #include <string>
 #include <unordered_map>
 #include <deque>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+#include <dirent.h>
+#include <sys/stat.h>
 #include <iterator>
 #include <vector>
 
@@ -157,6 +162,11 @@ struct Gl {
   void* (*MapBufferRange)(GLenum, GLintptr, GLsizeiptr, GLbitfield);
   GLboolean (*UnmapBuffer)(GLenum);
   void (*DeleteBuffers)(GLsizei, const GLuint*);
+  // Opcionales: caché de programas en disco (GLES 3.0, como el caché de shaders que galaxy-vita trae listo).
+  void (*GetProgramBinary)(GLuint, GLsizei, GLsizei*, GLenum*, void*);
+  void (*ProgramBinary)(GLuint, GLenum, const void*, GLsizei);
+  void (*ProgramParameteri)(GLuint, GLenum, GLint);
+  const unsigned char* (*GetString)(GLenum);
 };
 Gl gl{};
 
@@ -247,6 +257,10 @@ bool load_gl() {
     gl.MapBufferRange = reinterpret_cast<decltype(gl.MapBufferRange)>(g_loader("glMapBufferRange"));
     gl.UnmapBuffer = reinterpret_cast<decltype(gl.UnmapBuffer)>(g_loader("glUnmapBuffer"));
     gl.DeleteBuffers = reinterpret_cast<decltype(gl.DeleteBuffers)>(g_loader("glDeleteBuffers"));
+    gl.GetProgramBinary = reinterpret_cast<decltype(gl.GetProgramBinary)>(g_loader("glGetProgramBinary"));
+    gl.ProgramBinary = reinterpret_cast<decltype(gl.ProgramBinary)>(g_loader("glProgramBinary"));
+    gl.ProgramParameteri = reinterpret_cast<decltype(gl.ProgramParameteri)>(g_loader("glProgramParameteri"));
+    gl.GetString = reinterpret_cast<decltype(gl.GetString)>(g_loader("glGetString"));
   }
   return ok;
 }
@@ -324,6 +338,10 @@ struct Stats {
   uint64_t texUploads = 0, missingTextures = 0, copies = 0;
   uint64_t interval = 0;  // cuadros desde el último informe
   double cpuMs = 0, gpuWaitMs = 0;
+  // Como el backend de galaxy-vita: estado GL que no cambió (no se llama a GL), dibujos que no pintan nada, programas.
+  uint64_t stateSkipped = 0, stateApplied = 0, texBindsSkipped = 0, texBinds = 0, rejectedNoWrite = 0,
+           rejectedScissor = 0, progCompiled = 0, progCached = 0;
+  double compileMs = 0;
 } g_stats;
 
 std::unordered_map<uint64_t, BindDesc> g_bindGroups;
@@ -359,6 +377,8 @@ struct CopyTexture {
 };
 std::unordered_map<uint64_t, CopyTexture> g_copyTextures;  // solo en el hilo del motor
 GLuint g_whiteTexture = 0;
+std::atomic<uint64_t> g_bindGen{1};  // sube cuando register_bind_group cambia un grupo ya visto
+uint64_t g_texGen = 1;  // sube cuando cambia un nombre GL de textura (subidas nuevas, copias, borrados)
 std::unordered_map<uint64_t, GLuint> g_samplers;
 
 bool find_bind_group(uint64_t ref, BindDesc& out) {
@@ -883,19 +903,152 @@ GLuint compile(GLenum type, const std::string& src, std::string& err) {
 std::unordered_map<uint64_t, Program> g_programs;
 int g_programErrors = 0;
 
+// --- Caché de programas en disco ------------------------------------------------------------------------------
+// galaxy-vita trae los shaders ya compilados y los prepara en la pantalla de carga para que no haya tirones a mitad
+// del juego. Aquí no se puede traer nada hecho (cada driver compila a su modo), pero el resultado sí se guarda: el
+// primer encuentro con un programa lo compila (decenas de ms en la Mali) y lo escribe en CHOYA_GX_CACHE; las
+// siguientes veces se carga el binario (glProgramBinary) en una fracción de eso. La clave es el texto de los dos
+// shaders más el driver, así que un cambio del generador o del driver nunca carga un binario viejo.
+constexpr GLenum kProgramBinaryLength = 0x8741, kNumProgramBinaryFormats = 0x87FE,
+                 kProgramBinaryRetrievableHint = 0x8257;
+std::string g_cacheDir;
+bool g_cacheTried = false, g_cacheOn = false;
+uint64_t g_driverHash = 0;
+int g_cacheWriteErrors = 0;
+
+uint64_t fnv64(const void* data, size_t size, uint64_t h = 1469598103934665603ull) {
+  const auto* p = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < size; ++i) h = (h ^ p[i]) * 1099511628211ull;
+  return h;
+}
+
+void cache_init() {
+  if (g_cacheTried) return;
+  g_cacheTried = true;
+  const char* dir = std::getenv("CHOYA_GX_CACHE");
+  if (dir == nullptr || dir[0] == '\0' || std::strcmp(dir, "0") == 0) return;
+  if (gl.GetProgramBinary == nullptr || gl.ProgramBinary == nullptr || gl.GetString == nullptr) {
+    log_line("motor: caché de programas apagado (el driver no tiene glProgramBinary)");
+    return;
+  }
+  GLint formats = 0;
+  gl.GetIntegerv(kNumProgramBinaryFormats, &formats);
+  if (formats <= 0) {
+    log_line("motor: caché de programas apagado (el driver no da formatos binarios)");
+    return;
+  }
+  for (GLenum e : {GLenum{0x1F00}, GLenum{0x1F01}, GLenum{0x1F02}}) {  // fabricante, renderer, versión
+    const unsigned char* str = gl.GetString(e);
+    const char* text = str != nullptr ? reinterpret_cast<const char*>(str) : "";
+    g_driverHash = fnv64(text, std::strlen(text) + 1, g_driverHash ? g_driverHash : 1469598103934665603ull);
+  }
+  g_cacheDir = dir;
+  ::mkdir(dir, 0755);
+  size_t files = 0;
+  if (DIR* d = ::opendir(dir)) {
+    while (const dirent* e = ::readdir(d)) {
+      if (std::strstr(e->d_name, ".bin") != nullptr) ++files;
+    }
+    ::closedir(d);
+    g_cacheOn = true;
+  }
+  log_line("motor: caché de programas en %s (%zu guardados)%s", dir, files, g_cacheOn ? "" : ": no pude abrir la carpeta");
+}
+
+std::string cache_path(uint64_t h) {
+  char name[32];
+  std::snprintf(name, sizeof(name), "/%016llx.bin", static_cast<unsigned long long>(h));
+  return g_cacheDir + name;
+}
+
+struct CacheHeader {
+  char magic[4];  // CHPB
+  uint32_t format, length;
+  uint32_t pad;
+};
+
+bool cache_load(GLuint prog, uint64_t h) {
+  if (!g_cacheOn) return false;
+  FILE* f = std::fopen(cache_path(h).c_str(), "rb");
+  if (f == nullptr) return false;
+  CacheHeader hd{};
+  std::vector<uint8_t> data;
+  bool ok = std::fread(&hd, sizeof(hd), 1, f) == 1 && std::memcmp(hd.magic, "CHPB", 4) == 0 && hd.length > 0 &&
+            hd.length < (64u << 20);
+  if (ok) {
+    data.resize(hd.length);
+    ok = std::fread(data.data(), 1, data.size(), f) == data.size();
+  }
+  std::fclose(f);
+  if (!ok) return false;
+  gl.ProgramBinary(prog, hd.format, data.data(), static_cast<GLsizei>(data.size()));
+  GLint linked = 0;
+  gl.GetProgramiv(prog, kLinkStatus, &linked);
+  if (!linked) std::remove(cache_path(h).c_str());  // el driver ya no lo acepta: se compila y se reescribe
+  return linked != 0;
+}
+
+void cache_store(GLuint prog, uint64_t h) {
+  if (!g_cacheOn || g_cacheWriteErrors > 3) return;
+  GLint length = 0;
+  gl.GetProgramiv(prog, kProgramBinaryLength, &length);
+  if (length <= 0) return;
+  std::vector<uint8_t> data(static_cast<size_t>(length));
+  GLsizei got = 0;
+  GLenum format = 0;
+  gl.GetProgramBinary(prog, length, &got, &format, data.data());
+  if (got <= 0) return;
+  const std::string path = cache_path(h), tmp = path + ".tmp";
+  FILE* f = std::fopen(tmp.c_str(), "wb");
+  CacheHeader hd{{'C', 'H', 'P', 'B'}, format, static_cast<uint32_t>(got), 0};
+  bool ok = f != nullptr && std::fwrite(&hd, sizeof(hd), 1, f) == 1 &&
+            std::fwrite(data.data(), 1, static_cast<size_t>(got), f) == static_cast<size_t>(got);
+  if (f != nullptr) ok = std::fclose(f) == 0 && ok;
+  ok = ok && std::rename(tmp.c_str(), path.c_str()) == 0;  // completo o nada (si se apaga a mitad)
+  if (!ok) {
+    std::remove(tmp.c_str());
+    if (++g_cacheWriteErrors == 1) log_line("motor: no pude guardar en el caché de programas (%s)", path.c_str());
+  }
+}
+
+// Lo que GL olvida al cargar un binario o enlazar: las unidades de los samplers y el bloque de uniformes.
+void setup_program(Program& prog) {
+  prog.ok = true;
+  gl.UseProgram(prog.id);
+  gl.Uniform1i(gl.GetUniformLocation(prog.id, "vbuf"), 0);
+  gl.Uniform1i(gl.GetUniformLocation(prog.id, "abuf"), 1);
+  prog.debugLoc = gl.GetUniformLocation(prog.id, "u_debug");
+  for (int i = 0; i < 8; ++i) {
+    const std::string name = "tex" + std::to_string(i);
+    gl.Uniform1i(gl.GetUniformLocation(prog.id, name.c_str()), 2 + i);  // unidades 2..9 (0 y 1: vbuf, abuf)
+  }
+  const GLuint block = gl.GetUniformBlockIndex(prog.id, "U");
+  if (block != kInvalidIndex) gl.UniformBlockBinding(prog.id, block, 0);
+}
+
 const Program& program_for(const PipelineDesc& cfg) {
   const uint64_t key = shader_key(cfg);
   auto it = g_programs.find(key);
   if (it != g_programs.end()) return it->second;
+  const auto start = std::chrono::steady_clock::now();
+  cache_init();
   Program prog;
   std::string vs, fs, err;
   build_sources(cfg, vs, fs);
+  uint64_t h = fnv64(vs.data(), vs.size() + 1, g_driverHash ? g_driverHash : 1469598103934665603ull);
+  h = fnv64(fs.data(), fs.size() + 1, h);
+  prog.id = gl.CreateProgram();
+  if (cache_load(prog.id, h)) {
+    setup_program(prog);
+    if (g_stats.progCached++ == 0 && g_programs.empty()) log_line("motor: programas cargados del caché de disco");
+    return g_programs.emplace(key, prog).first->second;
+  }
   const GLuint v = compile(kVertexShader, vs, err);
   const GLuint f = v ? compile(kFragmentShader, fs, err) : 0;
   if (v && f) {
-    prog.id = gl.CreateProgram();
     gl.AttachShader(prog.id, v);
     gl.AttachShader(prog.id, f);
+    if (g_cacheOn && gl.ProgramParameteri != nullptr) gl.ProgramParameteri(prog.id, kProgramBinaryRetrievableHint, 1);
     gl.LinkProgram(prog.id);
     GLint ok = 0;
     gl.GetProgramiv(prog.id, kLinkStatus, &ok);
@@ -905,21 +1058,14 @@ const Program& program_for(const PipelineDesc& cfg) {
       err.assign(static_cast<size_t>(len > 1 ? len : 1), '\0');
       gl.GetProgramInfoLog(prog.id, len, nullptr, err.data());
     } else {
-      prog.ok = true;
-      gl.UseProgram(prog.id);
-      gl.Uniform1i(gl.GetUniformLocation(prog.id, "vbuf"), 0);
-      gl.Uniform1i(gl.GetUniformLocation(prog.id, "abuf"), 1);
-      prog.debugLoc = gl.GetUniformLocation(prog.id, "u_debug");
-      for (int i = 0; i < 8; ++i) {
-        const std::string name = "tex" + std::to_string(i);
-        gl.Uniform1i(gl.GetUniformLocation(prog.id, name.c_str()), 2 + i);  // unidades 2..9 (0 y 1: vbuf, abuf)
-      }
-      const GLuint block = gl.GetUniformBlockIndex(prog.id, "U");
-      if (block != kInvalidIndex) gl.UniformBlockBinding(prog.id, block, 0);
+      setup_program(prog);
+      cache_store(prog.id, h);
     }
   }
   if (v) gl.DeleteShader(v);
   if (f) gl.DeleteShader(f);
+  ++g_stats.progCompiled;
+  g_stats.compileMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   if (!prog.ok && g_programErrors++ < 3) {
     log_line("motor: programa %016llx no compiló: %s", static_cast<unsigned long long>(key), err.c_str());
     log_line("motor: vertex shader:\n%s", vs.c_str());
@@ -966,16 +1112,22 @@ u8 without_dst_alpha(u8 fac) {
   return fac;
 }
 
-void apply_state(const PipelineDesc& c, uint32_t dstAlpha) {
-  // Profundidad: GL solo escribe profundidad con la prueba activa, así que "sin comparar" es ALWAYS.
-  gl.Enable(kDepthTest);
-  gl.DepthFunc(c.depthCompare ? compare(c.depthFunc) : kAlways);
-  gl.DepthMask(c.depthUpdate ? 1 : 0);
-  // Recorte de caras pendiente (paso 2b): en 2a se dibuja todo para ver las formas.
-  gl.Disable(kCullFace);
-  const bool hasAlpha = c.pixelFmt == GX_PF_RGBA6_Z24;
-  gl.ColorMask(c.colorUpdate, c.colorUpdate, c.colorUpdate, c.alphaUpdate && hasAlpha);
+// Estado de render de un pipeline, calculado una vez por pipeline (no en cada dibujo).
+struct StateBlock {
+  GLenum depthFunc, cs, cd, as, ad, ceq, aeq;
+  uint8_t depthMask, blend, colorMask, alphaMask;
+  uint32_t dstAlpha;  // UINT32_MAX: sin alfa constante
+  bool operator==(const StateBlock&) const = default;
+};
 
+StateBlock make_state(const PipelineDesc& c, uint32_t dstAlpha) {
+  StateBlock st{};
+  // Profundidad: GL solo escribe profundidad con la prueba activa, así que "sin comparar" es ALWAYS.
+  st.depthFunc = c.depthCompare ? compare(c.depthFunc) : kAlways;
+  st.depthMask = c.depthUpdate ? 1 : 0;
+  const bool hasAlpha = c.pixelFmt == GX_PF_RGBA6_Z24;
+  st.colorMask = c.colorUpdate ? 1 : 0;
+  st.alphaMask = c.alphaUpdate && hasAlpha ? 1 : 0;
   GLenum cs = kOne, cd = kZero, as = kOne, ad = kZero, ceq = kFuncAdd, aeq = kFuncAdd;
   bool blend = true;
   switch (c.blendMode) {
@@ -1007,20 +1159,134 @@ void apply_state(const PipelineDesc& c, uint32_t dstAlpha) {
     blend = false;
     break;
   }
+  st.dstAlpha = dstAlpha;
   if (dstAlpha != UINT32_MAX) {
     as = kConstantAlpha;
     ad = kZero;
     aeq = kFuncAdd;
     blend = true;
-    gl.BlendColor(0.f, 0.f, 0.f, static_cast<float>(dstAlpha) / 255.f);
   }
-  if (blend) {
-    gl.Enable(kBlend);
-    gl.BlendFuncSeparate(cs, cd, as, ad);
-    gl.BlendEquationSeparate(ceq, aeq);
-  } else {
-    gl.Disable(kBlend);
+  st.blend = blend ? 1 : 0;
+  if (!blend) cs = cd = as = ad = ceq = aeq = 0;  // sin mezcla los factores no importan (no se comparan)
+  st.cs = cs;
+  st.cd = cd;
+  st.as = as;
+  st.ad = ad;
+  st.ceq = ceq;
+  st.aeq = aeq;
+  return st;
+}
+
+// --- Estado GL en sombra (como el GlState de galaxy-vita) ---------------------------------------------------------
+// Nada de abajo llama a GL si el valor no cambia. Con ~19000 dibujos por cuadro en Golf eran cientos de miles de
+// llamadas al driver de la Mali por cuadro solo para repetir el mismo estado. shadow_invalidate() después de
+// cualquier cosa que toque GL por fuera (copias del EFB, la copia a pantalla, subidas de texturas).
+struct GlShadow {
+  GLuint program;
+  GLuint tex[8], samp[8];
+  int unit;
+  int8_t depthTest, blendOn, cullOn, scissorOn, depthMask, colorMask, alphaMask;
+  GLenum depthFunc;
+  GLenum blend[6];
+  float blendAlpha;
+  GLint vp[4], sc[4];
+  float dr[2];
+  GLuint uboBuf;
+  GLintptr uboOffset;
+  StateBlock last;
+  bool lastValid;
+};
+GlShadow S;
+
+void shadow_invalidate() {
+  std::memset(&S, 0xFF, sizeof(S));  // ningún valor válido de GL es todo unos
+  S.lastValid = false;
+  S.dr[0] = S.dr[1] = -1.f;
+  S.blendAlpha = -1.f;
+}
+
+void set_enable(GLenum cap, int8_t& cur, bool on) {
+  if (cur == (on ? 1 : 0)) return;
+  cur = on ? 1 : 0;
+  S.lastValid = false;
+  if (on) gl.Enable(cap);
+  else gl.Disable(cap);
+}
+void set_depth_mask(bool on) {
+  if (S.depthMask == (on ? 1 : 0)) return;
+  S.depthMask = on ? 1 : 0;
+  S.lastValid = false;
+  gl.DepthMask(on ? 1 : 0);
+}
+void set_color_mask(bool color, bool alpha) {
+  if (S.colorMask == (color ? 1 : 0) && S.alphaMask == (alpha ? 1 : 0)) return;
+  S.colorMask = color ? 1 : 0;
+  S.alphaMask = alpha ? 1 : 0;
+  S.lastValid = false;
+  gl.ColorMask(color, color, color, alpha);
+}
+void set_viewport(const GLint r[4]) {
+  if (std::memcmp(S.vp, r, sizeof(S.vp)) == 0) return;
+  std::memcpy(S.vp, r, sizeof(S.vp));
+  gl.Viewport(r[0], r[1], r[2], r[3]);
+}
+void set_scissor(const GLint r[4]) {
+  const GLint c[4] = {r[0], r[1], std::max(0, r[2]), std::max(0, r[3])};
+  if (std::memcmp(S.sc, c, sizeof(S.sc)) == 0) return;
+  std::memcpy(S.sc, c, sizeof(S.sc));
+  gl.Scissor(c[0], c[1], c[2], c[3]);
+}
+void set_depth_range(float n, float f) {
+  if (S.dr[0] == n && S.dr[1] == f) return;
+  S.dr[0] = n;
+  S.dr[1] = f;
+  gl.DepthRangef(n, f);
+}
+void set_program(GLuint id) {
+  if (S.program == id) return;
+  S.program = id;
+  gl.UseProgram(id);
+}
+void set_ubo(GLuint buf, GLintptr offset) {
+  if (S.uboBuf == buf && S.uboOffset == offset) return;
+  S.uboBuf = buf;
+  S.uboOffset = offset;
+  gl.BindBufferRange(kUniformBuffer, 0, buf, offset, 16384);
+}
+
+void apply_state(const StateBlock& st) {
+  if (S.lastValid && S.last == st) {
+    ++g_stats.stateSkipped;
+    return;
   }
+  ++g_stats.stateApplied;
+  set_enable(kDepthTest, S.depthTest, true);
+  if (S.depthFunc != st.depthFunc) {
+    S.depthFunc = st.depthFunc;
+    gl.DepthFunc(st.depthFunc);
+  }
+  set_depth_mask(st.depthMask != 0);
+  // Recorte de caras pendiente (paso 2b): en 2a se dibuja todo para ver las formas.
+  set_enable(kCullFace, S.cullOn, false);
+  set_color_mask(st.colorMask != 0, st.alphaMask != 0);
+  if (st.dstAlpha != UINT32_MAX) {
+    const float a = static_cast<float>(st.dstAlpha) / 255.f;
+    if (S.blendAlpha != a) {
+      S.blendAlpha = a;
+      gl.BlendColor(0.f, 0.f, 0.f, a);
+    }
+  }
+  set_enable(kBlend, S.blendOn, st.blend != 0);
+  if (st.blend) {
+    const GLenum b[6] = {st.cs, st.cd, st.as, st.ad, st.ceq, st.aeq};
+    if (std::memcmp(S.blend, b, sizeof(b)) != 0) {
+      if (std::memcmp(S.blend, b, 4 * sizeof(GLenum)) != 0) gl.BlendFuncSeparate(st.cs, st.cd, st.as, st.ad);
+      if (S.blend[4] != st.ceq || S.blend[5] != st.aeq) gl.BlendEquationSeparate(st.ceq, st.aeq);
+      std::memcpy(S.blend, b, sizeof(b));
+    }
+  }
+  S.last = st;
+  S.lastValid = true;
 }
 // --- Recursos -------------------------------------------------------------------------------------------------
 constexpr int kTexWidth = 4096;
@@ -1203,12 +1469,14 @@ void process_textures() {
       gl.DeleteTextures(1, &it->second.id);
       g_texBytes -= it->second.bytes;
       g_textures.erase(it);
+      ++g_texGen;
     }
     auto c = g_copyTextures.find(id);
     if (c != g_copyTextures.end()) {
       gl.DeleteFramebuffers(1, &c->second.fbo);
       gl.DeleteTextures(1, &c->second.tex);
       g_copyTextures.erase(c);
+      ++g_texGen;
     }
   }
   if (pending.empty()) return;
@@ -1223,6 +1491,7 @@ void process_textures() {
         g_texBytes -= tex.bytes;
       }
       gl.GenTextures(1, &tex.id);
+      ++g_texGen;
       gl.BindTexture(kTexture2D, tex.id);
       const GLenum internal = kind == kTexGray ? kR8 : kind == kTexGrayAlpha ? kRg8 : kind == kTexRgb565 ? kRgb565
                               : kind == kTexRgb5a1 ? kRgb5A1 : kRgba8;
@@ -1290,9 +1559,23 @@ GLuint sampler_for(const SamplerDesc& s) {
   return id;
 }
 
-void bind_textures(uint64_t bindGroup) {
+// Texturas de cada grupo ya resueltas a nombres GL (la "memo" de enlaces de galaxy-vita): se rehacen solo si aurora
+// registró grupos nuevos o el motor creó o borró texturas desde la última vez.
+struct ResolvedBind {
+  uint64_t bindGen = 0, texGen = 0;
+  GLuint tex[8], samp[8];
+};
+std::unordered_map<uint64_t, ResolvedBind> g_resolvedBinds;
+
+const ResolvedBind& resolve_bind(uint64_t bindGroup) {
+  ResolvedBind& r = g_resolvedBinds[bindGroup];
+  const uint64_t bindGen = g_bindGen.load(std::memory_order_acquire);
+  if (r.bindGen == bindGen && r.texGen == g_texGen) return r;
+  r.bindGen = bindGen;
+  r.texGen = g_texGen;
   BindDesc bd;
   const bool has = bindGroup != 0 && find_bind_group(bindGroup, bd);
+  if (!has) r.texGen = 0;  // sin registrar todavía: volver a buscarlo
   for (int i = 0; i < 8; ++i) {
     GLuint tex = g_whiteTexture;
     GLuint samp = 0;
@@ -1304,13 +1587,79 @@ void bind_textures(uint64_t bindGroup) {
         tex = c->second.tex;  // copia del EFB
       } else {
         ++g_stats.missingTextures;  // paleta, o una copia que todavía no se hace
+        r.texGen = 0;               // volver a buscarla la próxima vez (la copia puede llegar en este cuadro)
       }
       samp = sampler_for(bd.samp[i]);
     }
-    gl.ActiveTexture(kTexture0 + 2 + static_cast<GLenum>(i));
-    gl.BindTexture(kTexture2D, tex);
-    gl.BindSampler(static_cast<GLuint>(2 + i), samp);
+    r.tex[i] = tex;
+    r.samp[i] = samp;
   }
+  return r;
+}
+
+void bind_textures(uint64_t bindGroup) {
+  const ResolvedBind& r = resolve_bind(bindGroup);
+  for (int i = 0; i < 8; ++i) {
+    if (S.tex[i] == r.tex[i] && S.samp[i] == r.samp[i]) {
+      ++g_stats.texBindsSkipped;
+      continue;
+    }
+    ++g_stats.texBinds;
+    if (S.tex[i] != r.tex[i]) {
+      if (S.unit != 2 + i) {
+        S.unit = 2 + i;
+        gl.ActiveTexture(kTexture0 + 2 + static_cast<GLenum>(i));
+      }
+      gl.BindTexture(kTexture2D, r.tex[i]);
+      S.tex[i] = r.tex[i];
+    }
+    if (S.samp[i] != r.samp[i]) {
+      gl.BindSampler(static_cast<GLuint>(2 + i), r.samp[i]);
+      S.samp[i] = r.samp[i];
+    }
+  }
+}
+
+// Pipelines ya resueltos (la caché de resolución de galaxy-vita): programa y estado GL calculados una vez por
+// pipeline de aurora, no en cada dibujo (antes: copiar el descriptor con candado, hash y búsqueda del programa).
+struct ResolvedPipe {
+  const Program* prog = nullptr;
+  StateBlock state{};
+  bool skipLine = false, noWrite = false;
+};
+std::unordered_map<uint64_t, ResolvedPipe> g_resolvedPipes;
+
+const ResolvedPipe* resolve_pipe(uint64_t ref) {
+  auto it = g_resolvedPipes.find(ref);
+  if (it != g_resolvedPipes.end()) return &it->second;
+  PipelineDesc pc;
+  if (!find_pipeline(ref, pc)) return nullptr;  // todavía sin registrar: no se guarda
+  ResolvedPipe r;
+  r.skipLine = pc.lineMode != 0 || pc.cullMode == GX_CULL_ALL;
+  r.state = make_state(pc, UINT32_MAX);
+  // Un dibujo que no escribe color, alfa ni profundidad no cambia nada en el EFB (GX no tiene estencil).
+  r.noWrite = !r.state.colorMask && !r.state.alphaMask && !r.state.depthMask;
+  if (!r.skipLine && !r.noWrite) {
+    r.prog = &program_for(pc);
+    S.program = ~0u;  // compilar o cargar un programa lo deja en uso (glUseProgram en setup_program)
+  }
+  return &g_resolvedPipes.emplace(ref, r).first->second;
+}
+
+// El estado del pipeline con el alfa constante del dibujo (GXSetDstAlpha), igual que make_state(pc, dstAlpha).
+StateBlock with_dst_alpha(StateBlock st, uint32_t dstAlpha) {
+  if (dstAlpha == UINT32_MAX) return st;
+  if (!st.blend) {
+    st.cs = kOne;
+    st.cd = kZero;
+    st.ceq = kFuncAdd;
+  }
+  st.as = kConstantAlpha;
+  st.ad = kZero;
+  st.aeq = kFuncAdd;
+  st.blend = 1;
+  st.dstAlpha = dstAlpha;
+  return st;
 }
 
 bool init_gl() {
@@ -1516,6 +1865,7 @@ void run_copy(const Item& it) {
     if (ct.tex != 0) gl.DeleteTextures(1, &ct.tex);
     gl.ActiveTexture(kTexture0 + 10);
     gl.GenTextures(1, &ct.tex);
+    ++g_texGen;
     gl.BindTexture(kTexture2D, ct.tex);
     gl.TexStorage2D(kTexture2D, 1, kRgba8, static_cast<GLsizei>(c.texW), static_cast<GLsizei>(c.texH));
     gl.GenFramebuffers(1, &ct.fbo);
@@ -1580,7 +1930,13 @@ bool has_clear(uint64_t ref) noexcept {
 
 void register_bind_group(uint64_t ref, const BindDesc& desc) noexcept {
   std::lock_guard lock(g_pipelineMutex);
-  g_bindGroups[ref] = desc;  // el mismo hash es el mismo contenido; se reemplaza por si cambió la textura
+  // aurora lo llama en cada dibujo: solo un grupo nuevo o cambiado invalida las texturas ya resueltas del motor.
+  auto [it, added] = g_bindGroups.try_emplace(ref, desc);
+  if (!added) {
+    if (std::memcmp(&it->second, &desc, sizeof(desc)) == 0) return;
+    it->second = desc;  // el mismo hash es el mismo contenido; se reemplaza por si cambió la textura
+    g_bindGen.fetch_add(1, std::memory_order_release);
+  }
 }
 bool has_bind_group(uint64_t ref) noexcept {
   std::lock_guard lock(g_pipelineMutex);
@@ -1944,6 +2300,48 @@ bool draw_frame(int screenWidth, int screenHeight) noexcept {
 }
 
 namespace {
+// Memoria de la consola acotada a propósito, como la memoria de video en galaxy-vita (que no deja crecer los búferes
+// del EFB con poca memoria libre y suelta lo que no se usa): con menos de CHOYA_GX_MEMORIA_MIN MB disponibles (96 por
+// omisión) el motor suelta los cuadros que guarda para reusar sus búferes y le devuelve al sistema la memoria libre
+// del heap (malloc_trim). En la RG35XX H (1 GB, sin swap) eso es lo que separa un tirón de que el sistema mate al juego.
+void low_memory_relief() {
+  static const long minMb = [] {
+    const char* e = std::getenv("CHOYA_GX_MEMORIA_MIN");
+    return e != nullptr ? std::atol(e) : 96L;
+  }();
+  if (minMb <= 0) return;
+  long availKb = -1;
+  if (FILE* m = std::fopen("/proc/meminfo", "r")) {
+    char line[128];
+    while (std::fgets(line, sizeof(line), m)) {
+      if (std::sscanf(line, "MemAvailable: %ld", &availKb) == 1) break;
+    }
+    std::fclose(m);
+  }
+  if (availKb < 0 || availKb / 1024 >= minMb) return;
+  size_t pooled = 0;
+  {
+    std::lock_guard lock(g_frameMutex);
+    pooled = g_pool.size();
+    g_pool.clear();
+    g_pool.shrink_to_fit();
+  }
+  g_resolvedBinds.clear();  // se rehacen solas
+#if defined(__GLIBC__)
+  malloc_trim(0);
+#endif
+  long afterKb = -1;
+  if (FILE* m = std::fopen("/proc/meminfo", "r")) {
+    char line[128];
+    while (std::fgets(line, sizeof(line), m)) {
+      if (std::sscanf(line, "MemAvailable: %ld", &afterKb) == 1) break;
+    }
+    std::fclose(m);
+  }
+  log_line("motor: memoria baja (%ld MB disponibles, mínimo %ld): solté %zu cuadros guardados y el heap libre; quedan "
+           "%ld MB", availKb / 1024, minMb, pooled, afterKb / 1024);
+}
+
 bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present) {
   present = present && f.present;
   const auto cpuStart = std::chrono::steady_clock::now();
@@ -1959,6 +2357,8 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
   process_textures();
   uint64_t lastBindGroup = ~0ull;
+  uint64_t lastPipeRef = ~0ull;
+  const ResolvedPipe* lastPipe = nullptr;
   g_stats.bytesVerts += f.verts.size();
   g_stats.bytesUniforms += f.uniforms.size();
   g_stats.bytesIndices += f.indices.size();
@@ -2030,6 +2430,8 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   gl.ActiveTexture(kTexture0 + 1);
   gl.BindTexture(kTexture2D, res.atex.id);
   uint32_t drawIndex = 0;
+  shadow_invalidate();  // las subidas y la textura de vértices cambiaron estado por fuera
+  S.unit = 1;
 
 
   // Coordenadas del pase (origen arriba a la izquierda) -> GL (origen abajo) dentro del EFB.
@@ -2051,6 +2453,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     if (passOpen && passResolves && present) {
       present_efb(passCopy, screenWidth, screenHeight);
       presented = true;
+      shadow_invalidate();
     }
   };
   for (const Item& it : f.items) {
@@ -2067,47 +2470,48 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       viewportRect[1] = g_efb.height - passH;
       viewportRect[2] = passW;
       viewportRect[3] = passH;
-      gl.Viewport(viewportRect[0], viewportRect[1], viewportRect[2], viewportRect[3]);
-      gl.Disable(kScissorTest);
+      set_viewport(viewportRect);
+      set_enable(kScissorTest, S.scissorOn, false);
       GLbitfield bits = 0;
       if (it.pass.clearColor) {
-        gl.ColorMask(1, 1, 1, 1);
+        set_color_mask(true, true);
         gl.ClearColor(it.pass.rgba[0], it.pass.rgba[1], it.pass.rgba[2], it.pass.rgba[3]);
         bits |= kColorBufferBit;
       }
       if (it.pass.clearDepth) {
-        gl.DepthMask(1);
+        set_depth_mask(true);
         gl.ClearDepthf(it.pass.depth);
         bits |= kDepthBufferBit;
       }
       if (bits) gl.Clear(bits);
-      gl.Enable(kScissorTest);
+      set_enable(kScissorTest, S.scissorOn, true);
       scissorRect[0] = 0;
       scissorRect[1] = g_efb.height - passH;
       scissorRect[2] = passW;
       scissorRect[3] = passH;
-      gl.Scissor(scissorRect[0], scissorRect[1], scissorRect[2], scissorRect[3]);
+      set_scissor(scissorRect);
     } break;
     case Op::Viewport: {
       GLint r[4];
       to_gl_rect(it.viewport.left, it.viewport.top, it.viewport.width, it.viewport.height, r);
-      gl.Viewport(r[0], r[1], r[2], r[3]);
+      set_viewport(r);
       std::memcpy(viewportRect, r, sizeof(r));
       const float minDepth = g_reversedZ ? 1.0f - it.viewport.zfar : it.viewport.znear;
       const float maxDepth = g_reversedZ ? 1.0f - it.viewport.znear : it.viewport.zfar;
-      gl.DepthRangef(minDepth, maxDepth);
+      set_depth_range(minDepth, maxDepth);
     } break;
     case Op::Scissor: {
       to_gl_rect(static_cast<float>(it.scissor.x), static_cast<float>(it.scissor.y),
                      static_cast<float>(it.scissor.width), static_cast<float>(it.scissor.height), scissorRect);
-      gl.Scissor(scissorRect[0], scissorRect[1], std::max(0, scissorRect[2]), std::max(0, scissorRect[3]));
+      set_scissor(scissorRect);
     } break;
     case Op::Copy: {
       run_copy(it);
-      gl.Viewport(viewportRect[0], viewportRect[1], viewportRect[2], viewportRect[3]);
-      gl.Scissor(scissorRect[0], scissorRect[1], std::max(0, scissorRect[2]), std::max(0, scissorRect[3]));
+      shadow_invalidate();  // la copia usó su propio programa, estado y unidades 10/11
+      set_viewport(viewportRect);
+      set_enable(kScissorTest, S.scissorOn, true);
+      set_scissor(scissorRect);
       gl.BindVertexArray(g_vao);
-      gl.ActiveTexture(kTexture0);
       lastBindGroup = ~0ull;  // las texturas de copia pudieron rehacerse
     } break;
     case Op::Clear: {
@@ -2121,26 +2525,38 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
         to_gl_rect(static_cast<float>(it.clear.scissor.x), static_cast<float>(it.clear.scissor.y),
                        static_cast<float>(it.clear.scissor.width), static_cast<float>(it.clear.scissor.height), r);
       }
-      gl.Scissor(r[0], r[1], std::max(0, r[2]), std::max(0, r[3]));
-      gl.ColorMask(cc.color, cc.color, cc.color, cc.alpha);
-      gl.DepthMask(cc.depth ? 1 : 0);
+      set_scissor(r);
+      set_color_mask(cc.color != 0, cc.alpha != 0);
+      set_depth_mask(cc.depth != 0);
       gl.ClearColor(it.clear.rgba[0], it.clear.rgba[1], it.clear.rgba[2], it.clear.rgba[3]);
       gl.ClearDepthf(it.clear.depth);
       GLbitfield bits = 0;
       if (cc.color || cc.alpha) bits |= kColorBufferBit;
       if (cc.depth) bits |= kDepthBufferBit;
       if (bits) gl.Clear(bits);
-      gl.Scissor(scissorRect[0], scissorRect[1], std::max(0, scissorRect[2]), std::max(0, scissorRect[3]));
+      set_scissor(scissorRect);
       ++g_stats.clears;
     } break;
     case Op::Draw: {
-      PipelineDesc pc;
-      if (!find_pipeline(it.draw.pipeline, pc)) {
+      if (it.draw.pipeline != lastPipeRef) {
+        lastPipe = resolve_pipe(it.draw.pipeline);
+        lastPipeRef = lastPipe != nullptr ? it.draw.pipeline : ~0ull;
+      }
+      const ResolvedPipe* rp = lastPipe;
+      if (rp == nullptr) {
         ++g_stats.skippedConfig;
         break;
       }
-      if (pc.lineMode != 0 || it.draw.instanceCount != 1 || pc.cullMode == GX_CULL_ALL) {
+      if (rp->skipLine || it.draw.instanceCount != 1) {
         ++g_stats.skippedLine;
+        break;
+      }
+      if (rp->noWrite) {
+        ++g_stats.rejectedNoWrite;
+        break;
+      }
+      if (scissorRect[2] <= 0 || scissorRect[3] <= 0) {  // recorte vacío: no puede pintar ni un píxel
+        ++g_stats.rejectedScissor;
         break;
       }
       if (it.draw.uniformOffset % static_cast<uint32_t>(g_uboAlign) != 0 ||
@@ -2148,26 +2564,26 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
         ++g_stats.skippedAlign;
         break;
       }
-      const Program& prog = program_for(pc);
+      const Program& prog = *rp->prog;
       if (!prog.ok) {
         ++g_stats.skippedProgram;
         break;
       }
-      gl.UseProgram(prog.id);
-      gl.BindBufferRange(kUniformBuffer, 0, ubo, static_cast<GLintptr>(it.draw.uniformOffset), 16384);
+      set_program(prog.id);
+      set_ubo(ubo, static_cast<GLintptr>(it.draw.uniformOffset));
       if (it.draw.bindGroup != lastBindGroup) {
         bind_textures(it.draw.bindGroup);
         lastBindGroup = it.draw.bindGroup;
       }
-      apply_state(pc, it.draw.dstAlpha);
+      apply_state(with_dst_alpha(rp->state, it.draw.dstAlpha));
       if (debug_colors()) {
         static const float kPalette[12][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 1, 0}, {1, 0, 1}, {0, 1, 1},
                                               {1, .5f, 0}, {.5f, 0, 1}, {0, .6f, .3f}, {.6f, .3f, 0}, {.3f, .3f, .3f},
                                               {1, 1, 1}};
         const float* c = kPalette[drawIndex % 12];
         gl.Uniform4f(prog.debugLoc, c[0], c[1], c[2], 1.f);
-        gl.Disable(kBlend);
-        gl.ColorMask(1, 1, 1, 1);
+        set_enable(kBlend, S.blendOn, false);
+        set_color_mask(true, true);
       }
       ++drawIndex;
       gl.DrawElements(kTriangles, static_cast<GLsizei>(it.draw.indexCount), kUnsignedShort,
@@ -2212,6 +2628,20 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
          g_stats.passes / n, static_cast<unsigned long long>(g_stats.skippedConfig),
          static_cast<unsigned long long>(g_stats.skippedLine), static_cast<unsigned long long>(g_stats.skippedAlign),
          static_cast<unsigned long long>(g_stats.skippedProgram), g_programs.size(), gl.GetError());
+    {
+      const double st = static_cast<double>(g_stats.stateSkipped + g_stats.stateApplied);
+      const double tb = static_cast<double>(g_stats.texBindsSkipped + g_stats.texBinds);
+      log_line("motor: estado GL repetido sin llamar al driver %.0f %%, texturas ya enlazadas %.0f %%; dibujos que no "
+               "pintan %.1f por cuadro (sin escritura %llu, recorte vacío %llu); programas nuevos %llu compilados "
+               "(%.0f ms), %llu del caché de disco",
+               st > 0 ? 100.0 * static_cast<double>(g_stats.stateSkipped) / st : 0.0,
+               tb > 0 ? 100.0 * static_cast<double>(g_stats.texBindsSkipped) / tb : 0.0,
+               static_cast<double>(g_stats.rejectedNoWrite + g_stats.rejectedScissor) / n,
+               static_cast<unsigned long long>(g_stats.rejectedNoWrite),
+               static_cast<unsigned long long>(g_stats.rejectedScissor),
+               static_cast<unsigned long long>(g_stats.progCompiled), g_stats.compileMs,
+               static_cast<unsigned long long>(g_stats.progCached));
+    }
     // Memoria: el proceso y lo que guarda el motor (para ver si algo crece sin parar).
     long rssPages = 0;
     if (FILE* statm = std::fopen("/proc/self/statm", "r")) {
@@ -2252,6 +2682,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
              "volcados %zu (%zu MB)",
              rssPages * 4 / 1024, rssAnon / 1024, rssFile / 1024, rssShmem / 1024, g_texBytes >> 20, groups,
              bindGroups, pipelines, pending, pendingBytes / 1024, kept, keptBytes >> 20);
+    low_memory_relief();
     g_stats = Stats{.frames = g_stats.frames};
   }
   return presented;
