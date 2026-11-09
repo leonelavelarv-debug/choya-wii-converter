@@ -290,7 +290,7 @@ void capture_discard() noexcept { core::capture_discard(); }
 
 } // namespace aurora::choya
 
-// Volcado a pedido (Select + R1 en modo diagnóstico): el siguiente cuadro dibujado va a cuadro-manual-<n>.bin.
+// Volcado a pedido (MENU + R1 en modo diagnóstico): el siguiente cuadro dibujado va a cuadro-manual-<n>.bin.
 static std::atomic<bool> g_choyaDumpRequest{false};
 extern "C" void choya_gx_request_dump() { g_choyaDumpRequest.store(true); }
 

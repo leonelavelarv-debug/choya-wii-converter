@@ -1,7 +1,7 @@
 #!/bin/bash
 # Choya Wii Converter - Wii Sports recompilado (WiiCompiled/BrawlRecompiled) con el motor GLES de Choya.
-# Para jugar. Select + Start sostenidos 1.5 s cierran el juego.
-# Modo diagnóstico (3 min, perfil, volcados de cuadros; Select + R1 vuelca el cuadro que se ve): "Wii Sports (Choya) - diagnostico.sh" o CHOYA_MODO=diagnostico.
+# Para jugar. Salir: MENU + START (KNULLI, muOS) o SELECT + START (ArkOS, dArkOS). Controles como en Nebula.
+# Modo diagnóstico (3 min, perfil, volcados de cuadros; MENU + R1 vuelca el cuadro que se ve): "Wii Sports (Choya) - diagnostico.sh" o CHOYA_MODO=diagnostico.
 # Deja run.log y resumen.txt en la carpeta wiisports-choya.
 
 DIR="$(cd "$(dirname "$0")" && pwd)/wiisports-choya"
@@ -39,6 +39,18 @@ if [ -n "$controlfolder" ]; then
   get_controls >/dev/null 2>&1
   [ -n "$sdl_controllerconfig" ] && export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
 fi
+# El perfil de controles según el firmware, igual que en Nebula (Super Mario Galaxy):
+#   KNULLI y muOS (Anbernic RG con H700): salir con MENU + START; ArkOS y dArkOS: SELECT + START; el resto: los dos.
+#   CHOYA_FACE_LAYOUT=positions|labels  labels si en tu firmware A y B salen al revés (A debe ser el de la derecha)
+#   CHOYA_QUIT_COMBO=menu|select|both   fuerza la combinación para salir
+cfw=$(printf '%s' "${CFW_NAME:-}" | tr '[:upper:]' '[:lower:]')
+case "$cfw" in
+  *knulli*|*muos*) quit_combo=menu ;;
+  *arkos*|*darkos*) quit_combo=select ;;
+  *) quit_combo=both ;;
+esac
+export CHOYA_QUIT_COMBO="${CHOYA_QUIT_COMBO:-$quit_combo}"
+export CHOYA_FACE_LAYOUT="${CHOYA_FACE_LAYOUT:-positions}"
 # Se guarda el mapeo completo; si otro día no aparece PortMaster se usa el último bueno.
 if [ -n "$SDL_GAMECONTROLLERCONFIG" ]; then
   printf "%s\n" "$SDL_GAMECONTROLLERCONFIG" > "$DIR/mapeo-sdl.txt"
@@ -81,7 +93,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "juego: $GAME"
   echo "PortMaster: ${controlfolder:-no encontrado}  dispositivo: ${DEVICE_NAME:-?}  CFW: ${CFW_NAME:-?}"
   echo "mapeo del mando: ${SDL_GAMECONTROLLERCONFIG:-ninguno}" | cut -c1-200
-  echo "gptokeyb: ${GPTOKEYB:-no}"
+  echo "gptokeyb: ${GPTOKEYB:-no}  salir: $CHOYA_QUIT_COMBO + START  botones: $CHOYA_FACE_LAYOUT"
   echo "dispositivos de entrada: $(grep -h "^N: Name=" /proc/bus/input/devices 2>/dev/null | cut -d= -f2- | tr "\n" " ")"
 } > "$DIR/cpu.txt" 2>&1
 
@@ -98,7 +110,7 @@ escribir_resumen() {
     echo "--- cuadros por segundo"
     grep -E "\[vi\] fps" "$DIR/run.log" | tail -15
     echo "--- mandos"
-    grep -hE "evdev|mandos|gamepad|joystick|Select \+|SDL ve|volcado" "$DIR/choya-gles.txt" "$DIR/run.log" 2>/dev/null | grep -v "^\[choya-gles\]" | head -60
+    grep -hE "mandos|gamepad|joystick|\[input\]|volcado" "$DIR/choya-gles.txt" "$DIR/run.log" 2>/dev/null | grep -v "^\[choya-gles\]" | head -60
     echo "--- errores"
     grep -iE "fatal|error|abort|AccessViolation|choya\]|not found|cannot open" "$DIR/run.log" | head -20
     echo "--- final del log"
@@ -106,17 +118,20 @@ escribir_resumen() {
   } > "$DIR/resumen.txt" 2>&1
 }
 
-# Salida de PortMaster (gptokeyb): Select + Start cierra el juego (en los dos modos).
+# Salir: la combinación del firmware con Start (el juego la atiende y se cierra limpio; gptokeyb mata con la misma
+# si no contesta): MENU (HOTKEY=guide) en KNULLI y muOS; SELECT (el de gptokeyb sin HOTKEY) en ArkOS y el resto.
 iniciar_gptokeyb() {
   GPID=""
+  if [ "$CHOYA_QUIT_COMBO" = menu ]; then export HOTKEY=guide; else unset HOTKEY; fi
   if [ -n "$GPTOKEYB" ]; then
     $GPTOKEYB "WiiCompiled" > "$DIR/gptokeyb.log" 2>&1 &
     GPID=$!
   fi
+  command -v pm_platform_helper >/dev/null 2>&1 && pm_platform_helper "$DIR/WiiCompiled" >/dev/null 2>&1
 }
 parar_gptokeyb() {
   [ -n "$GPID" ] && kill $GPID 2>/dev/null
-  pkill -f gptokeyb 2>/dev/null
+  if command -v pm_finish >/dev/null 2>&1; then pm_finish >/dev/null 2>&1; else pkill -f gptokeyb 2>/dev/null; fi
 }
 # Resumen cada 10 s mientras corre, por si el juego se cierra con la tecla de salida del sistema.
 esperar_juego() {
@@ -130,7 +145,7 @@ if [ "$MODO" = "diagnostico" ]; then
   # Perfil: a los 20 s empieza a tomar muestras durante 35 s y deja perfil.txt (en la PC: choya perfil perfil.txt).
   export CHOYA_PERFIL=20,35
   # Vuelca estos cuadros del motor a cuadro-<n>.bin para revisarlos en la PC (aviso ~10 s, título ~40 s y luego
-  # cada ~40 s, por si Select + R1 no responde). Select + R1 vuelca además el cuadro que se ve.
+  # cada ~40 s, por si MENU + R1 no responde). MENU + R1 vuelca además el cuadro que se ve.
   export CHOYA_GX_VOLCADO=600,2400,4000,5600,7200,8800
   rm -f "$DIR"/cuadro-*.bin "$DIR/perfil.txt"
   # -k 5: si a los 3 min no se cierra con la señal normal, se mata.

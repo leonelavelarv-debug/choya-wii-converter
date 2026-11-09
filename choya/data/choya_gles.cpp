@@ -22,12 +22,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <dirent.h>
 #include <linux/fb.h>
-#include <linux/input.h>
-#include <poll.h>
-#include <cerrno>
-#include <vector>
 #include <string>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -324,117 +319,25 @@ void RenderThread() {
 }
 } // namespace
 
-// Controles en la consola: Select + Start sostenidos 1.5 s cierran el juego (no hay otra forma de salir), y a
-// los 2 s se anota en choya-gles.txt qué mandos ve SDL (para revisar el mapeo de botones).
+// Los controles del juego son los de Nebula (virtual_remote.cpp, parche de Choya; MENU + Start sale). Aquí solo se
+// anota en choya-gles.txt qué mandos ve SDL, y MENU + R1 pide un volcado del cuadro en modo diagnóstico.
 namespace {
-// Lee los botones de la consola directo del kernel (/dev/input/eventN), sin SDL: anota qué dispositivos hay, si
-// otro programa los tiene agarrados (EVIOCGRAB) y los primeros botones que se aprietan. Select + Start sostenidos
-// 1.5 s cierran el juego aunque SDL no vea el mando.
-void EvdevThread() {
-    std::this_thread::sleep_for(std::chrono::seconds(3));  // que choya-gles.txt ya esté abierto
-    std::vector<pollfd> fds;
-    for (int n = 0; n < 32; ++n) {
-        char path[64];
-        std::snprintf(path, sizeof(path), "/dev/input/event%d", n);
-        const int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd < 0) continue;
-        char name[128] = "?";
-        ioctl(fd, EVIOCGNAME(sizeof(name)), name);
-        const char* grab = "libre";
-        if (ioctl(fd, EVIOCGRAB, 1) == 0) {
-            ioctl(fd, EVIOCGRAB, 0);
-        } else if (errno == EBUSY) {
-            grab = "AGARRADO por otro programa (SDL no recibe sus botones)";
-        } else {
-            grab = "no se pudo revisar";
-        }
-        char line[320];
-        std::snprintf(line, sizeof(line), "evdev: %s '%s' %s", path, name, grab);
-        Log("%s", line);
-        fds.push_back({fd, POLLIN, 0});
-    }
-    if (fds.empty()) {
-        Log("evdev: no se pudo abrir ningun /dev/input/event (%s)", std::strerror(errno));
-        return;
-    }
-    int logged = 0;
-    bool select = false, start = false;
-    std::chrono::steady_clock::time_point since{};
-    for (;;) {
-        if (poll(fds.data(), fds.size(), 100) < 0 && errno != EINTR) return;
-        for (pollfd& p : fds) {
-            if (!(p.revents & POLLIN)) continue;
-            input_event ev[32];
-            const ssize_t r = read(p.fd, ev, sizeof(ev));
-            for (ssize_t i = 0; r > 0 && i < r / static_cast<ssize_t>(sizeof(input_event)); ++i) {
-                if (ev[i].type != EV_KEY && ev[i].type != EV_ABS) continue;
-                if (logged < 40 && (ev[i].type == EV_KEY || (ev[i].code >= ABS_HAT0X && ev[i].code <= ABS_HAT0Y))) {
-                    ++logged;
-                    char line[96];
-                    std::snprintf(line, sizeof(line), "evdev: fd %d %s %d = %d", p.fd, ev[i].type == EV_KEY ? "boton" : "eje",
-                                  ev[i].code, ev[i].value);
-                    Log("%s", line);
-                }
-                // Select/Start: códigos estándar (314/315) o los que manda la RG35XX H en KNULLI (310/311).
-                if (ev[i].type == EV_KEY && (ev[i].code == BTN_SELECT || ev[i].code == BTN_TL)) select = ev[i].value != 0;
-                if (ev[i].type == EV_KEY && (ev[i].code == BTN_START || ev[i].code == BTN_TR)) start = ev[i].value != 0;
-            }
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (!(select && start)) {
-            since = {};
-        } else if (since == std::chrono::steady_clock::time_point{}) {
-            since = now;
-        } else if (now - since > std::chrono::milliseconds(1500)) {
-            Log("Select + Start (evdev): cerrando el juego");
-            std::fflush(stderr);
-            _exit(0);
-        }
-    }
-}
-
 void CheckGamepads() {
     static uint64_t frames = 0;
-    static int held = 0;
     static int lastCount = -1;
+    static int dumpHeld = 0;
     ++frames;
-    if (frames == 1) std::thread(EvdevThread).detach();
     int count = 0;
     SDL_JoystickID* ids = SDL_GetGamepads(&count);
-    bool combo = false, dump = false;
-    static int dumpHeld = 0;
+    bool dump = false;
     for (int i = 0; ids && i < count; ++i) {
         SDL_Gamepad* pad = SDL_GetGamepadFromID(ids[i]);
-        if (pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_BACK) && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_START)) {
-            combo = true;
-        }
-        if (pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_BACK) &&
+        if (pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_GUIDE) &&
             SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) {
             dump = true;
         }
     }
-    {  // la primera vez que SDL ve Select, Start o R1 (para revisar el mapeo si una combinación no responde)
-        static bool seen[3] = {};
-        static const SDL_GamepadButton btn[3] = {SDL_GAMEPAD_BUTTON_BACK, SDL_GAMEPAD_BUTTON_START,
-                                                 SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER};
-        static const char* names[3] = {"Select (back)", "Start", "R1 (rightshoulder)"};
-        for (int i = 0; ids && i < count; ++i) {
-            SDL_Gamepad* pad = SDL_GetGamepadFromID(ids[i]);
-            for (int b = 0; pad && b < 3; ++b) {
-                if (!seen[b] && SDL_GetGamepadButton(pad, btn[b])) {
-                    seen[b] = true;
-                    Log("SDL ve %s", names[b]);
-                }
-            }
-        }
-    }
-    // Select + R1 sostenidos 1 s: vuelca el cuadro que se ve (cuadro-manual-<n>.bin; solo en modo diagnóstico).
-    dumpHeld = dump ? dumpHeld + 1 : 0;
-    if (dumpHeld == 60) {
-        Log("Select + R1: volcado del cuadro pedido");
-        choya_gx_request_dump();
-    }
-    if (frames == 1 || frames == 120 || frames == 1200 || count != lastCount) {
+    if (frames == 120 || frames == 1200 || (frames > 120 && count != lastCount)) {
         lastCount = count;
         int njoy = 0;
         SDL_JoystickID* joys = SDL_GetJoysticks(&njoy);
@@ -449,12 +352,11 @@ void CheckGamepads() {
         SDL_free(joys);
     }
     SDL_free(ids);
-    held = combo ? held + 1 : 0;
-    if (held == 90) {
-        Log("Select + Start: cerrando el juego");
-        if (g.log) std::fflush(g.log);
-        std::fflush(stderr);
-        _exit(0);
+    // MENU + R1 sostenidos 1 s: vuelca el cuadro que se ve (cuadro-manual-<n>.bin; solo en modo diagnóstico).
+    dumpHeld = dump ? dumpHeld + 1 : 0;
+    if (dumpHeld == 60) {
+        Log("MENU + R1: volcado del cuadro pedido");
+        choya_gx_request_dump();
     }
 }
 } // namespace

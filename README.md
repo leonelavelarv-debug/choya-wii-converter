@@ -179,7 +179,7 @@ El runtime de WiiCompiled tiene ~400 funciones nativas (gráficos, sistema, disc
 10. Renombra las llamadas a funciones de otros juegos que Wii Sports no tiene (`choya_ausente_XXXXXXXX`) y las define en `src/choya_ausentes.cpp`: así enlaza, y si alguna llegara a llamarse el programa se detiene diciendo cuál.
 11. Reactiva las funciones nativas que WiiCompiled apagó solo porque Brawl, SPM o NSMBW no las tenían (`#if 0  // BRAWL: no matching function...`) cuando Wii Sports sí las tiene, como `OSInitFont` o las de NAND y caché.
 12. Agrega funciones nativas propias para lo que Wii Sports usa y los juegos de WiiCompiled no (`src/choya_wiisports_hle.cpp`); la primera es `WPADSetSensorBarPower`, que en la consola enciende la barra de sensores por un registro de hardware.
-13. Hace unos pocos cambios de código revisados a mano (cada uno debe encontrar su texto exacto o se anota sin tocar nada): botón **B** en el teclado (S o B) y en el mando (gatillo derecho), porque Wii Sports lo pide desde la pantalla de título; la pantalla de inicio dice Wii Sports y conserva el crédito de BrawlRecompiled y WiiCompiled; y el mensaje de `OSSetPowerCallback`, que Wii Sports llama en cada cuadro, solo se anota cuando cambia.
+13. Hace unos pocos cambios de código revisados a mano (cada uno debe encontrar su texto exacto o se anota sin tocar nada): botón **B** en el teclado (S o B), porque Wii Sports lo pide desde la pantalla de título; el teclado y los mandos hacen de Wii Remote 1 (BrawlRecompiled los dejaba solo como mandos de GameCube); los controles del mando al estilo de Nebula (ver abajo); la pantalla de inicio dice Wii Sports y conserva el crédito de BrawlRecompiled y WiiCompiled; y el mensaje de `OSSetPowerCallback`, que Wii Sports llama en cada cuadro, solo se anota cuando cambia.
 14. Escribe `projects\wiisports\retarget.md` con todo lo que cambió y lo que no pudo resolver.
 
 Ante la duda no cambia nada: una dirección sin pista segura queda igual y aparece en la lista "Sin resolver" para revisarla a mano.
@@ -200,7 +200,9 @@ bash scripts/build-wiisports-wsl.sh /mnt/c/wii/RSPE01/DATA/sys/main.dol ~/BrawlR
 Con `RAPIDO=1` delante no vuelve a traducir: solo rehace el runtime y enlaza. Todo queda en `~/choya-build.log` (y una copia en `C:\Users\Public\choya-build.log`); al final imprime cuántos errores hubo y en qué archivos.
 
 
-Controles con teclado: **A** = A, **S** o **B** = B, **Z**/Shift = 1, **X**/Espacio = 2, flechas = cruz, Enter/Esc = +, guion/Tab = −, **C**/Ctrl = agitar. Con mando: el gatillo derecho es B.
+Controles con teclado: **A** = A, **S** o **B** = B, **Z**/Shift = 1, **X**/Espacio = 2, flechas = cruz, Enter/Esc = +, guion/Tab = −, **C**/Ctrl = agitar.
+
+Controles con mando (los de Nebula, el port de Super Mario Galaxy): el mando de la consola como game controller de SDL con el mapeo de PortMaster y el Wii Remote vertical: **A** = A (derecha), **B** = B (abajo), **X** = 1, **Y** = 2, **R1** = agitar, **Start** = +, **Select**/L1/L2 = −, cruceta o stick izquierdo = cruz. Salir: **MENU + Start** en KNULLI y muOS, **Select + Start** en ArkOS (el juego se cierra limpio; gptokeyb mata con la misma combinación si no contesta). En el lanzador: `CHOYA_FACE_LAYOUT=labels` si A y B salen al revés en tu firmware y `CHOYA_QUIT_COMBO=menu|select|both` para forzar la salida.
 
 Para arrancarlo y ver dónde se detiene:
 

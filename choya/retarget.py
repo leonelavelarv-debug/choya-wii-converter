@@ -766,6 +766,108 @@ def struct_checks(ws: Symbols) -> list[tuple[str, int, int | None, str]]:
 # Cambios de código (no de direcciones) para Wii Sports: (archivo, texto exacto, reemplazo, etiqueta).
 # Cada texto debe aparecer exactamente una vez; si no, se anota y no se toca nada.
 _B_NOTE = "  // choya: botón B, Wii Sports lo pide en casi todos los menús"
+
+# Controles del jugador 1 al estilo de Nebula (leonelavelarv-debug/nebula, platform/knulli/game/host_window_knulli.cpp):
+# el mando de la consola como game controller de SDL con el mapeo de PortMaster, los botones de cara por posición
+# (o por letra si el firmware los nombra así), un perfil que da el lanzador según el firmware y la combinación de
+# salida del firmware con Start, que cierra el juego limpio (gptokeyb mata con la misma si no contesta).
+# Wii Remote vertical, como se juega Wii Sports: A = derecha (A), B = abajo (B), 1 = arriba (X), 2 = izquierda (Y),
+# R1 = agitar, Start = +, Select/L1/L2 = −, cruceta y stick izquierdo = cruceta del Remote.
+_NEBULA_PAD = r"""// choya: controles al estilo de Nebula. CHOYA_FACE_LAYOUT=positions|labels (labels: el firmware nombra A al botón
+// de la derecha); CHOYA_QUIT_COMBO=menu|select|both (KNULLI y muOS: MENU + Start; ArkOS: SELECT + Start).
+struct ChoyaPadProfile {
+    bool labels = false;
+    bool quitMenu = true;
+    bool quitSelect = false;
+};
+const ChoyaPadProfile& ChoyaProfile() {
+    static const ChoyaPadProfile profile = [] {
+        ChoyaPadProfile p;
+        const char* face = std::getenv("CHOYA_FACE_LAYOUT");
+        p.labels = face != nullptr && std::strcmp(face, "labels") == 0;
+        if (const char* quit = std::getenv("CHOYA_QUIT_COMBO")) {
+            p.quitMenu = std::strcmp(quit, "select") != 0;
+            p.quitSelect = std::strcmp(quit, "select") == 0 || std::strcmp(quit, "both") == 0;
+        }
+        RT_LOGF(RT_TAG_CONFIG, "[input] perfil: botones por %s, salir con %s + Start\n", p.labels ? "letra" : "posicion",
+                p.quitMenu && p.quitSelect ? "MENU o SELECT" : (p.quitSelect ? "SELECT" : "MENU"));
+        return p;
+    }();
+    return profile;
+}
+
+Intent GamepadIntent() {
+    Intent intent;
+    const ChoyaPadProfile& profile = ChoyaProfile();
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    for (int i = 0; ids != nullptr && i < count; ++i) {
+        SDL_Gamepad* gamepad = SDL_GetGamepadFromID(ids[i]);
+        if (gamepad == nullptr) gamepad = SDL_OpenGamepad(ids[i]);
+        if (gamepad == nullptr) continue;
+        {  // una vez por mando: cuál es y con qué mapeo
+            static std::vector<SDL_JoystickID> s_seen;
+            if (std::find(s_seen.begin(), s_seen.end(), ids[i]) == s_seen.end()) {
+                s_seen.push_back(ids[i]);
+                char* mapping = SDL_GetGamepadMapping(gamepad);
+                RT_LOGF(RT_TAG_CONFIG, "[input] mando \"%s\" conectado (%s)\n", SDL_GetGamepadName(gamepad),
+                        mapping != nullptr ? mapping : "sin mapeo");
+                if (mapping != nullptr) SDL_free(mapping);
+            }
+        }
+        const WiiRemoteInput::Kind kind = WiiRemoteInput::KindForName(SDL_GetGamepadName(gamepad));
+        if (kind != WiiRemoteInput::Kind::NotWii && kind != WiiRemoteInput::Kind::WiiUPro) {
+            continue;  // un Wii Remote de verdad: el juego lo lee por KPAD
+        }
+        const auto button = [gamepad](SDL_GamepadButton b) { return SDL_GetGamepadButton(gamepad, b); };
+        // Caras por posición (SDL: south abajo, east derecha, west izquierda, north arriba).
+        bool south = button(SDL_GAMEPAD_BUTTON_SOUTH), east = button(SDL_GAMEPAD_BUTTON_EAST);
+        bool west = button(SDL_GAMEPAD_BUTTON_WEST), north = button(SDL_GAMEPAD_BUTTON_NORTH);
+        if (profile.labels) {  // a posiciones: el botón de la derecha es east, el de abajo south
+            std::swap(south, east);
+            std::swap(west, north);
+        }
+        uint32_t bits = 0;
+        if (east) bits |= kWpadA;
+        if (south) bits |= kWpadB;
+        if (north) bits |= kWpadOne;
+        if (west) bits |= kWpadTwo;
+        if (button(SDL_GAMEPAD_BUTTON_START)) bits |= kWpadPlus;
+        const float lt = SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) / 32767.0f;
+        if (button(SDL_GAMEPAD_BUTTON_BACK) || button(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) || lt > 0.5f) bits |= kWpadMinus;
+        // Cruceta del Remote vertical: la cruceta y el stick izquierdo en ocho direcciones.
+        if (button(SDL_GAMEPAD_BUTTON_DPAD_UP)) bits |= kWpadUp;
+        if (button(SDL_GAMEPAD_BUTTON_DPAD_DOWN)) bits |= kWpadDown;
+        if (button(SDL_GAMEPAD_BUTTON_DPAD_LEFT)) bits |= kWpadLeft;
+        if (button(SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) bits |= kWpadRight;
+        const float sx = SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTX) / 32767.0f;
+        const float sy = -SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTY) / 32767.0f;  // +y arriba
+        constexpr float kStickMin = kStickThreshold / 127.0f;
+        if (sx * sx + sy * sy >= kStickMin * kStickMin) {
+            if (std::fabs(sx) >= kDiagonalSlope * std::fabs(sy)) bits |= sx < 0 ? kWpadLeft : kWpadRight;
+            if (std::fabs(sy) >= kDiagonalSlope * std::fabs(sx)) bits |= sy < 0 ? kWpadDown : kWpadUp;
+        }
+        intent.buttons |= bits;
+        intent.shake = intent.shake || button(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER);
+        // La combinación de salida del firmware: MENU (guide; KNULLI, muOS) o SELECT (ArkOS) + Start cierra el juego
+        // limpio, como cerrar la ventana (el gptokeyb del lanzador mata con los mismos botones si esto no contesta).
+        const bool quit = button(SDL_GAMEPAD_BUTTON_START) &&
+                          ((profile.quitMenu && button(SDL_GAMEPAD_BUTTON_GUIDE)) ||
+                           (profile.quitSelect && button(SDL_GAMEPAD_BUTTON_BACK)));
+        static bool s_quitSent = false;
+        if (quit && !s_quitSent) {
+            s_quitSent = true;
+            RT_LOGF(RT_TAG_CONFIG, "[input] %s + Start: salir\n", button(SDL_GAMEPAD_BUTTON_GUIDE) ? "MENU" : "SELECT");
+            SDL_Event ev{};
+            ev.type = SDL_EVENT_QUIT;
+            SDL_PushEvent(&ev);
+        }
+    }
+    SDL_free(ids);
+    return intent;
+}
+
+"""
 EDITS = [
     # Botón B en el teclado (S o B) y en el mando (gatillo derecho). Los juegos de WiiCompiled se juegan con
     # el Wii Remote de lado y no lo usan; Wii Sports pide "A y B" desde la pantalla de título.
@@ -783,10 +885,6 @@ EDITS = [
      "        if (held(kMinus)) intent.buttons |= kWpadMinus;\n"
      "        if (held(kButtonB)) intent.buttons |= kWpadB;" + _B_NOTE + "\n", "botón B en el mando"),
     ("src/virtual_remote.cpp",
-     '    {"rightshoulder,righttrigger", "rightshoulder,righttrigger", "rightshoulder,righttrigger"},',
-     '    {"rightshoulder", "rightshoulder", "rightshoulder"},  // choya: agitar solo con RB (el gatillo es B)',
-     "botón B en el mando"),
-    ("src/virtual_remote.cpp",
      '    {"back,leftshoulder,lefttrigger", "back,touchpad,leftshoulder,lefttrigger", "back,leftshoulder,lefttrigger"},\n};',
      '    {"back,leftshoulder,lefttrigger", "back,touchpad,leftshoulder,lefttrigger", "back,leftshoulder,lefttrigger"},\n'
      '    {"a", "a", "a"},' + _B_NOTE + '\n};', "botón B en el mando"),
@@ -795,11 +893,13 @@ EDITS = [
     ("src/virtual_remote.cpp", "    (void)chan;\n    return false;\n}",
      "    return chan == 0;  // choya: Wii Sports solo lee el Wii Remote; teclado y mandos hacen de Remote 1\n}",
      "mandos como Wii Remote 1"),
-    # Botones con las letras de la RG35XX H: A = A, B = B, X = 1, Y = 2, R1 = agitar, Start = +, Select/L1/L2 = −
-    # (posiciones de SDL: a = abajo (B), b = derecha (A), x = izquierda (Y), y = arriba (X)).
-    ("src/virtual_remote.cpp", '    {"a", "a", "a,b"},\n    {"b,x", "b,x", "x"},\n    {"y", "y", "y"},',
-     '    {"x", "x", "x"},  // choya: 2 = Y (izquierda)\n    {"y", "y", "y"},  // choya: 1 = X (arriba)\n'
-     '    {"b", "b", "b"},  // choya: A = A (derecha)', "botones como en la consola"),
+    # Controles al estilo de Nebula (ver _NEBULA_PAD): reemplazan el mapeo por texto de BrawlRecompiled.
+    ("src/virtual_remote.cpp", "#include <SDL3/SDL_timer.h>\n",
+     "#include <SDL3/SDL_timer.h>\n#include <SDL3/SDL_events.h>  // choya: salir con MENU + Start\n#include <cstring>\n",
+     "controles de Nebula"),
+    ("src/virtual_remote.cpp", "Intent GamepadIntent() {\n",
+     _NEBULA_PAD + "[[maybe_unused]] Intent GamepadIntentBrawl() {  // choya: el de BrawlRecompiled, ya sin uso\n",
+     "controles de Nebula"),
     ("src/virtual_remote.cpp", '"plus", "minus",\n};', '"plus", "minus", "b",' + _B_NOTE + '\n};',
      "botón B en el mando"),
     # Wii Sports registra su función de apagado en cada cuadro: anotarlo solo cuando cambia.
