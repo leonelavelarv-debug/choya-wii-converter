@@ -1061,7 +1061,7 @@ AURORA_EDITS = [
   // choya: copia del cuadro (vértices, uniformes, índices, arreglos y pases) para el motor GLES de Choya.
   // Los lotes partidos a mitad de cuadro (copias del EFB a RAM) todavía no se copian.
   if (choya::enabled()) {
-    if (advanceFrame) {
+    if (true) {  // choya: también los lotes partidos (staging lleno), que se dibujan sin mostrarse
       choya::capture_begin(g_verts.data(), g_verts.size(), g_uniforms.data(), g_uniforms.size(), g_indices.data(),
                            g_indices.size(), g_storage.data(), g_storage.size());
       for (const auto& pass : g_renderPasses) {
@@ -1096,7 +1096,7 @@ AURORA_EDITS = [
                               pass.resolveForceOpaqueAlpha);
         }
       }
-      choya::capture_end();
+      choya::capture_end(advanceFrame);
     } else {
       choya::capture_discard();
     }
@@ -1139,7 +1139,10 @@ def _capture_payloads() -> list[str]:
     """Bloques de copia del cuadro que han insertado las versiones de Choya en common.cpp (actual y anteriores)."""
     edit = next(e for e in AURORA_EDITS if e[3] == "motor de Choya (copia del cuadro)")
     current = edit[2][len(edit[1]):]
-    v0123 = current.replace(
+    v0150 = current.replace(
+        "    if (true) {  // choya: también los lotes partidos (staging lleno), que se dibujan sin mostrarse\n",
+        "    if (advanceFrame) {\n").replace("      choya::capture_end(advanceFrame);\n", "      choya::capture_end();\n")
+    v0123 = v0150.replace(
         "        // Copia del EFB a una textura (GXCopyTex): el motor la hace al terminar el pase.\n"
         "        if (pass.resolveTarget && !displayCopy) {\n"
         "          choya::capture_copy(pass.resolveTarget.get(), pass.resolveRect, pass.resolveFormat,\n"
@@ -1154,8 +1157,8 @@ def _capture_payloads() -> list[str]:
         "                            pass.clearDepthValue, displayCopy);\n",
         "        choya::capture_pass(pass.targetSize.width, pass.targetSize.height, pass.clearColor, pass.clearDepth, rgba,\n"
         "                            pass.clearDepthValue);\n")
-    assert v0120 != v0122 != v0123 != current
-    return [current, v0123, v0122, v0120]
+    assert len({v0120, v0122, v0123, v0150, current}) == 5
+    return [current, v0150, v0123, v0122, v0120]
 
 
 # Lo que versiones anteriores de Choya insertaron en aurora: se quita antes de aplicar los cambios actuales, para

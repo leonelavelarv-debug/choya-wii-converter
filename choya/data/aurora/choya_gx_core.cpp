@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <deque>
 #include <vector>
 
 namespace choya::gx {
@@ -272,9 +273,15 @@ struct Frame {
   std::vector<uint8_t> verts, uniforms, indices, storage;
   std::vector<Item> items;
   bool ready = false;
+  bool present = true;  // false: lote partido a mitad de cuadro (se dibuja en el EFB sin mostrarse)
+  bool keep = false;    // no se puede saltar (copias del EFB o lote partido)
 };
 Frame g_recording;
-Frame g_ready;
+// Cuadros listos para dibujar, en orden. Uno completo sin copias del EFB se puede saltar si llega otro (el motor va
+// atrasado); uno con copias o un lote partido (staging lleno) no: lo que deja en texturas o en el EFB lo usan los
+// siguientes (las caras de los Miis se copian una sola vez).
+std::deque<Frame> g_queue;
+std::vector<Frame> g_pool;  // cuadros ya dibujados, para reusar sus búferes
 Frame g_last;  // el último cuadro dibujado (para volcarlo)
 bool g_recordingActive = false;
 std::mutex g_frameMutex;
@@ -1362,7 +1369,7 @@ void run_copy(const Item& it) {
   ++g_stats.copies;
 }
 
-bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight);
+bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present);
 
 } // namespace
 
@@ -1425,6 +1432,13 @@ static std::atomic<uint64_t> g_captureUs{0};
 void capture_begin(const uint8_t* verts, size_t vertsSize, const uint8_t* uniforms, size_t uniformsSize,
                    const uint8_t* indices, size_t indicesSize, const uint8_t* storage, size_t storageSize) noexcept {
   g_captureStart = std::chrono::steady_clock::now();
+  {
+    std::lock_guard lock(g_frameMutex);
+    if (!g_pool.empty() && g_recording.verts.capacity() == 0) {
+      g_recording = std::move(g_pool.back());
+      g_pool.pop_back();
+    }
+  }
   copy_bytes(g_recording.verts, verts, vertsSize);
   copy_bytes(g_recording.uniforms, uniforms, uniformsSize);
   // Relleno: cada dibujo enlaza 16 KiB de uniformes a partir de su desplazamiento.
@@ -1509,14 +1523,36 @@ void capture_clear(uint64_t pipeline, const float rgba[4], float depth, bool use
   g_recording.items.push_back(it);
 }
 
-void capture_end() noexcept {
+void capture_end(bool present) noexcept {
   if (!g_recordingActive) return;
   g_recordingActive = false;
   g_captureUs += static_cast<uint64_t>(
       std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - g_captureStart).count());
+  g_recording.present = present;
+  g_recording.keep = !present;
+  for (const Item& it : g_recording.items) {
+    if (it.op == Op::Copy) {
+      g_recording.keep = true;
+      break;
+    }
+  }
+  g_recording.ready = true;
   std::lock_guard lock(g_frameMutex);
-  std::swap(g_ready, g_recording);
-  g_ready.ready = true;
+  // Los cuadros completos sin copias que el motor no alcanzó a dibujar los reemplaza este.
+  for (auto it = g_queue.begin(); it != g_queue.end();) {
+    if (!it->keep) {
+      g_pool.push_back(std::move(*it));
+      it = g_queue.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (g_queue.size() >= 32) {  // el motor no avanza: no acumular memoria sin fin
+    g_pool.push_back(std::move(g_queue.front()));
+    g_queue.pop_front();
+  }
+  g_queue.push_back(std::move(g_recording));
+  g_recording = Frame{};
 }
 
 void capture_discard() noexcept { g_recordingActive = false; }
@@ -1665,7 +1701,7 @@ bool load_frame(const char* path) noexcept {
   g_reversedZ = header[2] != 0;
   f.ready = true;
   std::lock_guard lock(g_frameMutex);
-  g_ready = std::move(f);
+  g_queue.push_back(std::move(f));
   return true;
 }
 
@@ -1679,23 +1715,36 @@ bool draw_frame(int screenWidth, int screenHeight) noexcept {
     }
     g_glReady = true;
   }
-  static Frame drawing;
+  // Todos los cuadros pendientes, en orden (el juego puede capturar el siguiente mientras tanto); solo el último se
+  // muestra, los anteriores dejan sus copias del EFB y lo que dibujaron en el EFB.
+  std::deque<Frame> batch;
   {
     std::lock_guard lock(g_frameMutex);
-    if (!g_ready.ready) return false;
-    g_ready.ready = false;
-    std::swap(drawing, g_ready);  // el juego puede capturar el siguiente mientras se dibuja este
+    if (g_queue.empty()) return false;
+    batch.swap(g_queue);
   }
-  const bool drawn = draw_frame_locked(drawing, screenWidth, screenHeight);
+  bool drawn = false;
+  for (size_t i = 0; i < batch.size(); ++i) {
+    drawn = draw_frame_locked(batch[i], screenWidth, screenHeight, i + 1 == batch.size());
+  }
   {
     std::lock_guard lock(g_frameMutex);
-    std::swap(g_last, drawing);
+    for (size_t i = 0; i < batch.size(); ++i) {
+      if (i + 1 == batch.size()) {
+        std::swap(g_last, batch[i]);
+        g_pool.push_back(std::move(batch[i]));  // el g_last anterior
+      } else {
+        g_pool.push_back(std::move(batch[i]));
+      }
+    }
+    while (g_pool.size() > 4) g_pool.pop_back();
   }
   return drawn;
 }
 
 namespace {
-bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
+bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present) {
+  present = present && f.present;
   const auto cpuStart = std::chrono::steady_clock::now();
   // Tamaño del EFB: el pase más grande del cuadro.
   int efbW = 1, efbH = 1;
@@ -1763,7 +1812,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
   bool passResolves = false;
   auto end_pass = [&]() {
     // La copia a pantalla (XFB) es el EFB al terminar el pase que se copia (GXCopyDisp u otra copia).
-    if (passOpen && passResolves) {
+    if (passOpen && passResolves && present) {
       present_efb(passCopy, screenWidth, screenHeight);
       presented = true;
     }
@@ -1892,9 +1941,10 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
     }
   }
   end_pass();
-  if (!presented) {
+  if (!presented && present) {
     // Ningún pase se copió: se muestra cómo quedó el último.
     present_efb(Rect{0, 0, passW, passH}, screenWidth, screenHeight);
+    presented = true;
   }
   gl.BindFramebuffer(kFramebuffer, 0);
   gl.Disable(kScissorTest);
@@ -1919,7 +1969,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
          static_cast<unsigned long long>(g_stats.skippedProgram), g_programs.size(), gl.GetError());
     g_stats = Stats{.frames = g_stats.frames};
   }
-  return true;
+  return presented;
 }
 } // namespace
 } // namespace choya::gx

@@ -240,6 +240,39 @@ int main(int argc, char** argv) {
   const bool copies = ctr == 0x00FF00 && cbl == 0x0000FF && cbr == 0xFFFFFF && gr >= 80 && gr <= 84 && gg == gr;
   if (!copies) std::printf("copias del EFB: %06X %06X %06X gris %06X\n", ctr, cbl, cbr, gray);
   ok = ok && copies;
+
+  // Cuadro 5: el motor va atrasado. Llegan tres cuadros sin dibujarse: uno con una copia del EFB (textura 2x2 a la
+  // textura 600), uno sin copias (se puede saltar) y un lote partido seguido del cuadro final que dibuja la 600. La
+  // copia no se debe perder, y el lote partido deja en el EFB el fondo verde que el final no borra.
+  gx::BindDesc b6{};
+  b6.tex[0] = 600;
+  b6.samp[0] = bd.samp[0];
+  gx::register_bind_group(102, b6);
+  gx::capture_begin(v4.data(), v4.size(), u4.data(), u4.size(), (const uint8_t*)i4.data(), 12, nullptr, 0);
+  gx::capture_pass(640, 480, true, true, black, 0.f, false, gx::Rect{0, 0, 0, 0});
+  gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+  gx::capture_scissor(gx::Rect{0, 0, 640, 480});
+  gx::capture_draw(4, 0, 6, 1, 0, UINT32_MAX, 99);
+  gx::capture_copy(600, gx::Rect{0, 0, 640, 480}, 32, 32, 0x6, false);
+  gx::capture_end();
+  gx::capture_begin(v4.data(), v4.size(), u4.data(), u4.size(), (const uint8_t*)i4.data(), 12, nullptr, 0);
+  gx::capture_pass(640, 480, true, true, black, 0.f, true, gx::Rect{0, 0, 640, 480});
+  gx::capture_end();
+  const float green[4] = {0, 1, 0, 1};
+  gx::capture_begin(v5.data(), v5.size(), u4.data(), u4.size(), (const uint8_t*)i5.data(), i5.size() * 2, nullptr, 0);
+  gx::capture_pass(640, 480, true, true, green, 0.f, false, gx::Rect{0, 0, 0, 0});
+  gx::capture_end(false);
+  gx::capture_begin(v5.data(), v5.size(), u4.data(), u4.size(), (const uint8_t*)i5.data(), i5.size() * 2, nullptr, 0);
+  gx::capture_pass(640, 480, false, false, black, 0.f, true, gx::Rect{0, 0, 640, 480});
+  gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+  gx::capture_scissor(gx::Rect{0, 0, 640, 480});
+  gx::capture_draw(4, 12, 6, 1, 0, UINT32_MAX, 102);  // cuadro chico arriba a la izquierda con la copia
+  gx::capture_end();
+  gx::draw_frame(640, 480);
+  const int small = pixel(20, 470), bg = pixel(540, 80);
+  const bool queued = small == 0xFF0000 && bg == 0x00FF00;
+  if (!queued) std::printf("cola de cuadros: copia %06X fondo %06X\n", small, bg);
+  ok = ok && queued;
   std::puts(ok ? "PRUEBA OK" : "PRUEBA FALLÓ");
   return ok ? 0 : 1;
 }

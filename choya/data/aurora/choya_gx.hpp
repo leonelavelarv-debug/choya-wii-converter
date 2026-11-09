@@ -42,7 +42,7 @@ void capture_viewport(const gfx::Viewport& vp) noexcept;
 void capture_scissor(const gfx::ClipRect& rect) noexcept;
 void capture_gx_draw(const gx::DrawData& draw) noexcept;
 void capture_clear(const gfx::clear::DrawData& draw) noexcept;
-void capture_end() noexcept;
+void capture_end(bool present = true) noexcept;
 void capture_discard() noexcept;
 
 } // namespace aurora::choya

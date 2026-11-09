@@ -290,7 +290,7 @@ void capture_clear(const gfx::clear::DrawData& draw) noexcept {
                       core::Rect{draw.scissor.x, draw.scissor.y, draw.scissor.width, draw.scissor.height});
 }
 
-void capture_end() noexcept { core::capture_end(); }
+void capture_end(bool present) noexcept { core::capture_end(present); }
 
 void capture_discard() noexcept { core::capture_discard(); }
 

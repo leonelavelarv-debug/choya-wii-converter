@@ -105,7 +105,8 @@ void capture_scissor(const Rect& rect) noexcept;
 void capture_draw(uint64_t pipeline, uint32_t idxOffset, uint32_t indexCount, uint32_t instanceCount,
                   uint32_t uniformOffset, uint32_t dstAlpha, uint64_t bindGroup) noexcept;
 void capture_clear(uint64_t pipeline, const float rgba[4], float depth, bool useScissor, const Rect& rect) noexcept;
-void capture_end() noexcept;
+// present = false: lote partido a mitad de cuadro (staging lleno); se dibuja en el EFB sin mostrarse.
+void capture_end(bool present = true) noexcept;
 void capture_discard() noexcept;
 bool capturing() noexcept;
 
