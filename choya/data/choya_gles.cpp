@@ -375,8 +375,9 @@ void EvdevThread() {
                                   ev[i].code, ev[i].value);
                     Log("%s", line);
                 }
-                if (ev[i].type == EV_KEY && ev[i].code == BTN_SELECT) select = ev[i].value != 0;
-                if (ev[i].type == EV_KEY && ev[i].code == BTN_START) start = ev[i].value != 0;
+                // Select/Start: códigos estándar (314/315) o los que manda la RG35XX H en KNULLI (310/311).
+                if (ev[i].type == EV_KEY && (ev[i].code == BTN_SELECT || ev[i].code == BTN_TL)) select = ev[i].value != 0;
+                if (ev[i].type == EV_KEY && (ev[i].code == BTN_START || ev[i].code == BTN_TR)) start = ev[i].value != 0;
             }
         }
         const auto now = std::chrono::steady_clock::now();
@@ -410,6 +411,21 @@ void CheckGamepads() {
         if (pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_BACK) &&
             SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) {
             dump = true;
+        }
+    }
+    {  // la primera vez que SDL ve Select, Start o R1 (para revisar el mapeo si una combinación no responde)
+        static bool seen[3] = {};
+        static const SDL_GamepadButton btn[3] = {SDL_GAMEPAD_BUTTON_BACK, SDL_GAMEPAD_BUTTON_START,
+                                                 SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER};
+        static const char* names[3] = {"Select (back)", "Start", "R1 (rightshoulder)"};
+        for (int i = 0; ids && i < count; ++i) {
+            SDL_Gamepad* pad = SDL_GetGamepadFromID(ids[i]);
+            for (int b = 0; pad && b < 3; ++b) {
+                if (!seen[b] && SDL_GetGamepadButton(pad, btn[b])) {
+                    seen[b] = true;
+                    Log("SDL ve %s", names[b]);
+                }
+            }
         }
     }
     // Select + R1 sostenidos 1 s: vuelca el cuadro que se ve (cuadro-manual-<n>.bin; solo en modo diagnóstico).

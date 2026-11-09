@@ -98,7 +98,7 @@ escribir_resumen() {
     echo "--- cuadros por segundo"
     grep -E "\[vi\] fps" "$DIR/run.log" | tail -15
     echo "--- mandos"
-    grep -hE "evdev|mandos|gamepad|joystick|Select \+ Start" "$DIR/choya-gles.txt" "$DIR/run.log" 2>/dev/null | grep -v "^\[choya-gles\]" | head -60
+    grep -hE "evdev|mandos|gamepad|joystick|Select \+|SDL ve|volcado" "$DIR/choya-gles.txt" "$DIR/run.log" 2>/dev/null | grep -v "^\[choya-gles\]" | head -60
     echo "--- errores"
     grep -iE "fatal|error|abort|AccessViolation|choya\]|not found|cannot open" "$DIR/run.log" | head -20
     echo "--- final del log"
@@ -106,14 +106,37 @@ escribir_resumen() {
   } > "$DIR/resumen.txt" 2>&1
 }
 
+# Salida de PortMaster (gptokeyb): Select + Start cierra el juego (en los dos modos).
+iniciar_gptokeyb() {
+  GPID=""
+  if [ -n "$GPTOKEYB" ]; then
+    $GPTOKEYB "WiiCompiled" > "$DIR/gptokeyb.log" 2>&1 &
+    GPID=$!
+  fi
+}
+parar_gptokeyb() {
+  [ -n "$GPID" ] && kill $GPID 2>/dev/null
+  pkill -f gptokeyb 2>/dev/null
+}
+# Resumen cada 10 s mientras corre, por si el juego se cierra con la tecla de salida del sistema.
+esperar_juego() {
+  while kill -0 "$1" 2>/dev/null; do
+    sleep 10
+    kill -0 "$1" 2>/dev/null && { escribir_resumen; sync; }
+  done
+}
+
 if [ "$MODO" = "diagnostico" ]; then
   # Perfil: a los 20 s empieza a tomar muestras durante 35 s y deja perfil.txt (en la PC: choya perfil perfil.txt).
   export CHOYA_PERFIL=20,35
-  # Vuelca estos cuadros del motor a cuadro-<n>.bin (aviso ~10 s, título ~40 s) para revisarlos en la PC.
-  export CHOYA_GX_VOLCADO=600,2400
+  # Vuelca estos cuadros del motor a cuadro-<n>.bin para revisarlos en la PC (aviso ~10 s, título ~40 s y luego
+  # cada ~40 s, por si Select + R1 no responde). Select + R1 vuelca además el cuadro que se ve.
+  export CHOYA_GX_VOLCADO=600,2400,4000,5600,7200,8800
   rm -f "$DIR"/cuadro-*.bin "$DIR/perfil.txt"
-  timeout 180 ./WiiCompiled > "$DIR/run.log" 2>&1 &
+  # -k 5: si a los 3 min no se cierra con la señal normal, se mata.
+  timeout -k 5 180 ./WiiCompiled > "$DIR/run.log" 2>&1 &
   TPID=$!
+  iniciar_gptokeyb
   # A los 60 s: cuánto procesador gastó cada hilo (100 ticks = 1 s) y a qué frecuencia iba el procesador.
   sleep 60
   PID=""
@@ -132,26 +155,18 @@ if [ "$MODO" = "diagnostico" ]; then
       echo "WiiCompiled ya no estaba corriendo"
     fi
   } >> "$DIR/cpu.txt" 2>&1
+  esperar_juego $TPID
   wait $TPID
   STATUS=$?
+  parar_gptokeyb
 else
   ./WiiCompiled > "$DIR/run.log" 2>&1 &
   JPID=$!
-  # Salida de PortMaster (gptokeyb): Select + Start cierra el juego aunque SDL no vea el mando.
-  GPID=""
-  if [ -n "$GPTOKEYB" ]; then
-    $GPTOKEYB "WiiCompiled" > "$DIR/gptokeyb.log" 2>&1 &
-    GPID=$!
-  fi
-  # Resumen cada 10 s mientras corre, por si el juego se cierra con la tecla de salida del sistema.
-  while kill -0 $JPID 2>/dev/null; do
-    sleep 10
-    kill -0 $JPID 2>/dev/null && { escribir_resumen; sync; }
-  done
+  iniciar_gptokeyb
+  esperar_juego $JPID
   wait $JPID
   STATUS=$?
-  [ -n "$GPID" ] && kill $GPID 2>/dev/null
-  pkill -f gptokeyb 2>/dev/null
+  parar_gptokeyb
 fi
 
 escribir_resumen
