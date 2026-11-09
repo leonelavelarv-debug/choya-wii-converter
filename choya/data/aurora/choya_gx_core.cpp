@@ -25,6 +25,7 @@
 #include <string>
 #include <unordered_map>
 #include <deque>
+#include <iterator>
 #include <vector>
 
 namespace choya::gx {
@@ -1557,20 +1558,26 @@ void capture_end(bool present) noexcept {
   }
   std::sort(g.copies.begin(), g.copies.end());
   g.copies.erase(std::unique(g.copies.begin(), g.copies.end()), g.copies.end());
-  // Los grupos que el motor no alcanzó a dibujar y cuyas copias rehace este, sobran.
-  for (auto it = g_queue.begin(); it != g_queue.end();) {
-    if (std::includes(g.copies.begin(), g.copies.end(), it->copies.begin(), it->copies.end())) {
-      for (Frame& f : it->frames) recycle(std::move(f));
-      it = g_queue.erase(it);
+  g_queue.push_back(std::move(g));
+  // Los grupos que el motor no alcanzó a dibujar y cuyas copias rehacen los más nuevos, sobran (de atrás hacia
+  // adelante, con todas las copias de los grupos posteriores).
+  std::vector<uint64_t> later = g_queue.back().copies, merged;
+  for (size_t i = g_queue.size() - 1; i-- > 0;) {
+    Group& old = g_queue[i];
+    if (std::includes(later.begin(), later.end(), old.copies.begin(), old.copies.end())) {
+      for (Frame& f : old.frames) recycle(std::move(f));
+      g_queue.erase(g_queue.begin() + static_cast<std::ptrdiff_t>(i));
     } else {
-      ++it;
+      merged.clear();
+      std::set_union(later.begin(), later.end(), old.copies.begin(), old.copies.end(), std::back_inserter(merged));
+      later.swap(merged);
     }
   }
-  if (g_queue.size() >= 6) {  // el motor no avanza: no acumular trabajo ni memoria sin fin
+  // El motor no avanza: no acumular trabajo ni memoria sin fin (aquí ya solo quedan grupos con copias únicas).
+  while (g_queue.size() > 6) {
     for (Frame& f : g_queue.front().frames) recycle(std::move(f));
     g_queue.pop_front();
   }
-  g_queue.push_back(std::move(g));
 }
 
 void capture_discard() noexcept { g_recordingActive = false; }

@@ -1,3 +1,4 @@
+#include <array>
 // Prueba del motor de Choya con Mesa llvmpipe.\n// Sin argumentos: dibuja cuadros sintéticos y lee píxeles.\n// Con argumentos (cuadro.bin salida.ppm): vuelve a dibujar un cuadro volcado en la consola (CHOYA_GX_VOLCADO).
 #include "choya_gx_core.hpp"
 #include <dolphin/gx/GXEnum.h>
@@ -273,6 +274,30 @@ int main(int argc, char** argv) {
   const bool queued = small == 0xFF0000 && bg == 0x00FF00;
   if (!queued) std::printf("cola de cuadros: copia %06X fondo %06X\n", small, bg);
   ok = ok && queued;
+
+  // Cuadro 6: copias que se repiten. Dos cuadros atrasados copian a la 601 (primero rojo, luego verde) y el final,
+  // sin copias, la dibuja: el primero sobra y se ve verde.
+  gx::BindDesc b7{};
+  b7.tex[0] = 601;
+  b7.samp[0] = bd.samp[0];
+  gx::register_bind_group(103, b7);
+  for (int k = 0; k < 2; ++k) {
+    gx::capture_begin(v4.data(), v4.size(), u4.data(), u4.size(), (const uint8_t*)i4.data(), 12, nullptr, 0);
+    gx::capture_pass(640, 480, true, true, k == 0 ? std::array<float, 4>{1, 0, 0, 1}.data() : green, 0.f, false,
+                     gx::Rect{0, 0, 0, 0});
+    gx::capture_copy(601, gx::Rect{0, 0, 640, 480}, 16, 16, 0x6, false);
+    gx::capture_end();
+  }
+  gx::capture_begin(v5.data(), v5.size(), u4.data(), u4.size(), (const uint8_t*)i5.data(), i5.size() * 2, nullptr, 0);
+  gx::capture_pass(640, 480, true, true, black, 0.f, true, gx::Rect{0, 0, 640, 480});
+  gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+  gx::capture_scissor(gx::Rect{0, 0, 640, 480});
+  gx::capture_draw(4, 12, 6, 1, 0, UINT32_MAX, 103);
+  gx::capture_end();
+  gx::draw_frame(640, 480);
+  const int rep = pixel(20, 470);
+  if (rep != 0x00FF00) std::printf("copias repetidas: %06X\n", rep);
+  ok = ok && rep == 0x00FF00;
   std::puts(ok ? "PRUEBA OK" : "PRUEBA FALLÓ");
   return ok ? 0 : 1;
 }
