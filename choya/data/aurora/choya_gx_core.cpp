@@ -118,6 +118,9 @@ struct Gl {
   void (*BindVertexArray)(GLuint);
   void (*DrawElements)(GLenum, GLsizei, GLenum, const void*);
   void (*DrawArrays)(GLenum, GLint, GLsizei);
+  void* (*FenceSync)(GLenum, GLbitfield);
+  GLenum (*ClientWaitSync)(void*, GLbitfield, unsigned long long);
+  void (*DeleteSync)(void*);
   void (*Viewport)(GLint, GLint, GLsizei, GLsizei);
   void (*Scissor)(GLint, GLint, GLsizei, GLsizei);
   void (*Enable)(GLenum);
@@ -198,6 +201,9 @@ bool load_gl() {
   CHOYA_GL(BindVertexArray);
   CHOYA_GL(DrawElements);
   CHOYA_GL(DrawArrays);
+  CHOYA_GL(FenceSync);
+  CHOYA_GL(ClientWaitSync);
+  CHOYA_GL(DeleteSync);
   CHOYA_GL(Viewport);
   CHOYA_GL(Scissor);
   CHOYA_GL(Enable);
@@ -305,7 +311,7 @@ struct Stats {
   uint64_t bytesVerts = 0, bytesUniforms = 0, bytesIndices = 0, bytesStorage = 0;
   uint64_t texUploads = 0, missingTextures = 0, copies = 0;
   uint64_t interval = 0;  // cuadros desde el último informe
-  double cpuMs = 0;
+  double cpuMs = 0, gpuWaitMs = 0;
 } g_stats;
 
 std::unordered_map<uint64_t, BindDesc> g_bindGroups;
@@ -1015,6 +1021,7 @@ struct FrameResources {
   WordTexture vtex, atex;
   GLuint ubo = 0, ebo = 0;
   size_t uboSize = 0, eboSize = 0;
+  void* fence = nullptr;  // la GPU terminó el cuadro que usó estos recursos
 };
 FrameResources g_ring[kRing];
 int g_ringIndex = 0;
@@ -1873,6 +1880,21 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   // Subir los datos del cuadro a los recursos que tocan en el anillo.
   FrameResources& res = g_ring[g_ringIndex];
   g_ringIndex = (g_ringIndex + 1) % kRing;
+  // Antes de reusar los recursos, esperar a que la GPU termine el cuadro que los usó (hace kRing cuadros). Sin esto
+  // la CPU le mandaba cuadros a la Mali más rápido de lo que los dibuja (el intercambio no espera) y la memoria de la
+  // GPU crecía hasta acabarse la RAM (Golf: de 160 a 530 MB y el juego a 0.1 cuadros/s).
+  if (res.fence != nullptr) {
+    const auto waitStart = std::chrono::steady_clock::now();
+    constexpr GLenum kTimeoutExpired = 0x911B;
+    for (int tries = 0; tries < 20; ++tries) {  // hasta 2 s
+      const GLenum r = gl.ClientWaitSync(res.fence, 1 /* GL_SYNC_FLUSH_COMMANDS_BIT */, 100000000ull);
+      if (r != kTimeoutExpired) break;  // listo o falló (kWaitFailed): no esperar más
+    }
+    gl.DeleteSync(res.fence);
+    res.fence = nullptr;
+    g_stats.gpuWaitMs +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+  }
   gl.ActiveTexture(kTexture0);
   if (!upload_words(res.vtex, f.verts)) {
     log_line("motor: cuadro demasiado grande para la textura de vértices");
@@ -1883,16 +1905,21 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     log_line("motor: cuadro demasiado grande para la textura de arreglos");
     return false;
   }
-  // Uniformes y elementos: se "huérfana" el búfer completo (BufferData nuevo) para no esperar a la GPU.
+  // Uniformes y elementos: la GPU ya soltó estos búferes (la espera de arriba), así que se reescriben sin pedir
+  // memoria nueva; solo crecen si el cuadro no cabe.
   gl.BindBuffer(kUniformBuffer, res.ubo);
-  res.uboSize = std::max(res.uboSize, f.uniforms.size());
-  gl.BufferData(kUniformBuffer, static_cast<GLsizeiptr>(res.uboSize), nullptr, kStreamDraw);
+  if (f.uniforms.size() > res.uboSize) {
+    res.uboSize = f.uniforms.size() + f.uniforms.size() / 4;
+    gl.BufferData(kUniformBuffer, static_cast<GLsizeiptr>(res.uboSize), nullptr, kStreamDraw);
+  }
   gl.BufferSubData(kUniformBuffer, 0, static_cast<GLsizeiptr>(f.uniforms.size()), f.uniforms.data());
   gl.BindVertexArray(g_vao);
   gl.BindBuffer(kElementArrayBuffer, res.ebo);
   if (!f.indices.empty()) {
-    res.eboSize = std::max(res.eboSize, f.indices.size());
-    gl.BufferData(kElementArrayBuffer, static_cast<GLsizeiptr>(res.eboSize), nullptr, kStreamDraw);
+    if (f.indices.size() > res.eboSize) {
+      res.eboSize = f.indices.size() + f.indices.size() / 4;
+      gl.BufferData(kElementArrayBuffer, static_cast<GLsizeiptr>(res.eboSize), nullptr, kStreamDraw);
+    }
     gl.BufferSubData(kElementArrayBuffer, 0, static_cast<GLsizeiptr>(f.indices.size()), f.indices.data());
   }
   gl.ActiveTexture(kTexture0);
@@ -2058,6 +2085,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   gl.ColorMask(1, 1, 1, 1);
   gl.DepthMask(1);
 
+  res.fence = gl.FenceSync(0x9117 /* GL_SYNC_GPU_COMMANDS_COMPLETE */, 0);
   g_stats.cpuMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count();
   // Informe cada 300 cuadros o cada 10 s (lo que llegue antes: con el juego lento también se ve qué pasa).
   ++g_stats.frames;
@@ -2068,9 +2096,10 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     lastReport = nowReport;
     const double n = static_cast<double>(g_stats.interval);
     log_line("motor: KB por cuadro: vértices %.0f, uniformes %.0f, índices %.0f, arreglos %.0f; CPU del motor %.2f ms "
-             "por cuadro (copia %.2f ms)",
+             "por cuadro (copia %.2f ms, esperando a la GPU %.2f ms)",
              g_stats.bytesVerts / n / 1024, g_stats.bytesUniforms / n / 1024, g_stats.bytesIndices / n / 1024,
-             g_stats.bytesStorage / n / 1024, g_stats.cpuMs / n, g_captureUs.exchange(0) / n / 1000.0);
+             g_stats.bytesStorage / n / 1024, g_stats.cpuMs / n, g_captureUs.exchange(0) / n / 1000.0,
+             g_stats.gpuWaitMs / n);
     log_line("motor: texturas: %zu en GL, %llu subidas, %zu copias del EFB (%.1f por cuadro), %llu enlaces sin textura "
              "(paletas u otras)",
              g_textures.size(), static_cast<unsigned long long>(g_stats.texUploads), g_copyTextures.size(),
