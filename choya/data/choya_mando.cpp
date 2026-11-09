@@ -157,6 +157,43 @@ bool ApplyMapping(Device& d, const std::string& line) {
     return d.south.kind != Source::None || d.east.kind != Source::None;
 }
 
+// Botones por código de evdev: "east=304,south=305,..." con los nombres de SDL (east derecha, south abajo, west
+// izquierda, north arriba, back, guide, start, leftshoulder, rightshoulder, lefttrigger, righttrigger).
+void ApplyCodes(Device& d, const char* spec) {
+    std::string all(spec);
+    size_t pos = 0;
+    while (pos < all.size()) {
+        size_t comma = all.find(',', pos);
+        if (comma == std::string::npos) comma = all.size();
+        const std::string item = all.substr(pos, comma - pos);
+        pos = comma + 1;
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = item.substr(0, eq);
+        Source s;
+        s.kind = Source::Button;
+        s.code = std::atoi(item.c_str() + eq + 1);
+        if (key == "south") d.south = s;
+        else if (key == "east") d.east = s;
+        else if (key == "west") d.west = s;
+        else if (key == "north") d.north = s;
+        else if (key == "back") d.back = s;
+        else if (key == "guide") d.guide = s;
+        else if (key == "start") d.start = s;
+        else if (key == "leftshoulder") d.lshoulder = s;
+        else if (key == "rightshoulder") d.rshoulder = s;
+        else if (key == "lefttrigger") d.ltrigger = s;
+        else if (key == "righttrigger") d.rtrigger = s;
+    }
+}
+
+// La RG35XX H con KNULLI: los botones medidos en la consola (resumen de la 0.14.1: cada botón apretado en orden,
+// y que con el mapeo de PortMaster X salía como A y L1 como B). La cruceta (hat) y los sticks siguen del mapeo.
+//   A 304, B 305, Y 306, X 307, L1 308, R1 309, SELECT 310, START 311, MENU 312, L2 314, R2 315
+constexpr const char* kRg35xxhCodes =
+    "east=304,south=305,west=306,north=307,leftshoulder=308,rightshoulder=309,back=310,start=311,guide=312,"
+    "lefttrigger=314,righttrigger=315";
+
 void Open() {
     const char* env = std::getenv("SDL_GAMECONTROLLERCONFIG");
     if (env == nullptr || *env == '\0') {
@@ -227,6 +264,14 @@ void Open() {
         }
         g_ok = true;
         Log("mando: " + std::string(path) + " '" + d.name + "' guid " + guid + ", mapeo de PortMaster como en SDL2");
+        if (d.name == "Anbernic RG35XX-H Controller") {
+            ApplyCodes(d, kRg35xxhCodes);
+            Log("mando: botones con la tabla propia de la RG35XX H (el mapeo de PortMaster los cambia)");
+        }
+        if (const char* codes = std::getenv("CHOYA_MANDO_CODIGOS"); codes != nullptr && *codes != '\0') {
+            ApplyCodes(d, codes);
+            Log(std::string("mando: botones de CHOYA_MANDO_CODIGOS: ") + codes);
+        }
         std::string codes = "mando: codigos de botones (orden de SDL2):";
         for (size_t i = 0; i < d.buttonCodes.size(); ++i) codes += " b" + std::to_string(i) + "=" + std::to_string(d.buttonCodes[i]);
         Log(codes);
@@ -289,11 +334,11 @@ extern "C" bool choya_mando_leer(ChoyaMando* out) {
             if (TestBit(keys, code) && !TestBit(g_prevKeys, code)) {
                 ++g_pressLogs;
                 const auto is = [code](const Source& s) { return s.kind == Source::Button && s.code == code; };
-                const char* role = is(d.east) ? "derecha (b) = Wii A" : is(d.south) ? "abajo (a) = Wii B" :
-                                   is(d.north) ? "arriba (y) = Wii 1" : is(d.west) ? "izquierda (x) = Wii 2" :
+                const char* role = is(d.east) ? "A = Wii A" : is(d.south) ? "B = Wii B" :
+                                   is(d.north) ? "X = Wii 1" : is(d.west) ? "Y = Wii 2" :
                                    is(d.rshoulder) ? "R1 = agitar" : is(d.lshoulder) ? "L1 = Wii -" :
                                    is(d.back) ? "select = Wii -" : is(d.start) ? "start = Wii +" :
-                                   is(d.guide) ? "menu" : is(d.ltrigger) ? "L2 = Wii -" : is(d.rtrigger) ? "R2" : "sin uso";
+                                   is(d.guide) ? "MENU (con Start sale)" : is(d.ltrigger) ? "L2 = Wii -" : is(d.rtrigger) ? "R2 (sin uso)" : "sin uso";
                 Log("mando: boton " + std::to_string(code) + " -> " + role);
             }
         }

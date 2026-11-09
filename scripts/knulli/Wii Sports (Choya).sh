@@ -43,6 +43,8 @@ fi
 #   KNULLI y muOS (Anbernic RG con H700): salir con MENU + START; ArkOS y dArkOS: SELECT + START; el resto: los dos.
 #   CHOYA_FACE_LAYOUT=positions|labels  labels si en tu firmware A y B salen al revés (A debe ser el de la derecha)
 #   CHOYA_QUIT_COMBO=menu|select|both   fuerza la combinación para salir
+#   CHOYA_MANDO_CODIGOS="east=304,south=305,..."  botones por código del kernel (east = A, south = B, north = X,
+#                       west = Y, leftshoulder, rightshoulder, lefttrigger, righttrigger, back, start, guide = MENU)
 cfw=$(printf '%s' "${CFW_NAME:-}" | tr '[:upper:]' '[:lower:]')
 case "$cfw" in
   *knulli*|*muos*) quit_combo=menu ;;
