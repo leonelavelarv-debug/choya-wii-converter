@@ -274,14 +274,22 @@ struct Frame {
   std::vector<Item> items;
   bool ready = false;
   bool present = true;  // false: lote partido a mitad de cuadro (se dibuja en el EFB sin mostrarse)
-  bool keep = false;    // no se puede saltar (copias del EFB o lote partido)
 };
 Frame g_recording;
-// Cuadros listos para dibujar, en orden. Uno completo sin copias del EFB se puede saltar si llega otro (el motor va
-// atrasado); uno con copias o un lote partido (staging lleno) no: lo que deja en texturas o en el EFB lo usan los
-// siguientes (las caras de los Miis se copian una sola vez).
-std::deque<Frame> g_queue;
+// Cuadros listos para dibujar, en orden, en grupos: los lotes partidos (staging lleno) de un cuadro y el cuadro que
+// los termina. Si el motor va atrasado, un grupo se salta cuando uno más nuevo hace todas sus copias del EFB (casi
+// siempre: el juego rehace las mismas copias cada cuadro); uno con copias que nadie repite (las caras de los Miis se
+// copian una sola vez) se dibuja aunque no se muestre.
+struct Group {
+  std::vector<Frame> frames;
+  std::vector<uint64_t> copies;  // texturas que copia (ordenadas)
+};
+std::vector<Frame> g_open;   // lotes partidos del cuadro en curso
+std::deque<Group> g_queue;
 std::vector<Frame> g_pool;  // cuadros ya dibujados, para reusar sus búferes
+void recycle(Frame&& f) {
+  if (g_pool.size() < 4) g_pool.push_back(std::move(f));
+}
 Frame g_last;  // el último cuadro dibujado (para volcarlo)
 bool g_recordingActive = false;
 std::mutex g_frameMutex;
@@ -1529,30 +1537,40 @@ void capture_end(bool present) noexcept {
   g_captureUs += static_cast<uint64_t>(
       std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - g_captureStart).count());
   g_recording.present = present;
-  g_recording.keep = !present;
-  for (const Item& it : g_recording.items) {
-    if (it.op == Op::Copy) {
-      g_recording.keep = true;
-      break;
-    }
-  }
   g_recording.ready = true;
   std::lock_guard lock(g_frameMutex);
-  // Los cuadros completos sin copias que el motor no alcanzó a dibujar los reemplaza este.
+  g_open.push_back(std::move(g_recording));
+  g_recording = Frame{};
+  if (!present) {
+    if (g_open.size() > 16) {  // un cuadro que nunca termina: no acumular memoria sin fin
+      recycle(std::move(g_open.front()));
+      g_open.erase(g_open.begin());
+    }
+    return;
+  }
+  Group g;
+  g.frames.swap(g_open);
+  for (const Frame& f : g.frames) {
+    for (const Item& it : f.items) {
+      if (it.op == Op::Copy) g.copies.push_back(it.copy.tex);
+    }
+  }
+  std::sort(g.copies.begin(), g.copies.end());
+  g.copies.erase(std::unique(g.copies.begin(), g.copies.end()), g.copies.end());
+  // Los grupos que el motor no alcanzó a dibujar y cuyas copias rehace este, sobran.
   for (auto it = g_queue.begin(); it != g_queue.end();) {
-    if (!it->keep) {
-      g_pool.push_back(std::move(*it));
+    if (std::includes(g.copies.begin(), g.copies.end(), it->copies.begin(), it->copies.end())) {
+      for (Frame& f : it->frames) recycle(std::move(f));
       it = g_queue.erase(it);
     } else {
       ++it;
     }
   }
-  if (g_queue.size() >= 32) {  // el motor no avanza: no acumular memoria sin fin
-    g_pool.push_back(std::move(g_queue.front()));
+  if (g_queue.size() >= 6) {  // el motor no avanza: no acumular trabajo ni memoria sin fin
+    for (Frame& f : g_queue.front().frames) recycle(std::move(f));
     g_queue.pop_front();
   }
-  g_queue.push_back(std::move(g_recording));
-  g_recording = Frame{};
+  g_queue.push_back(std::move(g));
 }
 
 void capture_discard() noexcept { g_recordingActive = false; }
@@ -1701,7 +1719,9 @@ bool load_frame(const char* path) noexcept {
   g_reversedZ = header[2] != 0;
   f.ready = true;
   std::lock_guard lock(g_frameMutex);
-  g_queue.push_back(std::move(f));
+  Group g;
+  g.frames.push_back(std::move(f));
+  g_queue.push_back(std::move(g));
   return true;
 }
 
@@ -1717,11 +1737,15 @@ bool draw_frame(int screenWidth, int screenHeight) noexcept {
   }
   // Todos los cuadros pendientes, en orden (el juego puede capturar el siguiente mientras tanto); solo el último se
   // muestra, los anteriores dejan sus copias del EFB y lo que dibujaron en el EFB.
-  std::deque<Frame> batch;
+  std::deque<Group> groups;
   {
     std::lock_guard lock(g_frameMutex);
     if (g_queue.empty()) return false;
-    batch.swap(g_queue);
+    groups.swap(g_queue);
+  }
+  std::vector<Frame> batch;
+  for (Group& g : groups) {
+    for (Frame& f : g.frames) batch.push_back(std::move(f));
   }
   bool drawn = false;
   for (size_t i = 0; i < batch.size(); ++i) {
@@ -1730,14 +1754,9 @@ bool draw_frame(int screenWidth, int screenHeight) noexcept {
   {
     std::lock_guard lock(g_frameMutex);
     for (size_t i = 0; i < batch.size(); ++i) {
-      if (i + 1 == batch.size()) {
-        std::swap(g_last, batch[i]);
-        g_pool.push_back(std::move(batch[i]));  // el g_last anterior
-      } else {
-        g_pool.push_back(std::move(batch[i]));
-      }
+      if (i + 1 == batch.size()) std::swap(g_last, batch[i]);  // el g_last anterior se recicla
+      recycle(std::move(batch[i]));
     }
-    while (g_pool.size() > 4) g_pool.pop_back();
   }
   return drawn;
 }
