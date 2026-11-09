@@ -1854,6 +1854,15 @@ bool copy_program() {
   return g_copyProgram.id != 0;
 }
 
+// CHOYA_GX_COPIAS=0 (solo para diagnosticar): no hace las copias del EFB a textura.
+bool copies_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("CHOYA_GX_COPIAS");
+    return e == nullptr || std::strcmp(e, "0") != 0;
+  }();
+  return on;
+}
+
 // Hace la copia; deja enlazado el framebuffer del EFB (el que llama repone viewport y recorte).
 void run_copy(const Item& it) {
   const auto& c = it.copy;
@@ -2304,6 +2313,79 @@ namespace {
 // del EFB con poca memoria libre y suelta lo que no se usa): con menos de CHOYA_GX_MEMORIA_MIN MB disponibles (96 por
 // omisión) el motor suelta los cuadros que guarda para reusar sus búferes y le devuelve al sistema la memoria libre
 // del heap (malloc_trim). En la RG35XX H (1 GB, sin swap) eso es lo que separa un tirón de que el sistema mate al juego.
+// --- Memoria de la Mali por partes del cuadro ------------------------------------------------------------------
+// En Golf la memoria de la GPU (debugfs gpu_memory) pasa de 130 a 530 MB en medio minuto mientras las texturas del
+// motor son 16 MB: es memoria que el driver pide por su cuenta. Para saber qué la pide, se lee el total antes y
+// después de cada parte del cuadro y la diferencia se suma a esa parte. CHOYA_GX_MALI=0 lo apaga.
+enum MaliPart { kMaliSubidas, kMaliDibujos, kMaliCopias, kMaliPantalla, kMaliFuera, kMaliParts };
+struct MaliProf {
+  int state = 0;  // 0 sin probar, 1 activo, -1 apagado
+  const char* path = nullptr;
+  long last = -1;               // páginas en la última lectura
+  long part[kMaliParts] = {};   // páginas sumadas por parte (en el intervalo)
+  long reportStart = -1;        // páginas al empezar el intervalo
+  long history[3] = {-1, -1, -1};  // al final de los últimos intervalos (para la mitigación)
+} g_mali;
+
+long mali_read() {
+  FILE* f = std::fopen(g_mali.path, "r");
+  if (f == nullptr) return -1;
+  char name[64];
+  long pages = -1;
+  if (std::fscanf(f, "%63s %ld", name, &pages) != 2) pages = -1;
+  std::fclose(f);
+  return pages;
+}
+
+void mali_mark(MaliPart part) {
+  if (g_mali.state == 0) {
+    g_mali.state = -1;
+    const char* env = std::getenv("CHOYA_GX_MALI");
+    if (env != nullptr && std::strcmp(env, "0") == 0) return;
+    for (const char* p : {"/sys/kernel/debug/mali0/gpu_memory", "/sys/kernel/debug/mali/gpu_memory"}) {
+      g_mali.path = p;
+      if (mali_read() >= 0) {
+        g_mali.state = 1;
+        break;
+      }
+    }
+    if (g_mali.state != 1) return;
+    g_mali.last = g_mali.reportStart = mali_read();
+    log_line("motor: midiendo la memoria de la Mali por partes del cuadro (%s)", g_mali.path);
+  }
+  if (g_mali.state != 1) return;
+  const long now = mali_read();
+  if (now < 0) return;
+  g_mali.part[part] += now - g_mali.last;
+  g_mali.last = now;
+}
+
+// Cuántos cuadros puede tener la GPU pendientes a la vez (1 a kRing). Si la Mali crece sin parar se baja a 1 (como un
+// glFinish por cuadro): un recurso que la GPU todavía usa y se vuelve a escribir (EFB, copias) hace que el driver le
+// dé otra memoria en vez de esperar. CHOYA_GX_EN_VUELO fija el valor y apaga el cambio automático.
+int g_inFlight = 3;
+bool g_inFlightFixed = false;
+
+void mali_report(double frames) {
+  if (g_mali.state != 1) return;
+  const long now = g_mali.last;
+  const auto mb = [](long pages) { return static_cast<double>(pages) * 4.0 / 1024.0; };
+  log_line("motor: Mali %.0f MB (%+.1f MB en %.0f cuadros): subidas %+.1f, dibujos %+.1f, copias del EFB %+.1f, "
+           "pantalla %+.1f, entre cuadros %+.1f; cuadros en vuelo %d",
+           mb(now), mb(now - g_mali.reportStart), frames, mb(g_mali.part[kMaliSubidas]), mb(g_mali.part[kMaliDibujos]),
+           mb(g_mali.part[kMaliCopias]), mb(g_mali.part[kMaliPantalla]), mb(g_mali.part[kMaliFuera]), g_inFlight);
+  for (long& p : g_mali.part) p = 0;
+  g_mali.reportStart = now;
+  g_mali.history[0] = g_mali.history[1];
+  g_mali.history[1] = g_mali.history[2];
+  g_mali.history[2] = now;
+  // Creció más de 64 MB en los últimos dos intervalos: menos cuadros en vuelo.
+  if (!g_inFlightFixed && g_inFlight > 1 && g_mali.history[0] >= 0 && mb(now - g_mali.history[0]) > 64.0) {
+    g_inFlight = 1;
+    log_line("motor: la Mali creció %.0f MB en dos informes: ahora 1 cuadro en vuelo", mb(now - g_mali.history[0]));
+  }
+}
+
 void low_memory_relief() {
   static const long minMb = [] {
     const char* e = std::getenv("CHOYA_GX_MEMORIA_MIN");
@@ -2365,6 +2447,27 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   g_stats.bytesStorage += f.storage.size();
 
   // Subir los datos del cuadro a los recursos que tocan en el anillo.
+  mali_mark(kMaliFuera);
+  static const bool inFlightInit = [] {
+    if (const char* e = std::getenv("CHOYA_GX_EN_VUELO")) {
+      g_inFlight = std::clamp(std::atoi(e), 1, kRing);
+      g_inFlightFixed = true;
+    }
+    return true;
+  }();
+  (void)inFlightInit;
+  if (g_inFlight < kRing) {
+    // Esperar también al cuadro de hace g_inFlight (los de antes ya terminaron si ese terminó).
+    FrameResources& prev = g_ring[(g_ringIndex + kRing - g_inFlight) % kRing];
+    if (prev.fence != nullptr) {
+      const auto waitStart = std::chrono::steady_clock::now();
+      for (int tries = 0; tries < 20; ++tries) {
+        if (gl.ClientWaitSync(prev.fence, 1, 100000000ull) != 0x911B /* GL_TIMEOUT_EXPIRED */) break;
+      }
+      g_stats.gpuWaitMs +=
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+    }
+  }
   FrameResources& res = g_ring[g_ringIndex];
   g_ringIndex = (g_ringIndex + 1) % kRing;
   // Antes de reusar los recursos, esperar a que la GPU termine el cuadro que los usó (hace kRing cuadros). Sin esto
@@ -2430,6 +2533,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   gl.ActiveTexture(kTexture0 + 1);
   gl.BindTexture(kTexture2D, res.atex.id);
   uint32_t drawIndex = 0;
+  mali_mark(kMaliSubidas);
   shadow_invalidate();  // las subidas y la textura de vértices cambiaron estado por fuera
   S.unit = 1;
 
@@ -2451,7 +2555,9 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   auto end_pass = [&]() {
     // La copia a pantalla (XFB) es el EFB al terminar el pase que se copia (GXCopyDisp u otra copia).
     if (passOpen && passResolves && present) {
+      mali_mark(kMaliDibujos);
       present_efb(passCopy, screenWidth, screenHeight);
+      mali_mark(kMaliPantalla);
       presented = true;
       shadow_invalidate();
     }
@@ -2506,7 +2612,9 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       set_scissor(scissorRect);
     } break;
     case Op::Copy: {
-      run_copy(it);
+      mali_mark(kMaliDibujos);
+      if (copies_enabled()) run_copy(it);
+      mali_mark(kMaliCopias);
       shadow_invalidate();  // la copia usó su propio programa, estado y unidades 10/11
       set_viewport(viewportRect);
       set_enable(kScissorTest, S.scissorOn, true);
@@ -2593,10 +2701,12 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     }
   }
   end_pass();
+  mali_mark(kMaliDibujos);
   if (!presented && present) {
     // Ningún pase se copió: se muestra cómo quedó el último.
     present_efb(Rect{0, 0, passW, passH}, screenWidth, screenHeight);
     presented = true;
+    mali_mark(kMaliPantalla);
   }
   gl.BindFramebuffer(kFramebuffer, 0);
   gl.Disable(kScissorTest);
@@ -2682,6 +2792,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
              "volcados %zu (%zu MB)",
              rssPages * 4 / 1024, rssAnon / 1024, rssFile / 1024, rssShmem / 1024, g_texBytes >> 20, groups,
              bindGroups, pipelines, pending, pendingBytes / 1024, kept, keptBytes >> 20);
+    mali_report(n);
     low_memory_relief();
     g_stats = Stats{.frames = g_stats.frames};
   }

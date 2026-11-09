@@ -119,7 +119,9 @@ escribir_resumen() {
     echo "--- memoria cada 10 s"
     tail -120 "$DIR/memoria.txt" 2>/dev/null
     echo "--- memoria del motor"
-    grep -h "motor: memoria" "$DIR/choya-gles.txt" 2>/dev/null | tail -12
+    grep -h "motor: memoria del proceso" "$DIR/choya-gles.txt" 2>/dev/null | tail -8
+    echo "--- memoria de la Mali por partes del cuadro"
+    grep -hE "motor: (Mali|la Mali|midiendo)" "$DIR/choya-gles.txt" 2>/dev/null | head -30
     echo "--- motor: estado GL y programas"
     grep -hE "motor: (estado GL|caché de programas|programas cargados)" "$DIR/choya-gles.txt" 2>/dev/null | tail -8
     echo "programas en el caché: $(ls "$CHOYA_GX_CACHE" 2>/dev/null | grep -c '\.bin$')"
