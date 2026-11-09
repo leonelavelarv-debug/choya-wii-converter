@@ -356,9 +356,17 @@ void CheckGamepads() {
         SDL_free(joys);
     }
     SDL_free(ids);
-    // MENU + R1 sostenidos 1 s: vuelca el cuadro que se ve (cuadro-manual-<n>.bin; solo en modo diagnóstico).
-    dumpHeld = dump ? dumpHeld + 1 : 0;
-    if (dumpHeld == 60) {
+    // MENU + R1 sostenidos 1 s (de reloj: también con el juego lento): vuelca el cuadro que se ve
+    // (cuadro-manual-<n>.bin; solo en modo diagnóstico).
+    static std::chrono::steady_clock::time_point dumpSince{};
+    const auto now = std::chrono::steady_clock::now();
+    if (!dump) {
+        dumpHeld = 0;
+    } else if (dumpHeld == 0) {
+        dumpHeld = 1;
+        dumpSince = now;
+    } else if (dumpHeld == 1 && now - dumpSince >= std::chrono::seconds(1)) {
+        dumpHeld = 2;
         Log("MENU + R1: volcado del cuadro pedido");
         choya_gx_request_dump();
     }

@@ -111,6 +111,10 @@ escribir_resumen() {
     [ -f "$DIR/choya-gles.txt" ] && grep -v "extensiones:" "$DIR/choya-gles.txt" | tail -40 || echo "choya-gles.txt no se escribio"
     echo "--- cuadros por segundo"
     grep -E "\[vi\] fps" "$DIR/run.log" | tail -15
+    echo "--- memoria cada 10 s"
+    tail -40 "$DIR/memoria.txt" 2>/dev/null
+    echo "--- memoria del motor"
+    grep -h "motor: memoria" "$DIR/choya-gles.txt" 2>/dev/null | tail -12
     echo "--- mandos"
     grep -hE "mando|gamepad|joystick|\[input\]|volcado" "$DIR/choya-gles.txt" "$DIR/run.log" 2>/dev/null | grep -v "^\[choya-gles\]" | head -80
     echo "--- errores"
@@ -137,8 +141,20 @@ parar_gptokeyb() {
 }
 # Resumen cada 10 s mientras corre, por si el juego se cierra con la tecla de salida del sistema.
 esperar_juego() {
+  : > "$DIR/memoria.txt"
+  local t=0
   while kill -0 "$1" 2>/dev/null; do
     sleep 10
+    t=$((t + 10))
+    # Memoria cada 10 s: el juego (VmRSS), la libre del sistema y el swap, y los MHz (por si se calienta).
+    {
+      printf "%4ss  juego %s  libre %s  swap libre %s  MHz %s  temp %s\n" "$t" \
+        "$(grep -h VmRSS /proc/"$(pgrep -n WiiCompiled)"/status 2>/dev/null | awk '{print int($2/1024)" MB"}')" \
+        "$(awk '/MemAvailable/{print int($2/1024)" MB"}' /proc/meminfo)" \
+        "$(awk '/SwapFree/{print int($2/1024)" MB"}' /proc/meminfo)" \
+        "$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo 0) / 1000 ))" \
+        "$(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 ))C"
+    } >> "$DIR/memoria.txt" 2>/dev/null
     kill -0 "$1" 2>/dev/null && { escribir_resumen; sync; }
   done
 }

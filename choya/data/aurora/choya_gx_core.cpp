@@ -304,6 +304,7 @@ struct Stats {
            skippedProgram = 0, passes = 0;
   uint64_t bytesVerts = 0, bytesUniforms = 0, bytesIndices = 0, bytesStorage = 0;
   uint64_t texUploads = 0, missingTextures = 0, copies = 0;
+  uint64_t interval = 0;  // cuadros desde el último informe
   double cpuMs = 0;
 } g_stats;
 
@@ -1978,21 +1979,55 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   gl.DepthMask(1);
 
   g_stats.cpuMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count();
-  if (++g_stats.frames % 300 == 0) {
+  // Informe cada 300 cuadros o cada 10 s (lo que llegue antes: con el juego lento también se ve qué pasa).
+  ++g_stats.frames;
+  ++g_stats.interval;
+  static auto lastReport = std::chrono::steady_clock::now();
+  const auto nowReport = std::chrono::steady_clock::now();
+  if (g_stats.interval >= 300 || nowReport - lastReport >= std::chrono::seconds(10)) {
+    lastReport = nowReport;
+    const double n = static_cast<double>(g_stats.interval);
     log_line("motor: KB por cuadro: vértices %.0f, uniformes %.0f, índices %.0f, arreglos %.0f; CPU del motor %.2f ms "
              "por cuadro (copia %.2f ms)",
-             g_stats.bytesVerts / 300.0 / 1024, g_stats.bytesUniforms / 300.0 / 1024, g_stats.bytesIndices / 300.0 / 1024,
-             g_stats.bytesStorage / 300.0 / 1024, g_stats.cpuMs / 300.0, g_captureUs.exchange(0) / 300.0 / 1000.0);
+             g_stats.bytesVerts / n / 1024, g_stats.bytesUniforms / n / 1024, g_stats.bytesIndices / n / 1024,
+             g_stats.bytesStorage / n / 1024, g_stats.cpuMs / n, g_captureUs.exchange(0) / n / 1000.0);
     log_line("motor: texturas: %zu en GL, %llu subidas, %zu copias del EFB (%.1f por cuadro), %llu enlaces sin textura "
              "(paletas u otras)",
              g_textures.size(), static_cast<unsigned long long>(g_stats.texUploads), g_copyTextures.size(),
-             g_stats.copies / 300.0, static_cast<unsigned long long>(g_stats.missingTextures));
+             g_stats.copies / n, static_cast<unsigned long long>(g_stats.missingTextures));
     log_line("motor: %llu cuadros, por cuadro: %.1f dibujos, %.1f borrados, %.1f pases; saltados: %llu sin config, "
          "%llu líneas/puntos, %llu alineación, %llu sin programa; programas %zu; error GL 0x%04X",
-         static_cast<unsigned long long>(g_stats.frames), g_stats.draws / 300.0, g_stats.clears / 300.0,
-         g_stats.passes / 300.0, static_cast<unsigned long long>(g_stats.skippedConfig),
+         static_cast<unsigned long long>(g_stats.frames), g_stats.draws / n, g_stats.clears / n,
+         g_stats.passes / n, static_cast<unsigned long long>(g_stats.skippedConfig),
          static_cast<unsigned long long>(g_stats.skippedLine), static_cast<unsigned long long>(g_stats.skippedAlign),
          static_cast<unsigned long long>(g_stats.skippedProgram), g_programs.size(), gl.GetError());
+    // Memoria: el proceso y lo que guarda el motor (para ver si algo crece sin parar).
+    long rssPages = 0;
+    if (FILE* statm = std::fopen("/proc/self/statm", "r")) {
+      long sizePages = 0;
+      if (std::fscanf(statm, "%ld %ld", &sizePages, &rssPages) != 2) rssPages = 0;
+      std::fclose(statm);
+    }
+    size_t groups = 0, bindGroups = 0, pipelines = 0, pending = 0, pendingBytes = 0, kept = 0;
+    {
+      std::lock_guard lock(g_frameMutex);
+      groups = g_queue.size();
+    }
+    {
+      std::lock_guard lock(g_pipelineMutex);
+      bindGroups = g_bindGroups.size();
+      pipelines = g_pipelines.size();
+    }
+    {
+      auto& ts = texs();
+      std::lock_guard lock(ts.mutex);
+      pending = ts.pending.size();
+      for (const auto& up : ts.pending) pendingBytes += up.data.size();
+      kept = ts.kept.size();
+    }
+    log_line("motor: memoria del proceso %ld MB; grupos en cola %zu, grupos de texturas %zu, pipelines %zu, texturas "
+             "por subir %zu (%zu KB), guardadas para volcados %zu",
+             rssPages * 4 / 1024, groups, bindGroups, pipelines, pending, pendingBytes / 1024, kept);
     g_stats = Stats{.frames = g_stats.frames};
   }
   return presented;
