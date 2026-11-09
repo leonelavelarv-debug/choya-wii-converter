@@ -152,6 +152,11 @@ struct Gl {
   GLenum (*CheckFramebufferStatus)(GLenum);
   void (*BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
   void (*GetIntegerv)(GLenum, GLint*);
+  // Opcionales: búferes persistentes (GL_EXT_buffer_storage), como los anillos del renderer GLES de Nebula.
+  void (*BufferStorageEXT)(GLenum, GLsizeiptr, const void*, GLbitfield);
+  void* (*MapBufferRange)(GLenum, GLintptr, GLsizeiptr, GLbitfield);
+  GLboolean (*UnmapBuffer)(GLenum);
+  void (*DeleteBuffers)(GLsizei, const GLuint*);
 };
 Gl gl{};
 
@@ -236,6 +241,13 @@ bool load_gl() {
   CHOYA_GL(BlitFramebuffer);
   CHOYA_GL(GetIntegerv);
 #undef CHOYA_GL
+  // Opcionales (sin ellas se suben los datos como antes).
+  if (g_loader != nullptr) {
+    gl.BufferStorageEXT = reinterpret_cast<decltype(gl.BufferStorageEXT)>(g_loader("glBufferStorageEXT"));
+    gl.MapBufferRange = reinterpret_cast<decltype(gl.MapBufferRange)>(g_loader("glMapBufferRange"));
+    gl.UnmapBuffer = reinterpret_cast<decltype(gl.UnmapBuffer)>(g_loader("glUnmapBuffer"));
+    gl.DeleteBuffers = reinterpret_cast<decltype(gl.DeleteBuffers)>(g_loader("glDeleteBuffers"));
+  }
   return ok;
 }
 
@@ -1017,12 +1029,50 @@ struct WordTexture {
   GLuint id = 0;
   int rows = 0;
 };
+// Anillo persistente: un búfer GL creado una vez (GL_EXT_buffer_storage) y mapeado para siempre; la CPU escribe
+// en él con memcpy y la GPU lee de ahí. Igual que los anillos del renderer GLES de Nebula (Super Mario Galaxy en la
+// RG35XX H): nada de memoria nueva en cada cuadro. Solo se rehace si un cuadro no cabe.
+struct Ring {
+  GLuint buf = 0;
+  uint8_t* ptr = nullptr;
+  size_t size = 0;
+};
 struct FrameResources {
   WordTexture vtex, atex;
   GLuint ubo = 0, ebo = 0;
   size_t uboSize = 0, eboSize = 0;
+  Ring rv, ra, ru, ri;    // vértices, arreglos, uniformes, índices (con búferes persistentes)
   void* fence = nullptr;  // la GPU terminó el cuadro que usó estos recursos
 };
+bool g_persistent = false;  // GL_EXT_buffer_storage disponible y funcionando
+constexpr GLenum kPixelUnpackBuffer = 0x88EC, kCopyWriteBuffer = 0x8F37;
+constexpr GLbitfield kMapWrite = 0x0002, kMapPersistent = 0x0040, kMapCoherent = 0x0080;
+
+bool ensure_ring(Ring& r, size_t need, size_t minimum) {
+  if (r.buf != 0 && r.size >= need) return true;
+  if (r.buf != 0) {
+    gl.BindBuffer(kCopyWriteBuffer, r.buf);
+    gl.UnmapBuffer(kCopyWriteBuffer);
+    gl.DeleteBuffers(1, &r.buf);
+    r = Ring{};
+  }
+  const size_t size = std::max(minimum, need + need / 2);
+  gl.GenBuffers(1, &r.buf);
+  gl.BindBuffer(kCopyWriteBuffer, r.buf);
+  gl.BufferStorageEXT(kCopyWriteBuffer, static_cast<GLsizeiptr>(size), nullptr,
+                      kMapWrite | kMapPersistent | kMapCoherent);
+  r.ptr = static_cast<uint8_t*>(gl.MapBufferRange(kCopyWriteBuffer, 0, static_cast<GLsizeiptr>(size),
+                                                  kMapWrite | kMapPersistent | kMapCoherent));
+  gl.BindBuffer(kCopyWriteBuffer, 0);
+  if (r.ptr == nullptr) {
+    log_line("motor: no se pudo mapear un búfer persistente de %zu KB; se sube como antes", size / 1024);
+    gl.DeleteBuffers(1, &r.buf);
+    r = Ring{};
+    return false;
+  }
+  r.size = size;
+  return true;
+}
 FrameResources g_ring[kRing];
 int g_ringIndex = 0;
 GLuint g_vao = 0;
@@ -1030,7 +1080,7 @@ GLint g_uboAlign = 16;
 bool g_glReady = false, g_glFailed = false;
 std::vector<uint8_t> g_tail;
 
-bool upload_words(WordTexture& t, const std::vector<uint8_t>& bytes) {
+bool upload_words(WordTexture& t, const std::vector<uint8_t>& bytes, Ring* ring = nullptr) {
   const size_t words = (bytes.size() + 3) / 4;
   const int rows = static_cast<int>((words + kTexWidth - 1) / kTexWidth);
   if (rows == 0) return true;
@@ -1047,6 +1097,25 @@ bool upload_words(WordTexture& t, const std::vector<uint8_t>& bytes) {
     t.rows = alloc;
   }
   gl.BindTexture(kTexture2D, t.id);
+  if (ring != nullptr && ensure_ring(*ring, static_cast<size_t>(rows) * kTexWidth * 4, 4u << 20)) {
+    // Desde el anillo persistente (PBO): la textura se llena en la GPU, sin copias del driver ni memoria nueva.
+    std::memcpy(ring->ptr, bytes.data(), bytes.size());
+    const size_t padded = words * 4;
+    if (padded > bytes.size()) std::memset(ring->ptr + bytes.size(), 0, padded - bytes.size());
+    gl.BindBuffer(kPixelUnpackBuffer, ring->buf);
+    const size_t rowBytes = static_cast<size_t>(kTexWidth) * 4;
+    const int fullRows = static_cast<int>(words / kTexWidth);
+    if (fullRows > 0) {
+      gl.TexSubImage2D(kTexture2D, 0, 0, 0, kTexWidth, fullRows, kRedInteger, kUnsignedInt, nullptr);
+    }
+    const int restWords = static_cast<int>(words - static_cast<size_t>(fullRows) * kTexWidth);
+    if (restWords > 0) {
+      gl.TexSubImage2D(kTexture2D, 0, 0, fullRows, restWords, 1, kRedInteger, kUnsignedInt,
+                       reinterpret_cast<const void*>(static_cast<uintptr_t>(fullRows) * rowBytes));
+    }
+    gl.BindBuffer(kPixelUnpackBuffer, 0);
+    return true;
+  }
   // Filas completas directo de los datos; la última fila (incompleta) desde un búfer pequeño.
   const size_t rowBytes = static_cast<size_t>(kTexWidth) * 4;
   const int fullRows = static_cast<int>(bytes.size() / rowBytes);
@@ -1262,7 +1331,25 @@ bool init_gl() {
     gl.TexStorage2D(kTexture2D, 1, kRgba8, 1, 1);
     gl.TexSubImage2D(kTexture2D, 0, 0, 0, 1, 1, kRgba, kUnsignedByte, &white);
   }
-  log_line("motor: listo (alineación de UBO %d)", g_uboAlign);
+  {
+    // Búferes persistentes: la extensión y sus funciones; CHOYA_GX_PERSISTENTE=0 los apaga.
+    const char* env = std::getenv("CHOYA_GX_PERSISTENTE");
+    const bool wanted = env == nullptr || std::strcmp(env, "0") != 0;
+    g_persistent = wanted && gl.BufferStorageEXT != nullptr && gl.MapBufferRange != nullptr && gl.UnmapBuffer != nullptr &&
+                   gl.DeleteBuffers != nullptr;
+    if (g_persistent) {
+      Ring probe;
+      g_persistent = ensure_ring(probe, 4096, 4096);
+      if (probe.buf != 0) {
+        gl.BindBuffer(kCopyWriteBuffer, probe.buf);
+        gl.UnmapBuffer(kCopyWriteBuffer);
+        gl.BindBuffer(kCopyWriteBuffer, 0);
+        gl.DeleteBuffers(1, &probe.buf);
+      }
+    }
+  }
+  log_line("motor: listo (alineación de UBO %d; búferes persistentes %s)", g_uboAlign,
+           g_persistent ? "sí, como en Nebula" : "no, se suben los datos en cada cuadro");
   return true;
 }
 
@@ -1896,17 +1983,32 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
   }
   gl.ActiveTexture(kTexture0);
-  if (!upload_words(res.vtex, f.verts)) {
+  if (!upload_words(res.vtex, f.verts, g_persistent ? &res.rv : nullptr)) {
     log_line("motor: cuadro demasiado grande para la textura de vértices");
     return false;
   }
   gl.ActiveTexture(kTexture0 + 1);
-  if (!upload_words(res.atex, f.storage)) {
+  if (!upload_words(res.atex, f.storage, g_persistent ? &res.ra : nullptr)) {
     log_line("motor: cuadro demasiado grande para la textura de arreglos");
     return false;
   }
-  // Uniformes y elementos: la GPU ya soltó estos búferes (la espera de arriba), así que se reescriben sin pedir
+  GLuint ubo = res.ubo;
+  bool ringUniforms = false;
+  if (g_persistent && ensure_ring(res.ru, f.uniforms.size(), 4u << 20) &&
+      (f.indices.empty() || ensure_ring(res.ri, f.indices.size(), 2u << 20))) {
+    // Uniformes e índices en los anillos persistentes: memcpy y listo.
+    std::memcpy(res.ru.ptr, f.uniforms.data(), f.uniforms.size());
+    ubo = res.ru.buf;
+    gl.BindVertexArray(g_vao);
+    if (!f.indices.empty()) {
+      std::memcpy(res.ri.ptr, f.indices.data(), f.indices.size());
+      gl.BindBuffer(kElementArrayBuffer, res.ri.buf);
+    }
+    ringUniforms = true;
+  }
+  // Sin búferes persistentes: la GPU ya soltó estos búferes (la espera de arriba), así que se reescriben sin pedir
   // memoria nueva; solo crecen si el cuadro no cabe.
+  if (!ringUniforms) {
   gl.BindBuffer(kUniformBuffer, res.ubo);
   if (f.uniforms.size() > res.uboSize) {
     res.uboSize = f.uniforms.size() + f.uniforms.size() / 4;
@@ -1922,11 +2024,11 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     }
     gl.BufferSubData(kElementArrayBuffer, 0, static_cast<GLsizeiptr>(f.indices.size()), f.indices.data());
   }
+  }
   gl.ActiveTexture(kTexture0);
   gl.BindTexture(kTexture2D, res.vtex.id);
   gl.ActiveTexture(kTexture0 + 1);
   gl.BindTexture(kTexture2D, res.atex.id);
-  const GLuint ubo = res.ubo;
   uint32_t drawIndex = 0;
 
 

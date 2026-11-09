@@ -10,7 +10,13 @@
 #include <vector>
 using namespace choya;
 static void* egl; static void* gles;
-static void* gl_proc(const char* n) { return dlsym(gles, n); }
+static void* (*egl_get_proc)(const char*) = nullptr;
+// Como en la consola (choya_gles.cpp): la biblioteca y, si no está ahí (extensiones), eglGetProcAddress.
+static void* gl_proc(const char* n) {
+  void* p = dlsym(gles, n);
+  if (!p && egl_get_proc) p = egl_get_proc(n);
+  return p;
+}
 static void log_line(const char* l) { std::printf("[log] %s\n", l); }
 typedef void* (*GetDisplayFn)(void*);
 static void put_be_f32(std::vector<uint8_t>& v, float f){ uint32_t u; memcpy(&u,&f,4); v.push_back(u>>24); v.push_back(u>>16); v.push_back(u>>8); v.push_back(u); }
@@ -22,6 +28,7 @@ static bool init_egl(int w, int h) {
   egl = dlopen("libEGL.so.1", RTLD_NOW); gles = dlopen("libGLESv2.so.2", RTLD_NOW);
   if (!egl || !gles) return false;
   auto GetDisplay = (GetDisplayFn)dlsym(egl, "eglGetDisplay");
+  egl_get_proc = (void* (*)(const char*))dlsym(egl, "eglGetProcAddress");
   auto Initialize = (unsigned(*)(void*,int*,int*))dlsym(egl, "eglInitialize");
   auto BindAPI = (unsigned(*)(unsigned))dlsym(egl, "eglBindAPI");
   auto ChooseConfig = (unsigned(*)(void*,const int*,void**,int,int*))dlsym(egl, "eglChooseConfig");

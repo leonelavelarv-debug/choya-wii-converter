@@ -111,8 +111,10 @@ escribir_resumen() {
     [ -f "$DIR/choya-gles.txt" ] && grep -v "extensiones:" "$DIR/choya-gles.txt" | tail -40 || echo "choya-gles.txt no se escribio"
     echo "--- cuadros por segundo"
     grep -E "\[vi\] fps" "$DIR/run.log" | tail -15
+    echo "--- rendimiento (CHOYA_PERF)"
+    cat "$DIR/rendimiento.txt" 2>/dev/null
     echo "--- memoria cada 10 s"
-    tail -40 "$DIR/memoria.txt" 2>/dev/null
+    tail -120 "$DIR/memoria.txt" 2>/dev/null
     echo "--- memoria del motor"
     grep -h "motor: memoria" "$DIR/choya-gles.txt" 2>/dev/null | tail -12
     echo "--- mandos"
@@ -123,6 +125,58 @@ escribir_resumen() {
     tail -15 "$DIR/run.log"
   } > "$DIR/resumen.txt" 2>&1
 }
+
+# CHOYA_PERF=1 (por defecto): CPU, GPU y memoria a su frecuencia máxima mientras se juega, como NEBULA_PERF en el
+# port de Super Mario Galaxy (Nebula); se restauran al salir. Lo que cambia queda en rendimiento.txt.
+PERF_SAVED=""
+perf_restore() {  # al revés de como se cambiaron (el mínimo vuelve antes que el máximo)
+  local list="" entry
+  for entry in $PERF_SAVED; do list="$entry $list"; done
+  for entry in $list; do
+    echo "${entry#*=}" > "${entry%%=*}" 2>/dev/null || { [ -n "${ESUDO:-}" ] && echo "${entry#*=}" | $ESUDO tee "${entry%%=*}" >/dev/null 2>&1; }
+  done
+  PERF_SAVED=""
+}
+perf_set() {  # archivo valor: lo escribe y apunta el valor anterior para restaurarlo al salir
+  local old; old=$(cat "$1" 2>/dev/null)
+  [ "$old" = "$2" ] && return 0
+  if echo "$2" > "$1" 2>/dev/null || { [ -n "${ESUDO:-}" ] && echo "$2" | $ESUDO tee "$1" >/dev/null 2>&1; }; then
+    PERF_SAVED="$PERF_SAVED $1=$old"; echo "rendimiento: $1 $old -> $2"
+  else echo "rendimiento: no se pudo escribir $2 en $1 (sigue en $old)"; fi
+}
+top_freq() { tr ' ' '\n' < "$1" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1; }
+{
+  for dir in /sys/devices/system/cpu/cpufreq/policy*; do
+    [ -d "$dir" ] && echo "cpu $(basename "$dir"): $(cat "$dir/scaling_governor" 2>/dev/null) [$(cat "$dir/scaling_available_governors" 2>/dev/null)] $(cat "$dir/scaling_cur_freq" 2>/dev/null) kHz ($(cat "$dir/scaling_min_freq" 2>/dev/null)-$(cat "$dir/scaling_max_freq" 2>/dev/null), hasta $(cat "$dir/cpuinfo_max_freq" 2>/dev/null))"
+  done
+  for dir in /sys/class/devfreq/*; do
+    [ -d "$dir" ] && echo "devfreq $(basename "$dir"): $(cat "$dir/governor" 2>/dev/null) [$(cat "$dir/available_governors" 2>/dev/null)] $(cat "$dir/cur_freq" 2>/dev/null) Hz ($(cat "$dir/min_freq" 2>/dev/null)-$(cat "$dir/max_freq" 2>/dev/null); $(cat "$dir/available_frequencies" 2>/dev/null))"
+  done
+} > "$DIR/rendimiento.txt" 2>&1
+if [ "${CHOYA_PERF:-1}" = "1" ]; then
+  for dir in /sys/devices/system/cpu/cpufreq/policy*; do
+    [ -d "$dir" ] || continue
+    if grep -qw performance "$dir/scaling_available_governors" 2>/dev/null; then
+      perf_set "$dir/scaling_governor" performance
+    else
+      top=$(cat "$dir/cpuinfo_max_freq" 2>/dev/null)
+      [ -n "$top" ] && perf_set "$dir/scaling_max_freq" "$top" && perf_set "$dir/scaling_min_freq" "$top"
+    fi
+  done >> "$DIR/rendimiento.txt" 2>&1
+  for dir in /sys/class/devfreq/*; do
+    case "$(basename "$dir")" in *gpu*|*mali*|*1800000*|*dmc*) ;; *) continue ;; esac
+    if grep -qw performance "$dir/available_governors" 2>/dev/null; then
+      perf_set "$dir/governor" performance
+    fi
+    # Sin "performance" (o si el driver no le hace caso): el mínimo en la frecuencia más alta.
+    top=$(top_freq "$dir/available_frequencies")
+    if [ -n "$top" ]; then
+      perf_set "$dir/max_freq" "$top"
+      perf_set "$dir/min_freq" "$top"
+    fi
+  done >> "$DIR/rendimiento.txt" 2>&1
+  trap perf_restore EXIT
+fi
 
 # Salir: la combinación del firmware con Start (el juego la atiende y se cierra limpio; gptokeyb mata con la misma
 # si no contesta): MENU (HOTKEY=guide) en KNULLI y muOS; SELECT (el de gptokeyb sin HOTKEY) en ArkOS y el resto.
@@ -155,6 +209,18 @@ esperar_juego() {
         "$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo 0) / 1000 ))" \
         "$(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 ))C"
     } >> "$DIR/memoria.txt" 2>/dev/null
+    # Qué zonas de memoria del juego son las grandes (smaps: archivo o dispositivo de cada zona; /dev/mali0 o
+    # dmabuf = la GPU) y la memoria total de la Mali si el kernel la muestra.
+    local jp
+    jp=$(pgrep -n WiiCompiled)
+    if [ -n "$jp" ]; then
+      awk '/^[0-9a-f]+-[0-9a-f]+ /{n=$6; if (n=="") n="[anon]"} /^Rss:/{r[n]+=$2}
+           END{for (k in r) if (r[k] >= 8192) printf "%d %s\n", r[k]/1024, k}' /proc/"$jp"/smaps 2>/dev/null |
+        sort -rn | head -6 | awk '{printf "        %s MB %s\n", $1, $2}' >> "$DIR/memoria.txt"
+    fi
+    for g in /sys/kernel/debug/mali0/gpu_memory /sys/kernel/debug/mali/gpu_memory; do
+      [ -r "$g" ] && { awk 'NR==1{printf "        Mali: %d MB\n", $2*4/1024}' "$g" >> "$DIR/memoria.txt"; break; }
+    done
     kill -0 "$1" 2>/dev/null && { escribir_resumen; sync; }
   done
 }
@@ -202,5 +268,6 @@ else
   parar_gptokeyb
 fi
 
+perf_restore
 escribir_resumen
 sync
