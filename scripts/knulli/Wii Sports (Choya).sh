@@ -110,7 +110,7 @@ escribir_resumen() {
     echo "--- cuadros por segundo"
     grep -E "\[vi\] fps" "$DIR/run.log" | tail -15
     echo "--- mandos"
-    grep -hE "mandos|gamepad|joystick|\[input\]|volcado" "$DIR/choya-gles.txt" "$DIR/run.log" 2>/dev/null | grep -v "^\[choya-gles\]" | head -60
+    grep -hE "mando|gamepad|joystick|\[input\]|volcado" "$DIR/choya-gles.txt" "$DIR/run.log" 2>/dev/null | grep -v "^\[choya-gles\]" | head -80
     echo "--- errores"
     grep -iE "fatal|error|abort|AccessViolation|choya\]|not found|cannot open" "$DIR/run.log" | head -20
     echo "--- final del log"

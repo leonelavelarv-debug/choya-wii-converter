@@ -29,6 +29,8 @@
 
 #include <SDL3/SDL.h>
 
+#include "choya_mando.h"  // el mando de la consola (como en Nebula)
+
 extern "C" bool choya_gx_draw_frame(int screenWidth, int screenHeight);  // motor de Choya (aurora)
 extern "C" void choya_gx_request_dump();  // volcado del siguiente cuadro (aurora)
 
@@ -330,6 +332,8 @@ void CheckGamepads() {
     int count = 0;
     SDL_JoystickID* ids = SDL_GetGamepads(&count);
     bool dump = false;
+    ChoyaMando console{};
+    if (choya_mando_leer(&console) && console.guide && console.rightshoulder) dump = true;
     for (int i = 0; ids && i < count; ++i) {
         SDL_Gamepad* pad = SDL_GetGamepadFromID(ids[i]);
         if (pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_GUIDE) &&
