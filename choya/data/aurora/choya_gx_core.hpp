@@ -97,6 +97,9 @@ void capture_begin(const uint8_t* verts, size_t vertsSize, const uint8_t* unifor
 // hasResolve: el pase termina con la copia a pantalla; copyRect es la zona del EFB que se copia.
 void capture_pass(uint32_t width, uint32_t height, bool clearColor, bool clearDepth, const float clearRgba[4],
                   float clearDepthValue, bool hasResolve, const Rect& copyRect) noexcept;
+// Copia del EFB a una textura (GXCopyTex) al terminar el pase actual: la zona rect (coordenadas del pase) va a la
+// textura texId (texW x texH) convertida al formato fmt (GXTexFmt); opaque pone el alfa a 1.
+void capture_copy(uint64_t texId, const Rect& rect, uint32_t texW, uint32_t texH, uint32_t fmt, bool opaque) noexcept;
 void capture_viewport(const Viewport& vp) noexcept;
 void capture_scissor(const Rect& rect) noexcept;
 void capture_draw(uint64_t pipeline, uint32_t idxOffset, uint32_t indexCount, uint32_t instanceCount,

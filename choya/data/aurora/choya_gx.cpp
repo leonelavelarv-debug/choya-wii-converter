@@ -264,6 +264,12 @@ void capture_pass(uint32_t width, uint32_t height, bool clearColor, bool clearDe
   core::capture_pass(width, height, clearColor, clearDepth, clearRgba, clearDepthValue, isDisplayCopy, rect);
 }
 
+void capture_copy(const gfx::TextureRef* tex, const gfx::ClipRect& rect, uint32_t fmt, bool opaque) noexcept {
+  if (tex == nullptr) return;
+  core::capture_copy(reinterpret_cast<uintptr_t>(tex), core::Rect{rect.x, rect.y, rect.width, rect.height},
+                     tex->size.width, tex->size.height, fmt, opaque);
+}
+
 void capture_viewport(const gfx::Viewport& vp) noexcept {
   core::capture_viewport(core::Viewport{vp.left, vp.top, vp.width, vp.height, vp.znear, vp.zfar});
 }

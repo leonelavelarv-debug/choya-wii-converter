@@ -115,6 +115,7 @@ struct Gl {
   void (*GenVertexArrays)(GLsizei, GLuint*);
   void (*BindVertexArray)(GLuint);
   void (*DrawElements)(GLenum, GLsizei, GLenum, const void*);
+  void (*DrawArrays)(GLenum, GLint, GLsizei);
   void (*Viewport)(GLint, GLint, GLsizei, GLsizei);
   void (*Scissor)(GLint, GLint, GLsizei, GLsizei);
   void (*Enable)(GLenum);
@@ -194,6 +195,7 @@ bool load_gl() {
   CHOYA_GL(GenVertexArrays);
   CHOYA_GL(BindVertexArray);
   CHOYA_GL(DrawElements);
+  CHOYA_GL(DrawArrays);
   CHOYA_GL(Viewport);
   CHOYA_GL(Scissor);
   CHOYA_GL(Enable);
@@ -230,7 +232,7 @@ bool load_gl() {
 }
 
 // --- Cuadro capturado -----------------------------------------------------------------------------------------
-enum class Op : uint8_t { Pass, Viewport, Scissor, Draw, Clear };
+enum class Op : uint8_t { Pass, Viewport, Scissor, Draw, Clear, Copy };
 struct Item {
   Op op;
   uint8_t pad[7];
@@ -256,6 +258,13 @@ struct Item {
       uint32_t useScissor;
       Rect scissor;
     } clear;
+    // Copia del EFB a una textura (GXCopyTex) al terminar el pase: zona rect -> textura tex (texW x texH, fmt).
+    struct {
+      uint64_t tex;
+      Rect rect;
+      uint32_t texW, texH, fmt;
+      uint8_t opaque, pad[3];
+    } copy;
   };
 };
 static_assert(sizeof(Item) == 56);
@@ -278,7 +287,7 @@ struct Stats {
   uint64_t frames = 0, draws = 0, clears = 0, skippedLine = 0, skippedConfig = 0, skippedAlign = 0,
            skippedProgram = 0, passes = 0;
   uint64_t bytesVerts = 0, bytesUniforms = 0, bytesIndices = 0, bytesStorage = 0;
-  uint64_t texUploads = 0, missingTextures = 0;
+  uint64_t texUploads = 0, missingTextures = 0, copies = 0;
   double cpuMs = 0;
 } g_stats;
 
@@ -306,6 +315,12 @@ TexShared& texs() {
   return *s;
 }
 std::unordered_map<uint64_t, GlTexture> g_textures;  // solo en el hilo del motor
+// Texturas que son copias del EFB (GXCopyTex): las llena el motor en la GPU, con su framebuffer.
+struct CopyTexture {
+  GLuint tex = 0, fbo = 0;
+  uint32_t width = 0, height = 0;
+};
+std::unordered_map<uint64_t, CopyTexture> g_copyTextures;  // solo en el hilo del motor
 GLuint g_whiteTexture = 0;
 std::unordered_map<uint64_t, GLuint> g_samplers;
 
@@ -1037,6 +1052,12 @@ void process_textures() {
       gl.DeleteTextures(1, &it->second.id);
       g_textures.erase(it);
     }
+    auto c = g_copyTextures.find(id);
+    if (c != g_copyTextures.end()) {
+      gl.DeleteFramebuffers(1, &c->second.fbo);
+      gl.DeleteTextures(1, &c->second.tex);
+      g_copyTextures.erase(c);
+    }
   }
   if (pending.empty()) return;
   gl.ActiveTexture(kTexture0 + 2);
@@ -1106,8 +1127,10 @@ void bind_textures(uint64_t bindGroup) {
       auto it = g_textures.find(bd.tex[i]);
       if (it != g_textures.end()) {
         tex = it->second.id;
+      } else if (auto c = g_copyTextures.find(bd.tex[i]); c != g_copyTextures.end()) {
+        tex = c->second.tex;  // copia del EFB
       } else {
-        ++g_stats.missingTextures;  // copia del EFB o paleta: todavía no
+        ++g_stats.missingTextures;  // paleta, o una copia que todavía no se hace
       }
       samp = sampler_for(bd.samp[i]);
     }
@@ -1142,7 +1165,7 @@ bool init_gl() {
 
 // Framebuffer del EFB (color RGBA8 + profundidad/estencil).
 struct Efb {
-  GLuint fbo = 0, color = 0, depth = 0;
+  GLuint fbo = 0, color = 0, depth = 0;  // depth: textura (las copias del EFB de profundidad la leen)
   int width = 0, height = 0;
 } g_efb;
 
@@ -1151,7 +1174,7 @@ bool ensure_efb(int width, int height) {
   if (g_efb.fbo != 0) {
     gl.DeleteFramebuffers(1, &g_efb.fbo);
     gl.DeleteTextures(1, &g_efb.color);
-    gl.DeleteRenderbuffers(1, &g_efb.depth);
+    gl.DeleteTextures(1, &g_efb.depth);
   }
   g_efb.width = std::max(width, g_efb.width);
   g_efb.height = std::max(height, g_efb.height);
@@ -1160,13 +1183,15 @@ bool ensure_efb(int width, int height) {
   gl.TexStorage2D(kTexture2D, 1, kRgba8, g_efb.width, g_efb.height);
   gl.TexParameteri(kTexture2D, kTextureMinFilter, kLinear);
   gl.TexParameteri(kTexture2D, kTextureMagFilter, kLinear);
-  gl.GenRenderbuffers(1, &g_efb.depth);
-  gl.BindRenderbuffer(kRenderbuffer, g_efb.depth);
-  gl.RenderbufferStorage(kRenderbuffer, kDepth24Stencil8, g_efb.width, g_efb.height);
+  gl.GenTextures(1, &g_efb.depth);
+  gl.BindTexture(kTexture2D, g_efb.depth);
+  gl.TexStorage2D(kTexture2D, 1, kDepth24Stencil8, g_efb.width, g_efb.height);
+  gl.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
+  gl.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
   gl.GenFramebuffers(1, &g_efb.fbo);
   gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
   gl.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, g_efb.color, 0);
-  gl.FramebufferRenderbuffer(kFramebuffer, kDepthStencilAttachment, kRenderbuffer, g_efb.depth);
+  gl.FramebufferTexture2D(kFramebuffer, kDepthStencilAttachment, kTexture2D, g_efb.depth, 0);
   const GLenum status = gl.CheckFramebufferStatus(kFramebuffer);
   if (status != kFramebufferComplete) {
     log_line("motor: el framebuffer del EFB (%dx%d) no está completo (0x%04X)", g_efb.width, g_efb.height, status);
@@ -1185,6 +1210,156 @@ void present_efb(const Rect& r, int screenWidth, int screenHeight) {
   const int y0 = g_efb.height - r.y - r.height;
   gl.BlitFramebuffer(r.x, y0, r.x + r.width, y0 + r.height, 0, 0, screenWidth, screenHeight, kColorBufferBit, kLinear);
   gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+}
+
+// --- Copias del EFB a texturas (GXCopyTex) ------------------------------------------------------------------
+// Igual que tex_copy_conv de aurora: la zona del EFB se convierte al formato de la copia y se guarda en RGBA8 con el
+// valor que el juego leerá al muestrearla (intensidad en los cuatro canales, alfa a 1 en RGB565, profundidad en
+// bytes...). Fila 0 de la textura = arriba de la zona, como las texturas subidas.
+const char* kCopyVs = R"(#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+const char* kCopyFs = R"(#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D u_color;
+uniform highp sampler2D u_depth;
+uniform vec4 u_rect;   // zona del pase: x, y (arriba), ancho, alto
+uniform vec4 u_size;   // ancho y alto del EFB, ancho y alto de la textura
+uniform vec4 u_mode;   // formato (GXTexFmt), alfa opaco, Z invertida
+out vec4 o_color;
+float inten(vec3 c) { return dot(c, vec3(0.257, 0.504, 0.098)) + 16.0 / 255.0; }
+float q4(float v) { return floor(v * 16.0) / 15.0; }
+void main() {
+  vec2 t = gl_FragCoord.xy / u_size.zw;
+  vec2 p = u_rect.xy + t * u_rect.zw;
+  vec2 uv = vec2(p.x / u_size.x, 1.0 - p.y / u_size.y);
+  int fmt = int(u_mode.x + 0.5);
+  vec4 r;
+  if ((fmt & 0x10) != 0) {
+    float d = texture(u_depth, uv).r;
+    float z = u_mode.z > 0.5 ? 1.0 - d : d;
+    uint z24 = min(uint(clamp(z, 0.0, 1.0) * 16777215.0 + 0.5), 0xFFFFFFu);
+    vec3 b = vec3(float((z24 >> 16) & 255u), float((z24 >> 8) & 255u), float(z24 & 255u)) / 255.0;
+    if (fmt == 0x11) r = vec4(b.x);                        // Z8
+    else if (fmt == 0x13) r = vec4(b.x, b.x, b.x, 1.0);    // Z16
+    else if (fmt == 0x16) r = vec4(b, 1.0);                // Z24X8
+    else if (fmt == 0x30) r = vec4(q4(b.x));               // Z4
+    else if (fmt == 0x39) r = vec4(b.y);                   // Z8M
+    else if (fmt == 0x3A) r = vec4(b.z);                   // Z8L
+    else r = vec4(b.y, b.y, b.y, b.z);                     // Z16L
+  } else {
+    vec4 c = texture(u_color, uv);
+    if (u_mode.y > 0.5) c.a = 1.0;
+    float i = inten(c.rgb);
+    if (fmt == 0x0) r = vec4(q4(i));
+    else if (fmt == 0x1) r = vec4(i);
+    else if (fmt == 0x2) r = vec4(q4(i), q4(i), q4(i), q4(c.a));
+    else if (fmt == 0x3) r = vec4(i, i, i, c.a);
+    else if (fmt == 0x4) r = vec4(c.rgb, 1.0);
+    else if (fmt == 0x20) r = vec4(q4(c.r));
+    else if (fmt == 0x22) r = vec4(q4(c.r), q4(c.r), q4(c.r), q4(c.a));
+    else if (fmt == 0x23) r = vec4(c.r, c.r, c.r, c.a);
+    else if (fmt == 0x27) r = vec4(c.a);
+    else if (fmt == 0x28) r = vec4(c.r);
+    else if (fmt == 0x29) r = vec4(c.g);
+    else if (fmt == 0x2A) r = vec4(c.b);
+    else if (fmt == 0x2B) r = vec4(c.r, c.r, c.r, c.g);
+    else if (fmt == 0x2C) r = vec4(c.g, c.g, c.g, c.b);
+    else r = c;                                            // RGB5A3, RGBA8, YUVA8
+  }
+  o_color = clamp(r, 0.0, 1.0);
+}
+)";
+struct CopyProgram {
+  GLuint id = 0;
+  GLint rect = -1, size = -1, mode = -1;
+  bool tried = false;
+} g_copyProgram;
+
+bool copy_program() {
+  if (g_copyProgram.tried) return g_copyProgram.id != 0;
+  g_copyProgram.tried = true;
+  std::string err;
+  const GLuint v = compile(kVertexShader, kCopyVs, err);
+  const GLuint f = v ? compile(kFragmentShader, kCopyFs, err) : 0;
+  if (v && f) {
+    const GLuint prog = gl.CreateProgram();
+    gl.AttachShader(prog, v);
+    gl.AttachShader(prog, f);
+    gl.LinkProgram(prog);
+    GLint ok = 0;
+    gl.GetProgramiv(prog, kLinkStatus, &ok);
+    if (ok) {
+      g_copyProgram.id = prog;
+      gl.UseProgram(prog);
+      gl.Uniform1i(gl.GetUniformLocation(prog, "u_color"), 10);
+      gl.Uniform1i(gl.GetUniformLocation(prog, "u_depth"), 11);
+      g_copyProgram.rect = gl.GetUniformLocation(prog, "u_rect");
+      g_copyProgram.size = gl.GetUniformLocation(prog, "u_size");
+      g_copyProgram.mode = gl.GetUniformLocation(prog, "u_mode");
+    } else {
+      GLint len = 0;
+      gl.GetProgramiv(prog, kInfoLogLength, &len);
+      err.assign(static_cast<size_t>(len > 1 ? len : 1), '\0');
+      gl.GetProgramInfoLog(prog, len, nullptr, err.data());
+    }
+  }
+  if (v) gl.DeleteShader(v);
+  if (f) gl.DeleteShader(f);
+  if (g_copyProgram.id == 0) log_line("motor: no compila el programa de copias del EFB: %s", err.c_str());
+  return g_copyProgram.id != 0;
+}
+
+// Hace la copia; deja enlazado el framebuffer del EFB (el que llama repone viewport y recorte).
+void run_copy(const Item& it) {
+  const auto& c = it.copy;
+  if (c.texW == 0 || c.texH == 0 || c.texW > 4096 || c.texH > 4096 || c.rect.width <= 0 || c.rect.height <= 0) return;
+  if (!copy_program()) return;
+  CopyTexture& ct = g_copyTextures[c.tex];
+  if (ct.tex == 0 || ct.width != c.texW || ct.height != c.texH) {
+    if (ct.fbo != 0) gl.DeleteFramebuffers(1, &ct.fbo);
+    if (ct.tex != 0) gl.DeleteTextures(1, &ct.tex);
+    gl.ActiveTexture(kTexture0 + 10);
+    gl.GenTextures(1, &ct.tex);
+    gl.BindTexture(kTexture2D, ct.tex);
+    gl.TexStorage2D(kTexture2D, 1, kRgba8, static_cast<GLsizei>(c.texW), static_cast<GLsizei>(c.texH));
+    gl.GenFramebuffers(1, &ct.fbo);
+    gl.BindFramebuffer(kFramebuffer, ct.fbo);
+    gl.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, ct.tex, 0);
+    ct.width = c.texW;
+    ct.height = c.texH;
+  }
+  gl.BindFramebuffer(kFramebuffer, ct.fbo);
+  gl.Viewport(0, 0, static_cast<GLsizei>(c.texW), static_cast<GLsizei>(c.texH));
+  gl.Disable(kScissorTest);
+  gl.Disable(kDepthTest);
+  gl.Disable(kBlend);
+  gl.Disable(kCullFace);
+  gl.ColorMask(1, 1, 1, 1);
+  gl.UseProgram(g_copyProgram.id);
+  gl.Uniform4f(g_copyProgram.rect, static_cast<float>(c.rect.x), static_cast<float>(c.rect.y),
+               static_cast<float>(c.rect.width), static_cast<float>(c.rect.height));
+  gl.Uniform4f(g_copyProgram.size, static_cast<float>(g_efb.width), static_cast<float>(g_efb.height),
+               static_cast<float>(c.texW), static_cast<float>(c.texH));
+  gl.Uniform4f(g_copyProgram.mode, static_cast<float>(c.fmt), c.opaque ? 1.f : 0.f, g_reversedZ ? 1.f : 0.f, 0.f);
+  gl.ActiveTexture(kTexture0 + 10);
+  gl.BindTexture(kTexture2D, g_efb.color);
+  gl.BindSampler(10, 0);
+  gl.ActiveTexture(kTexture0 + 11);
+  gl.BindTexture(kTexture2D, g_efb.depth);
+  gl.BindSampler(11, 0);
+  gl.DrawArrays(kTriangles, 0, 3);
+  // Sin el EFB enlazado para muestrear mientras se vuelve a dibujar en él.
+  gl.BindTexture(kTexture2D, 0);
+  gl.ActiveTexture(kTexture0 + 10);
+  gl.BindTexture(kTexture2D, 0);
+  gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+  gl.Enable(kScissorTest);
+  ++g_stats.copies;
 }
 
 bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight);
@@ -1278,6 +1453,19 @@ void capture_pass(uint32_t width, uint32_t height, bool clearColor, bool clearDe
   g_recording.items.push_back(it);
 }
 
+void capture_copy(uint64_t texId, const Rect& rect, uint32_t texW, uint32_t texH, uint32_t fmt, bool opaque) noexcept {
+  if (!g_recordingActive) return;
+  Item it{};
+  it.op = Op::Copy;
+  it.copy.tex = texId;
+  it.copy.rect = rect;
+  it.copy.texW = texW;
+  it.copy.texH = texH;
+  it.copy.fmt = fmt;
+  it.copy.opaque = opaque ? 1 : 0;
+  g_recording.items.push_back(it);
+}
+
 void capture_viewport(const Viewport& vp) noexcept {
   if (!g_recordingActive) return;
   Item it{};
@@ -1335,7 +1523,7 @@ void capture_discard() noexcept { g_recordingActive = false; }
 
 // --- Volcado ------------------------------------------------------------------------------------------------
 namespace {
-constexpr char kDumpMagic[8] = {'C', 'H', 'O', 'Y', 'A', 'G', 'X', '2'};
+constexpr char kDumpMagic[8] = {'C', 'H', 'O', 'Y', 'A', 'G', 'X', '3'};  // 3: con copias del EFB (2 también se lee)
 
 void write_blob(FILE* f, const std::vector<uint8_t>& v) {
   const uint64_t n = v.size();
@@ -1430,7 +1618,8 @@ bool load_frame(const char* path) noexcept {
   if (!in) return false;
   char magic[8];
   uint32_t header[4];
-  bool ok = std::fread(magic, 1, 8, in) == 8 && std::memcmp(magic, kDumpMagic, 8) == 0 &&
+  bool ok = std::fread(magic, 1, 8, in) == 8 && std::memcmp(magic, kDumpMagic, 7) == 0 &&
+            (magic[7] == '2' || magic[7] == '3') &&
             std::fread(header, sizeof(header), 1, in) == 1 && header[0] == sizeof(PipelineDesc) &&
             header[1] == sizeof(Item);
   Frame f;
@@ -1568,6 +1757,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
     out[3] = static_cast<GLint>(h + 0.5f);
   };
   GLint scissorRect[4] = {0, g_efb.height - efbH, efbW, efbH};
+  GLint viewportRect[4] = {0, g_efb.height - efbH, efbW, efbH};
   bool presented = false;
   bool passOpen = false;
   bool passResolves = false;
@@ -1588,7 +1778,11 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
       passW = it.pass.width ? static_cast<int>(it.pass.width) : efbW;
       passH = it.pass.height ? static_cast<int>(it.pass.height) : efbH;
       passCopy = it.pass.copy.width > 0 && it.pass.copy.height > 0 ? it.pass.copy : Rect{0, 0, passW, passH};
-      gl.Viewport(0, g_efb.height - passH, passW, passH);
+      viewportRect[0] = 0;
+      viewportRect[1] = g_efb.height - passH;
+      viewportRect[2] = passW;
+      viewportRect[3] = passH;
+      gl.Viewport(viewportRect[0], viewportRect[1], viewportRect[2], viewportRect[3]);
       gl.Disable(kScissorTest);
       GLbitfield bits = 0;
       if (it.pass.clearColor) {
@@ -1613,6 +1807,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
       GLint r[4];
       to_gl_rect(it.viewport.left, it.viewport.top, it.viewport.width, it.viewport.height, r);
       gl.Viewport(r[0], r[1], r[2], r[3]);
+      std::memcpy(viewportRect, r, sizeof(r));
       const float minDepth = g_reversedZ ? 1.0f - it.viewport.zfar : it.viewport.znear;
       const float maxDepth = g_reversedZ ? 1.0f - it.viewport.znear : it.viewport.zfar;
       gl.DepthRangef(minDepth, maxDepth);
@@ -1621,6 +1816,14 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
       to_gl_rect(static_cast<float>(it.scissor.x), static_cast<float>(it.scissor.y),
                      static_cast<float>(it.scissor.width), static_cast<float>(it.scissor.height), scissorRect);
       gl.Scissor(scissorRect[0], scissorRect[1], std::max(0, scissorRect[2]), std::max(0, scissorRect[3]));
+    } break;
+    case Op::Copy: {
+      run_copy(it);
+      gl.Viewport(viewportRect[0], viewportRect[1], viewportRect[2], viewportRect[3]);
+      gl.Scissor(scissorRect[0], scissorRect[1], std::max(0, scissorRect[2]), std::max(0, scissorRect[3]));
+      gl.BindVertexArray(g_vao);
+      gl.ActiveTexture(kTexture0);
+      lastBindGroup = ~0ull;  // las texturas de copia pudieron rehacerse
     } break;
     case Op::Clear: {
       ClearDesc cc;
@@ -1704,9 +1907,10 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight) {
              "por cuadro (copia %.2f ms)",
              g_stats.bytesVerts / 300.0 / 1024, g_stats.bytesUniforms / 300.0 / 1024, g_stats.bytesIndices / 300.0 / 1024,
              g_stats.bytesStorage / 300.0 / 1024, g_stats.cpuMs / 300.0, g_captureUs.exchange(0) / 300.0 / 1000.0);
-    log_line("motor: texturas: %zu en GL, %llu subidas, %llu enlaces sin textura (copias del EFB o paletas)",
-             g_textures.size(), static_cast<unsigned long long>(g_stats.texUploads),
-             static_cast<unsigned long long>(g_stats.missingTextures));
+    log_line("motor: texturas: %zu en GL, %llu subidas, %zu copias del EFB (%.1f por cuadro), %llu enlaces sin textura "
+             "(paletas u otras)",
+             g_textures.size(), static_cast<unsigned long long>(g_stats.texUploads), g_copyTextures.size(),
+             g_stats.copies / 300.0, static_cast<unsigned long long>(g_stats.missingTextures));
     log_line("motor: %llu cuadros, por cuadro: %.1f dibujos, %.1f borrados, %.1f pases; saltados: %llu sin config, "
          "%llu líneas/puntos, %llu alineación, %llu sin programa; programas %zu; error GL 0x%04X",
          static_cast<unsigned long long>(g_stats.frames), g_stats.draws / 300.0, g_stats.clears / 300.0,

@@ -36,6 +36,8 @@ void capture_begin(const uint8_t* verts, size_t vertsSize, const uint8_t* unifor
 // isDisplayCopy: el pase termina con la copia a pantalla (GXCopyDisp); copyRect es la zona del EFB copiada.
 void capture_pass(uint32_t width, uint32_t height, bool clearColor, bool clearDepth, const float clearRgba[4],
                   float clearDepthValue, bool isDisplayCopy, const gfx::ClipRect& copyRect) noexcept;
+// Copia del EFB a una textura (GXCopyTex) al terminar el pase: rect es la zona del EFB, fmt el formato de la copia.
+void capture_copy(const gfx::TextureRef* tex, const gfx::ClipRect& rect, uint32_t fmt, bool opaque) noexcept;
 void capture_viewport(const gfx::Viewport& vp) noexcept;
 void capture_scissor(const gfx::ClipRect& rect) noexcept;
 void capture_gx_draw(const gx::DrawData& draw) noexcept;

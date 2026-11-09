@@ -202,6 +202,44 @@ int main(int argc, char** argv) {
   // Arriba a la izquierda (v=0) rojo, arriba a la derecha verde, abajo azul y blanco (GL lee desde abajo).
   int tl = pixel(100, 400), tr = pixel(540, 400), bl = pixel(100, 80), br = pixel(540, 80);
   ok = ok && tl == 0xFF0000 && tr == 0x00FF00 && bl == 0x0000FF && br == 0xFFFFFF;
+  if (!ok) std::puts("falló antes de las copias del EFB");
+
+  // Cuadro 4: copias del EFB (GXCopyTex). El pase 1 dibuja la textura 2x2 y se copia a la textura 500 (RGBA8,
+  // a 64x48) y a la 501 (I8: intensidad); el pase 2 dibuja la 500 a pantalla completa y la 501 en un cuadro chico.
+  gx::BindDesc bc{};
+  bc.tex[0] = 500;
+  bc.samp[0] = bd.samp[0];
+  gx::register_bind_group(100, bc);
+  gx::BindDesc bi{};
+  bi.tex[0] = 501;
+  bi.samp[0] = bd.samp[0];
+  gx::register_bind_group(101, bi);
+  std::vector<uint8_t> v5 = v4;
+  float q5[4][5] = {{-1,1,.5f,0,0},{-0.5f,1,.5f,1,0},{-1,0.5f,.5f,0,1},{-0.5f,0.5f,.5f,1,1}};  // arriba a la izquierda
+  for (auto& v : q5) for (float f : v) put_be_f32(v5, f);
+  std::vector<uint16_t> i5 = {0, 1, 2, 2, 1, 3, 4, 5, 6, 6, 5, 7};
+  gx::capture_begin(v5.data(), v5.size(), u4.data(), u4.size(), (const uint8_t*)i5.data(), i5.size() * 2, nullptr, 0);
+  gx::capture_pass(640, 480, true, true, black, 0.f, false, gx::Rect{0, 0, 0, 0});
+  gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+  gx::capture_scissor(gx::Rect{0, 0, 640, 480});
+  gx::capture_draw(4, 0, 6, 1, 0, UINT32_MAX, 99);
+  gx::capture_copy(500, gx::Rect{0, 0, 640, 480}, 64, 48, 0x6, false);
+  gx::capture_copy(501, gx::Rect{0, 0, 640, 480}, 64, 48, 0x1, false);
+  gx::capture_pass(640, 480, true, true, black, 0.f, true, gx::Rect{0, 0, 640, 480});
+  gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+  gx::capture_scissor(gx::Rect{0, 0, 640, 480});
+  gx::capture_draw(4, 0, 6, 1, 0, UINT32_MAX, 100);
+  gx::capture_draw(4, 12, 6, 1, 0, UINT32_MAX, 101);  // desde el índice 6 (en bytes)
+  gx::capture_end();
+  gx::draw_frame(640, 480);
+  // La copia RGBA8 se ve igual que la textura (abajo a la derecha, fuera del cuadro chico).
+  const int ctr = pixel(540, 400), cbl = pixel(100, 80), cbr = pixel(540, 80);
+  // El cuadro chico (arriba a la izquierda) muestra la intensidad del rojo de la copia I8: 0.257 + 16/255 = 82.
+  const int gray = pixel(40, 460);
+  const int gr = (gray >> 16) & 0xFF, gg = (gray >> 8) & 0xFF;
+  const bool copies = ctr == 0x00FF00 && cbl == 0x0000FF && cbr == 0xFFFFFF && gr >= 80 && gr <= 84 && gg == gr;
+  if (!copies) std::printf("copias del EFB: %06X %06X %06X gris %06X\n", ctr, cbl, cbr, gray);
+  ok = ok && copies;
   std::puts(ok ? "PRUEBA OK" : "PRUEBA FALLÓ");
   return ok ? 0 : 1;
 }

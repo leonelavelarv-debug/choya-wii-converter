@@ -1090,6 +1090,11 @@ AURORA_EDITS = [
             break;
           }
         }
+        // Copia del EFB a una textura (GXCopyTex): el motor la hace al terminar el pase.
+        if (pass.resolveTarget && !displayCopy) {
+          choya::capture_copy(pass.resolveTarget.get(), pass.resolveRect, pass.resolveFormat,
+                              pass.resolveForceOpaqueAlpha);
+        }
       }
       choya::capture_end();
     } else {
@@ -1134,7 +1139,13 @@ def _capture_payloads() -> list[str]:
     """Bloques de copia del cuadro que han insertado las versiones de Choya en common.cpp (actual y anteriores)."""
     edit = next(e for e in AURORA_EDITS if e[3] == "motor de Choya (copia del cuadro)")
     current = edit[2][len(edit[1]):]
-    v0122 = current.replace("pass.clearDepthValue, displayCopy, pass.resolveRect);",
+    v0123 = current.replace(
+        "        // Copia del EFB a una textura (GXCopyTex): el motor la hace al terminar el pase.\n"
+        "        if (pass.resolveTarget && !displayCopy) {\n"
+        "          choya::capture_copy(pass.resolveTarget.get(), pass.resolveRect, pass.resolveFormat,\n"
+        "                              pass.resolveForceOpaqueAlpha);\n"
+        "        }\n", "")
+    v0122 = v0123.replace("pass.clearDepthValue, displayCopy, pass.resolveRect);",
                             "pass.clearDepthValue, displayCopy);")
     v0120 = v0122.replace(
         "        // La copia a pantalla (GXCopyDisp) termina el pase cuyo destino es la textura de la copia de pantalla.\n"
@@ -1143,8 +1154,8 @@ def _capture_payloads() -> list[str]:
         "                            pass.clearDepthValue, displayCopy);\n",
         "        choya::capture_pass(pass.targetSize.width, pass.targetSize.height, pass.clearColor, pass.clearDepth, rgba,\n"
         "                            pass.clearDepthValue);\n")
-    assert v0120 != v0122 != current
-    return [current, v0122, v0120]
+    assert v0120 != v0122 != v0123 != current
+    return [current, v0123, v0122, v0120]
 
 
 # Lo que versiones anteriores de Choya insertaron en aurora: se quita antes de aplicar los cambios actuales, para
