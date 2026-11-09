@@ -318,6 +318,8 @@ struct TexUpload {
 struct GlTexture {
   GLuint id = 0;
   uint32_t width = 0, height = 0, mips = 0;
+  int kind = -1;     // TexKind
+  size_t bytes = 0;  // memoria en GL (todas las mips)
 };
 // Compartido entre el juego y el motor. En el heap y sin destruir: aurora libera texturas hasta el final.
 struct TexShared {
@@ -1054,6 +1056,62 @@ bool upload_words(WordTexture& t, const std::vector<uint8_t>& bytes) {
   return true;
 }
 
+// Cómo se guarda una textura en GL. aurora entrega todo en RGBA8 (4 bytes por píxel aunque el original sea I4 o
+// CMPR); en la consola eso llena la memoria (1 GB compartido con la GPU) y en Golf el sistema se queda sin RAM. Se
+// mira el contenido y se usa el formato más chico que no pierde (o casi) nada.
+enum TexKind { kTexGray = 0, kTexGrayAlpha, kTexRgb565, kTexRgb5a1, kTexRgba8 };
+constexpr GLenum kRed = 0x1903, kRg = 0x8227, kR8 = 0x8229, kRg8 = 0x822B, kRgb = 0x1907, kRgb565 = 0x8D62,
+                 kRgb5A1 = 0x8057, kUnsignedShort565 = 0x8363, kUnsignedShort5551 = 0x8034, kSwizzleR = 0x8E42,
+                 kSwizzleG = 0x8E43, kSwizzleB = 0x8E44, kSwizzleA = 0x8E45;
+int classify_texture(const std::vector<uint8_t>& rgba) {
+  static const bool keepRgba8 = std::getenv("CHOYA_TEX_RGBA8") != nullptr;
+  if (keepRgba8) return kTexRgba8;
+  bool gray = true, opaque = true, binaryAlpha = true;
+  for (size_t i = 0; i + 3 < rgba.size(); i += 4) {
+    const uint8_t r = rgba[i], g = rgba[i + 1], b = rgba[i + 2], a = rgba[i + 3];
+    if (r != g || g != b) gray = false;
+    if (a != 255) opaque = false;
+    if (a != 0 && a != 255) binaryAlpha = false;
+    if (!gray && !opaque && !binaryAlpha) return kTexRgba8;
+  }
+  if (gray) return opaque ? kTexGray : kTexGrayAlpha;
+  if (opaque) return kTexRgb565;
+  return binaryAlpha ? kTexRgb5a1 : kTexRgba8;
+}
+size_t texel_bytes(int kind) { return kind == kTexGray ? 1 : kind == kTexRgba8 ? 4 : 2; }
+
+// Convierte una mip RGBA8 al formato de la textura (en g_texScratch) y la sube.
+std::vector<uint8_t> g_texScratch;
+void upload_mip(int kind, GLint mip, uint32_t w, uint32_t h, const uint8_t* src) {
+  const size_t n = static_cast<size_t>(w) * h;
+  GLenum format = kRgba, type = kUnsignedByte;
+  const void* data = src;
+  if (kind != kTexRgba8) {
+    g_texScratch.resize(n * texel_bytes(kind));
+    uint8_t* d8 = g_texScratch.data();
+    auto* d16 = reinterpret_cast<uint16_t*>(g_texScratch.data());
+    for (size_t i = 0; i < n; ++i) {
+      const uint8_t* p = src + i * 4;
+      switch (kind) {
+      case kTexGray: d8[i] = p[0]; break;
+      case kTexGrayAlpha: d8[i * 2] = p[0]; d8[i * 2 + 1] = p[3]; break;
+      case kTexRgb565:
+        d16[i] = static_cast<uint16_t>(((p[0] >> 3) << 11) | ((p[1] >> 2) << 5) | (p[2] >> 3));
+        break;
+      default:  // 5551
+        d16[i] = static_cast<uint16_t>(((p[0] >> 3) << 11) | ((p[1] >> 3) << 6) | ((p[2] >> 3) << 1) | (p[3] >> 7));
+        break;
+      }
+    }
+    data = g_texScratch.data();
+    format = kind == kTexGray ? kRed : kind == kTexGrayAlpha ? kRg : kind == kTexRgb565 ? kRgb : kRgba;
+    type = kind == kTexRgb565 ? kUnsignedShort565 : kind == kTexRgb5a1 ? kUnsignedShort5551 : kUnsignedByte;
+  }
+  gl.TexSubImage2D(kTexture2D, mip, 0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), format, type, data);
+}
+
+size_t g_texBytes = 0;  // memoria de las texturas en GL
+
 void process_textures() {
   std::vector<TexUpload> pending;
   std::vector<uint64_t> released;
@@ -1067,6 +1125,7 @@ void process_textures() {
     auto it = g_textures.find(id);
     if (it != g_textures.end()) {
       gl.DeleteTextures(1, &it->second.id);
+      g_texBytes -= it->second.bytes;
       g_textures.erase(it);
     }
     auto c = g_copyTextures.find(id);
@@ -1078,17 +1137,37 @@ void process_textures() {
   }
   if (pending.empty()) return;
   gl.ActiveTexture(kTexture0 + 2);
+  gl.PixelStorei(kUnpackAlignment, 1);  // filas de 1 o 2 bytes por píxel
   for (auto& up : pending) {
     GlTexture& tex = g_textures[up.id];
-    if (tex.id == 0 || tex.width != up.width || tex.height != up.height || tex.mips != up.mips) {
-      if (tex.id != 0) gl.DeleteTextures(1, &tex.id);
+    const int kind = classify_texture(up.data);
+    if (tex.id == 0 || tex.width != up.width || tex.height != up.height || tex.mips != up.mips || tex.kind != kind) {
+      if (tex.id != 0) {
+        gl.DeleteTextures(1, &tex.id);
+        g_texBytes -= tex.bytes;
+      }
       gl.GenTextures(1, &tex.id);
       gl.BindTexture(kTexture2D, tex.id);
-      gl.TexStorage2D(kTexture2D, static_cast<GLsizei>(up.mips), kRgba8, static_cast<GLsizei>(up.width),
+      const GLenum internal = kind == kTexGray ? kR8 : kind == kTexGrayAlpha ? kRg8 : kind == kTexRgb565 ? kRgb565
+                              : kind == kTexRgb5a1 ? kRgb5A1 : kRgba8;
+      gl.TexStorage2D(kTexture2D, static_cast<GLsizei>(up.mips), internal, static_cast<GLsizei>(up.width),
                       static_cast<GLsizei>(up.height));
+      if (kind == kTexGray || kind == kTexGrayAlpha) {  // gris: (r, r, r, 1) o (r, r, r, g)
+        gl.TexParameteri(kTexture2D, kSwizzleR, static_cast<GLint>(kRed));
+        gl.TexParameteri(kTexture2D, kSwizzleG, static_cast<GLint>(kRed));
+        gl.TexParameteri(kTexture2D, kSwizzleB, static_cast<GLint>(kRed));
+        gl.TexParameteri(kTexture2D, kSwizzleA, kind == kTexGray ? 1 /* GL_ONE */ : 0x1904 /* GL_GREEN */);
+      }
       tex.width = up.width;
       tex.height = up.height;
       tex.mips = up.mips;
+      tex.kind = kind;
+      tex.bytes = 0;
+      for (uint32_t mip = 0; mip < up.mips; ++mip) {
+        tex.bytes += static_cast<size_t>(std::max(up.width >> mip, 1u)) * std::max(up.height >> mip, 1u) *
+                     texel_bytes(kind);
+      }
+      g_texBytes += tex.bytes;
     } else {
       gl.BindTexture(kTexture2D, tex.id);
     }
@@ -1097,12 +1176,13 @@ void process_textures() {
       const uint32_t w = std::max(up.width >> mip, 1u), h = std::max(up.height >> mip, 1u);
       const size_t bytes = static_cast<size_t>(w) * h * 4;
       if (offset + bytes > up.data.size()) break;
-      gl.TexSubImage2D(kTexture2D, static_cast<GLint>(mip), 0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h),
-                       kRgba, kUnsignedByte, up.data.data() + offset);
+      upload_mip(kind, static_cast<GLint>(mip), w, h, up.data.data() + offset);
       offset += bytes;
     }
     ++g_stats.texUploads;
   }
+  gl.PixelStorei(kUnpackAlignment, 4);
+  if (g_texScratch.capacity() > (8u << 20)) std::vector<uint8_t>().swap(g_texScratch);
 }
 
 GLuint sampler_for(const SamplerDesc& s) {
@@ -2008,7 +2088,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       if (std::fscanf(statm, "%ld %ld", &sizePages, &rssPages) != 2) rssPages = 0;
       std::fclose(statm);
     }
-    size_t groups = 0, bindGroups = 0, pipelines = 0, pending = 0, pendingBytes = 0, kept = 0;
+    size_t groups = 0, bindGroups = 0, pipelines = 0, pending = 0, pendingBytes = 0, kept = 0, keptBytes = 0;
     {
       std::lock_guard lock(g_frameMutex);
       groups = g_queue.size();
@@ -2024,10 +2104,23 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       pending = ts.pending.size();
       for (const auto& up : ts.pending) pendingBytes += up.data.size();
       kept = ts.kept.size();
+      for (const auto& [id, up] : ts.kept) keptBytes += up.data.size();
     }
-    log_line("motor: memoria del proceso %ld MB; grupos en cola %zu, grupos de texturas %zu, pipelines %zu, texturas "
-             "por subir %zu (%zu KB), guardadas para volcados %zu",
-             rssPages * 4 / 1024, groups, bindGroups, pipelines, pending, pendingBytes / 1024, kept);
+    long rssAnon = 0, rssFile = 0, rssShmem = 0;  // KB
+    if (FILE* st = std::fopen("/proc/self/status", "r")) {
+      char line[128];
+      while (std::fgets(line, sizeof(line), st)) {
+        std::sscanf(line, "RssAnon: %ld", &rssAnon);
+        std::sscanf(line, "RssFile: %ld", &rssFile);
+        std::sscanf(line, "RssShmem: %ld", &rssShmem);
+      }
+      std::fclose(st);
+    }
+    log_line("motor: memoria del proceso %ld MB (anónima %ld, archivos/GPU %ld, compartida %ld); texturas en GL %zu MB; "
+             "grupos en cola %zu, grupos de texturas %zu, pipelines %zu, texturas por subir %zu (%zu KB), guardadas para "
+             "volcados %zu (%zu MB)",
+             rssPages * 4 / 1024, rssAnon / 1024, rssFile / 1024, rssShmem / 1024, g_texBytes >> 20, groups,
+             bindGroups, pipelines, pending, pendingBytes / 1024, kept, keptBytes >> 20);
     g_stats = Stats{.frames = g_stats.frames};
   }
   return presented;
