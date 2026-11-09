@@ -88,6 +88,13 @@ export CHOYA_GLES=1
 export CHOYA_GX_COLORES=0
 # Caché de programas en disco (como los shaders listos de galaxy-vita): la primera vez se compilan, después se cargan.
 export CHOYA_GX_CACHE="${CHOYA_GX_CACHE:-$DIR/cache-shaders}"
+# Recursos convertidos por el conversor de Choya (assets.wlpk junto al juego): texturas en ETC2/EAC ya reducidas.
+# CHOYA_PAQUETE=0 usa solo las del disco.
+if [ "${CHOYA_PAQUETE:-}" != "0" ] && [ -f "$DIR/assets.wlpk" ]; then
+  export CHOYA_PAQUETE="$DIR/assets.wlpk"
+else
+  export CHOYA_PAQUETE=0
+fi
 mkdir -p "$CHOYA_GX_CACHE"
 rm -f "$DIR/choya-gles.txt"
 
@@ -98,6 +105,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "juego: $GAME"
   echo "PortMaster: ${controlfolder:-no encontrado}  dispositivo: ${DEVICE_NAME:-?}  CFW: ${CFW_NAME:-?}"
   echo "mapeo del mando: ${SDL_GAMECONTROLLERCONFIG:-ninguno}" | cut -c1-200
+  echo "recursos convertidos: $([ "$CHOYA_PAQUETE" = 0 ] && echo "no (texturas del disco)" || echo "$CHOYA_PAQUETE ($(du -h "$CHOYA_PAQUETE" 2>/dev/null | cut -f1))")"
   echo "gptokeyb: ${GPTOKEYB:-no}  salir: $CHOYA_QUIT_COMBO + START  botones: $CHOYA_FACE_LAYOUT"
   echo "dispositivos de entrada: $(grep -h "^N: Name=" /proc/bus/input/devices 2>/dev/null | cut -d= -f2- | tr "\n" " ")"
 } > "$DIR/cpu.txt" 2>&1
@@ -122,6 +130,10 @@ escribir_resumen() {
     grep -h "motor: memoria del proceso" "$DIR/choya-gles.txt" 2>/dev/null | tail -8
     echo "--- memoria de la Mali por partes del cuadro"
     grep -hE "motor: (Mali|la Mali|midiendo)" "$DIR/choya-gles.txt" 2>/dev/null | head -30
+    echo "--- tramos del cuadro (MENU sola 2 s mide 20 s; detalle en la PC: choya perfil perfil.txt)"
+    grep -hE "\[choya\] (midiendo|tramos|esperas|perfil escrito)|MENU sola" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | tail -6
+    echo "--- recursos convertidos (assets.wlpk)"
+    grep -hE "paquete" "$DIR/choya-gles.txt" 2>/dev/null | tail -4
     echo "--- motor: estado GL y programas"
     grep -hE "motor: (estado GL|caché de programas|programas cargados)" "$DIR/choya-gles.txt" 2>/dev/null | tail -8
     echo "programas en el caché: $(ls "$CHOYA_GX_CACHE" 2>/dev/null | grep -c '\.bin$')"

@@ -202,9 +202,30 @@ bool enabled() noexcept {
     // Los volcados llevan las texturas: hay que guardarlas desde que se crean.
     const char* dumps = std::getenv("CHOYA_GX_VOLCADO");
     core::set_keep_textures(dumps != nullptr && *dumps != '\0');
+    // Recursos convertidos por el conversor de Choya (python -m choya convert): CHOYA_PAQUETE=ruta de assets.wlpk.
+    // CHOYA_PAQUETE=0 (o sin la variable) usa solo las texturas del disco, como antes.
+    if (const char* pk = std::getenv("CHOYA_PAQUETE"); pk != nullptr && *pk != '\0' && std::strcmp(pk, "0") != 0) {
+      core::pack_open(pk);
+    }
     return true;
   }();
   return on;
+}
+
+gfx::TextureHandle packed_static_texture(uint32_t width, uint32_t height, uint32_t mips, uint32_t format,
+                                         const uint8_t* data, size_t size, const char* label) noexcept {
+  if (!enabled() || !core::pack_is_open() || data == nullptr) return {};
+  // Con paleta (C4/C8/C14X2) aurora aplica la paleta que cargó el juego; el paquete trae la del archivo, que el
+  // juego puede cambiar (colores de los Miis): esas siguen por aurora.
+  if (format == GX_TF_C4 || format == GX_TF_C8 || format == GX_TF_C14X2 || format > GX_TF_CMPR) return {};
+  const int64_t entry = core::pack_lookup(format, width, height, data, size);
+  if (entry < 0) return {};  // no está en el paquete: aurora sigue como siempre
+  uint32_t maxMips = 1;
+  for (uint32_t d = std::max(width, height); d > 1; d >>= 1) ++maxMips;
+  // La textura de aurora queda vacía (Dawn no dibuja en la consola); el id del motor es su dirección.
+  auto handle = gfx::new_dynamic_texture_2d(width, height, std::clamp<uint32_t>(mips, 1, maxMips), format, label);
+  if (!handle || !core::texture_from_pack(reinterpret_cast<uintptr_t>(handle.get()), entry)) return {};
+  return handle;
 }
 
 void texture_uploaded(const gfx::TextureRef& ref, const uint8_t* data, size_t size) noexcept {

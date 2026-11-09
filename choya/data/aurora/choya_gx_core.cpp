@@ -15,6 +15,7 @@
 #include <dolphin/gx/GXEnum.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
@@ -116,6 +117,7 @@ struct Gl {
   void (*BindTexture)(GLenum, GLuint);
   void (*TexStorage2D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
   void (*TexSubImage2D)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*);
+  void (*CompressedTexSubImage2D)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLsizei, const void*);
   void (*TexParameteri)(GLenum, GLenum, GLint);
   void (*ActiveTexture)(GLenum);
   void (*PixelStorei)(GLenum, GLint);
@@ -209,6 +211,7 @@ bool load_gl() {
   CHOYA_GL(BindTexture);
   CHOYA_GL(TexStorage2D);
   CHOYA_GL(TexSubImage2D);
+  CHOYA_GL(CompressedTexSubImage2D);
   CHOYA_GL(TexParameteri);
   CHOYA_GL(ActiveTexture);
   CHOYA_GL(PixelStorei);
@@ -340,7 +343,7 @@ struct Stats {
   double cpuMs = 0, gpuWaitMs = 0;
   // Como el backend de galaxy-vita: estado GL que no cambió (no se llama a GL), dibujos que no pintan nada, programas.
   uint64_t stateSkipped = 0, stateApplied = 0, texBindsSkipped = 0, texBinds = 0, rejectedNoWrite = 0,
-           rejectedScissor = 0, progCompiled = 0, progCached = 0;
+           rejectedScissor = 0, progCompiled = 0, progCached = 0, packUploads = 0;
   double compileMs = 0;
 } g_stats;
 
@@ -350,6 +353,10 @@ struct TexUpload {
   uint64_t id;
   uint32_t width, height, mips;
   std::vector<uint8_t> data;
+  // Del paquete de recursos convertidos (assets.wlpk): formato de salida del conversor (0 = RGBA8 de aurora),
+  // banderas de swizzle y dónde están los datos en el archivo (se leen en el hilo del motor).
+  uint8_t packFormat = 0, packFlags = 0;
+  uint64_t packOffset = 0, packSize = 0;
 };
 struct GlTexture {
   GLuint id = 0;
@@ -357,6 +364,69 @@ struct GlTexture {
   int kind = -1;     // TexKind
   size_t bytes = 0;  // memoria en GL (todas las mips)
 };
+// --- Paquete de recursos convertidos (assets.wlpk) ----------------------------------------------------------------
+// El conversor de Choya (python -m choya convert) lee el disco, reduce cada textura para la pantalla de la RG35XX H
+// y la recodifica a ETC2/EAC (o RGB565, RGBA8 si la compresión la dañaba). Aquí se busca cada textura que el juego
+// carga por la misma clave que usa el conversor (crc32 del nivel 0 GX + tamaño + formato, choya/pack.py); si está,
+// el motor sube esa versión en vez de la que aurora decodifica a RGBA8. Formato: choya/pack.py y runtime/include/wl.
+#pragma pack(push, 1)
+struct WlpkHeader {
+  char magic[4];
+  uint32_t version, entryCount, flags;
+  uint64_t tocOffset, namesOffset, namesSize, manifestOffset, manifestSize, reserved;
+};
+struct WlpkEntry {
+  uint8_t kind, format, count, flags;
+  uint32_t nameOffset;
+  uint64_t key, dataOffset, dataSize;
+  uint16_t width, height;
+  uint32_t extra0, extra1, extra2;
+};
+#pragma pack(pop)
+static_assert(sizeof(WlpkHeader) == 64 && sizeof(WlpkEntry) == 48);
+enum PackFormat : uint8_t {
+  kPkEtc2Rgb8 = 1, kPkEtc2Rgba8, kPkRgb565, kPkRgba4444, kPkRgba5551, kPkR11Eac, kPkRg11Eac, kPkL8, kPkLa8, kPkRgba8
+};
+constexpr uint8_t kPkSwizzleI = 1, kPkSwizzleIA = 2;
+
+struct PackState {
+  FILE* file = nullptr;
+  std::vector<WlpkEntry> textures;  // solo las texturas, ordenadas por clave
+  std::atomic<uint64_t> hits{0}, misses{0}, bytes{0}, readErrors{0};
+  std::mutex readMutex;
+};
+PackState& pack() {
+  static PackState* p = new PackState;  // sin destruir: el juego puede cargar texturas hasta el final
+  return *p;
+}
+
+uint32_t crc32_ieee(const uint8_t* data, size_t size) {
+  static const auto table = [] {
+    std::array<uint32_t, 256> t{};
+    for (uint32_t i = 0; i < 256; ++i) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+      t[i] = c;
+    }
+    return t;
+  }();
+  uint32_t c = 0xFFFFFFFFu;
+  for (size_t i = 0; i < size; ++i) c = table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+  return c ^ 0xFFFFFFFFu;
+}
+
+size_t pack_level_size(uint8_t fmt, uint32_t w, uint32_t h) {
+  const size_t blocks = static_cast<size_t>((w + 3) / 4) * ((h + 3) / 4);
+  switch (fmt) {
+  case kPkEtc2Rgb8: case kPkR11Eac: return blocks * 8;
+  case kPkEtc2Rgba8: case kPkRg11Eac: return blocks * 16;
+  case kPkRgb565: case kPkRgba4444: case kPkRgba5551: case kPkLa8: return static_cast<size_t>(w) * h * 2;
+  case kPkL8: return static_cast<size_t>(w) * h;
+  case kPkRgba8: return static_cast<size_t>(w) * h * 4;
+  default: return 0;
+  }
+}
+
 // Compartido entre el juego y el motor. En el heap y sin destruir: aurora libera texturas hasta el final.
 struct TexShared {
   std::mutex mutex;
@@ -1453,6 +1523,93 @@ void upload_mip(int kind, GLint mip, uint32_t w, uint32_t h, const uint8_t* src)
 }
 
 size_t g_texBytes = 0;  // memoria de las texturas en GL
+std::vector<uint8_t> g_packRead;  // datos leídos del paquete (se reusa)
+
+// Una textura del paquete de recursos convertidos: se crea con su formato (ETC2/EAC comprimido en la GPU, o los
+// formatos chicos sin comprimir) y sus mipmaps tal cual los dejó el conversor.
+bool upload_packed(GlTexture& tex, const TexUpload& up) {
+  const uint8_t* data = up.data.data();
+  size_t size = up.data.size();
+  if (up.data.empty()) {
+    auto& pk = pack();
+    g_packRead.resize(up.packSize);
+    std::lock_guard rl(pk.readMutex);
+    if (pk.file == nullptr || std::fseek(pk.file, static_cast<long>(up.packOffset), SEEK_SET) != 0 ||
+        std::fread(g_packRead.data(), 1, g_packRead.size(), pk.file) != g_packRead.size()) {
+      if (pk.readErrors++ == 0) log_line("paquete: no pude leer una textura (offset %llu)",
+                                         static_cast<unsigned long long>(up.packOffset));
+      return false;
+    }
+    data = g_packRead.data();
+    size = g_packRead.size();
+  }
+  GLenum internal = 0, format = 0, type = 0;
+  bool compressed = false;
+  switch (up.packFormat) {
+  case kPkEtc2Rgb8: internal = 0x9274; compressed = true; break;   // GL_COMPRESSED_RGB8_ETC2
+  case kPkEtc2Rgba8: internal = 0x9278; compressed = true; break;  // GL_COMPRESSED_RGBA8_ETC2_EAC
+  case kPkR11Eac: internal = 0x9270; compressed = true; break;     // GL_COMPRESSED_R11_EAC
+  case kPkRg11Eac: internal = 0x9272; compressed = true; break;    // GL_COMPRESSED_RG11_EAC
+  case kPkRgb565: internal = kRgb565; format = kRgb; type = kUnsignedShort565; break;
+  case kPkRgba4444: internal = 0x8056; format = kRgba; type = 0x8033; break;  // RGBA4, UNSIGNED_SHORT_4_4_4_4
+  case kPkRgba5551: internal = kRgb5A1; format = kRgba; type = kUnsignedShort5551; break;
+  case kPkL8: internal = kR8; format = kRed; type = kUnsignedByte; break;
+  case kPkLa8: internal = kRg8; format = kRg; type = kUnsignedByte; break;
+  case kPkRgba8: internal = kRgba8; format = kRgba; type = kUnsignedByte; break;
+  default: return false;
+  }
+  // Solo los niveles que vienen completos en los datos.
+  uint32_t levels = 0;
+  size_t need = 0;
+  for (uint32_t mip = 0; mip < up.mips; ++mip) {
+    const size_t bytes = pack_level_size(up.packFormat, std::max(up.width >> mip, 1u), std::max(up.height >> mip, 1u));
+    if (need + bytes > size) break;
+    need += bytes;
+    ++levels;
+  }
+  if (levels == 0) return false;
+  if (tex.id != 0) {
+    gl.DeleteTextures(1, &tex.id);
+    g_texBytes -= tex.bytes;
+  }
+  gl.GenTextures(1, &tex.id);
+  ++g_texGen;
+  gl.BindTexture(kTexture2D, tex.id);
+  gl.TexStorage2D(kTexture2D, static_cast<GLsizei>(levels), internal, static_cast<GLsizei>(up.width),
+                  static_cast<GLsizei>(up.height));
+  size_t offset = 0;
+  for (uint32_t mip = 0; mip < levels; ++mip) {
+    const uint32_t w = std::max(up.width >> mip, 1u), h = std::max(up.height >> mip, 1u);
+    const size_t bytes = pack_level_size(up.packFormat, w, h);
+    if (compressed) {
+      gl.CompressedTexSubImage2D(kTexture2D, static_cast<GLint>(mip), 0, 0, static_cast<GLsizei>(w),
+                                 static_cast<GLsizei>(h), internal, static_cast<GLsizei>(bytes), data + offset);
+    } else {
+      gl.TexSubImage2D(kTexture2D, static_cast<GLint>(mip), 0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h),
+                       format, type, data + offset);
+    }
+    offset += bytes;
+  }
+  // Intensidad (I4/I8): R en los cuatro canales; intensidad + alfa (IA4/IA8): R en color, G en alfa. L8/LA8 del
+  // perfil gles2 sin bandera: gris opaco o gris con alfa.
+  const bool swI = (up.packFlags & kPkSwizzleI) != 0;
+  const bool swIA = (up.packFlags & kPkSwizzleIA) != 0 || (up.packFormat == kPkLa8 && !swI);
+  if (swI || swIA || up.packFormat == kPkL8) {
+    gl.TexParameteri(kTexture2D, kSwizzleR, static_cast<GLint>(kRed));
+    gl.TexParameteri(kTexture2D, kSwizzleG, static_cast<GLint>(kRed));
+    gl.TexParameteri(kTexture2D, kSwizzleB, static_cast<GLint>(kRed));
+    gl.TexParameteri(kTexture2D, kSwizzleA, swI ? static_cast<GLint>(kRed) : swIA ? 0x1904 /* GL_GREEN */ : 1 /* ONE */);
+  }
+  tex.width = up.width;
+  tex.height = up.height;
+  tex.mips = up.mips;
+  tex.kind = 100 + up.packFormat;
+  tex.bytes = offset;
+  g_texBytes += tex.bytes;
+  ++g_stats.texUploads;
+  ++g_stats.packUploads;
+  return true;
+}
 
 void process_textures() {
   std::vector<TexUpload> pending;
@@ -1484,6 +1641,10 @@ void process_textures() {
   gl.PixelStorei(kUnpackAlignment, 1);  // filas de 1 o 2 bytes por píxel
   for (auto& up : pending) {
     GlTexture& tex = g_textures[up.id];
+    if (up.packFormat != 0) {
+      if (!upload_packed(tex, up) && tex.id == 0) g_textures.erase(up.id);
+      continue;
+    }
     const int kind = classify_texture(up.data);
     if (tex.id == 0 || tex.width != up.width || tex.height != up.height || tex.mips != up.mips || tex.kind != kind) {
       if (tex.id != 0) {
@@ -1969,6 +2130,122 @@ void texture_released(uint64_t id) noexcept {
   s.kept.erase(id);
 }
 
+size_t gx_level_size(uint32_t fmt, uint32_t w, uint32_t h) noexcept {
+  uint32_t bw = 4, bh = 4, bpp = 16;
+  switch (fmt) {
+  case GX_TF_I4: case GX_TF_C4: case GX_TF_CMPR: bw = 8; bh = 8; bpp = 4; break;
+  case GX_TF_I8: case GX_TF_IA4: case GX_TF_C8: bw = 8; bh = 4; bpp = 8; break;
+  case GX_TF_IA8: case GX_TF_RGB565: case GX_TF_RGB5A3: case GX_TF_C14X2: break;
+  case GX_TF_RGBA8: bpp = 32; break;
+  default: return 0;
+  }
+  const size_t bx = (w + bw - 1) / bw, by = (h + bh - 1) / bh;
+  return bx * by * bw * bh * bpp / 8;
+}
+
+uint64_t texture_key(const uint8_t* level0, size_t size, uint32_t w, uint32_t h, uint32_t fmt) noexcept {
+  const uint64_t crc = crc32_ieee(level0, size);
+  return (crc << 32) | (static_cast<uint64_t>((w - 1) & 0x3FF) << 22) | (static_cast<uint64_t>((h - 1) & 0x3FF) << 12) |
+         (static_cast<uint64_t>(fmt & 0xF) << 8);
+}
+
+bool pack_open(const char* path) noexcept {
+  auto& pk = pack();
+  if (pk.file != nullptr || path == nullptr || path[0] == '\0') return pk.file != nullptr;
+  FILE* f = std::fopen(path, "rb");
+  if (f == nullptr) {
+    log_line("paquete: no encontré %s; las texturas salen del disco (aurora)", path);
+    return false;
+  }
+  WlpkHeader h{};
+  bool ok = std::fread(&h, sizeof(h), 1, f) == 1 && std::memcmp(h.magic, "WLPK", 4) == 0 && h.version == 1 &&
+            h.entryCount < (1u << 22);
+  std::vector<WlpkEntry> toc;
+  if (ok) {
+    toc.resize(h.entryCount);
+    ok = std::fseek(f, static_cast<long>(h.tocOffset), SEEK_SET) == 0 &&
+         (toc.empty() || std::fread(toc.data(), sizeof(WlpkEntry), toc.size(), f) == toc.size());
+  }
+  if (!ok) {
+    std::fclose(f);
+    log_line("paquete: %s no es un assets.wlpk válido (versión 1)", path);
+    return false;
+  }
+  size_t audio = 0, compressed = 0;
+  uint64_t bytes = 0;
+  for (const WlpkEntry& e : toc) {
+    if (e.kind == 1 && e.format >= kPkEtc2Rgb8 && e.format <= kPkRgba8 && e.width > 0 && e.height > 0) {
+      pk.textures.push_back(e);
+      bytes += e.dataSize;
+      if (e.format == kPkEtc2Rgb8 || e.format == kPkEtc2Rgba8 || e.format == kPkR11Eac || e.format == kPkRg11Eac) {
+        ++compressed;
+      }
+    } else if (e.kind == 2) {
+      ++audio;
+    }
+  }
+  std::sort(pk.textures.begin(), pk.textures.end(), [](const WlpkEntry& a, const WlpkEntry& b) { return a.key < b.key; });
+  pk.file = f;
+  log_line("paquete: %s con %zu texturas convertidas (%zu en ETC2/EAC, %.1f MB) y %zu audios (el audio todavía sale "
+           "del disco)", path, pk.textures.size(), compressed, static_cast<double>(bytes) / 1048576.0, audio);
+  return true;
+}
+
+bool pack_is_open() noexcept { return pack().file != nullptr; }
+
+int64_t pack_lookup(uint32_t fmt, uint32_t width, uint32_t height, const uint8_t* level0, size_t size) noexcept {
+  auto& pk = pack();
+  if (pk.file == nullptr || level0 == nullptr || width == 0 || height == 0 || width > 1024 || height > 1024) return -1;
+  const size_t need = gx_level_size(fmt, width, height);
+  if (need == 0 || size < need) return -1;
+  const uint64_t key = texture_key(level0, need, width, height, fmt);
+  auto it = std::lower_bound(pk.textures.begin(), pk.textures.end(), key,
+                             [](const WlpkEntry& e, uint64_t k) { return e.key < k; });
+  if (it == pk.textures.end() || it->key != key) {
+    ++pk.misses;
+    return -1;
+  }
+  return it - pk.textures.begin();
+}
+
+bool texture_from_pack(uint64_t id, int64_t index) noexcept {
+  auto& pk = pack();
+  if (pk.file == nullptr || index < 0 || static_cast<size_t>(index) >= pk.textures.size()) return false;
+  const WlpkEntry& e = pk.textures[static_cast<size_t>(index)];
+  ++pk.hits;
+  pk.bytes += e.dataSize;
+  TexUpload up{id, e.width, e.height, std::max<uint32_t>(e.count, 1), {}};
+  up.packFormat = e.format;
+  up.packFlags = e.flags;
+  up.packOffset = e.dataOffset;
+  up.packSize = e.dataSize;
+  auto& s = texs();
+  std::lock_guard lock(s.mutex);
+  if (s.keep) {  // volcados: con los datos ya leídos, para escribirlos en el archivo
+    TexUpload copy = up;
+    copy.data.resize(e.dataSize);
+    std::lock_guard rl(pk.readMutex);
+    if (std::fseek(pk.file, static_cast<long>(e.dataOffset), SEEK_SET) == 0 &&
+        std::fread(copy.data.data(), 1, copy.data.size(), pk.file) == copy.data.size()) {
+      s.kept[id] = std::move(copy);
+    }
+  }
+  s.pending.push_back(std::move(up));
+  return true;
+}
+
+void texture_packed_data(uint64_t id, uint32_t width, uint32_t height, uint32_t mips, uint8_t format, uint8_t flags,
+                         const uint8_t* data, size_t size) noexcept {
+  if (width == 0 || height == 0 || mips == 0 || data == nullptr || format < kPkEtc2Rgb8 || format > kPkRgba8) return;
+  TexUpload up{id, width, height, mips, std::vector<uint8_t>(data, data + size)};
+  up.packFormat = format;
+  up.packFlags = flags;
+  auto& s = texs();
+  std::lock_guard lock(s.mutex);
+  if (s.keep) s.kept[id] = up;
+  s.pending.push_back(std::move(up));
+}
+
 void set_keep_textures(bool keep) noexcept {
   auto& s = texs();
   std::lock_guard lock(s.mutex);
@@ -2124,7 +2401,7 @@ void capture_discard() noexcept { g_recordingActive = false; }
 
 // --- Volcado ------------------------------------------------------------------------------------------------
 namespace {
-constexpr char kDumpMagic[8] = {'C', 'H', 'O', 'Y', 'A', 'G', 'X', '3'};  // 3: con copias del EFB (2 también se lee)
+constexpr char kDumpMagic[8] = {'C', 'H', 'O', 'Y', 'A', 'G', 'X', '4'};  // 4: texturas del paquete; 3 y 2 también se leen
 
 void write_blob(FILE* f, const std::vector<uint8_t>& v) {
   const uint64_t n = v.size();
@@ -2205,7 +2482,8 @@ bool dump_last_frame(const char* path) noexcept {
   const uint64_t nt = texs_out.size();
   std::fwrite(&nt, sizeof(nt), 1, out);
   for (const TexUpload* up : texs_out) {
-    const uint32_t hdr[3] = {up->width, up->height, up->mips};
+    const uint32_t hdr[4] = {up->width, up->height, up->mips,
+                             static_cast<uint32_t>(up->packFormat) | (static_cast<uint32_t>(up->packFlags) << 8)};
     std::fwrite(&up->id, sizeof(up->id), 1, out);
     std::fwrite(hdr, sizeof(hdr), 1, out);
     write_blob(out, up->data);
@@ -2220,7 +2498,7 @@ bool load_frame(const char* path) noexcept {
   char magic[8];
   uint32_t header[4];
   bool ok = std::fread(magic, 1, 8, in) == 8 && std::memcmp(magic, kDumpMagic, 7) == 0 &&
-            (magic[7] == '2' || magic[7] == '3') &&
+            (magic[7] == '2' || magic[7] == '3' || magic[7] == '4') &&
             std::fread(header, sizeof(header), 1, in) == 1 && header[0] == sizeof(PipelineDesc) &&
             header[1] == sizeof(Item);
   Frame f;
@@ -2256,10 +2534,17 @@ bool load_frame(const char* path) noexcept {
   ok = ok && std::fread(&nt, sizeof(nt), 1, in) == 1;
   for (uint64_t i = 0; ok && i < nt; ++i) {
     uint64_t id;
-    uint32_t hdr[3];
+    uint32_t hdr[4] = {0, 0, 0, 0};
     std::vector<uint8_t> data;
-    ok = std::fread(&id, sizeof(id), 1, in) == 1 && std::fread(hdr, sizeof(hdr), 1, in) == 1 && read_blob(in, data);
-    if (ok) texture_data(id, hdr[0], hdr[1], hdr[2], data.data(), data.size());
+    const size_t words = magic[7] == '4' ? 4 : 3;
+    ok = std::fread(&id, sizeof(id), 1, in) == 1 && std::fread(hdr, sizeof(uint32_t), words, in) == words &&
+         read_blob(in, data);
+    if (ok && (hdr[3] & 0xFF) != 0) {
+      texture_packed_data(id, hdr[0], hdr[1], hdr[2], static_cast<uint8_t>(hdr[3]), static_cast<uint8_t>(hdr[3] >> 8),
+                          data.data(), data.size());
+    } else if (ok) {
+      texture_data(id, hdr[0], hdr[1], hdr[2], data.data(), data.size());
+    }
   }
   std::fclose(in);
   if (!ok) return false;
@@ -2751,6 +3036,13 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
                static_cast<unsigned long long>(g_stats.rejectedScissor),
                static_cast<unsigned long long>(g_stats.progCompiled), g_stats.compileMs,
                static_cast<unsigned long long>(g_stats.progCached));
+    }
+    if (pack().file != nullptr) {
+      auto& pk = pack();
+      log_line("motor: paquete convertido: %llu texturas del juego encontradas (%.1f MB), %llu que no están (se usan las "
+               "de aurora), %llu subidas en este intervalo",
+               static_cast<unsigned long long>(pk.hits.load()), static_cast<double>(pk.bytes.load()) / 1048576.0,
+               static_cast<unsigned long long>(pk.misses.load()), static_cast<unsigned long long>(g_stats.packUploads));
     }
     // Memoria: el proceso y lo que guarda el motor (para ver si algo crece sin parar).
     long rssPages = 0;

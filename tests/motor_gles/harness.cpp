@@ -91,8 +91,57 @@ static int replay(const char* in, const char* out) {
   return 0;
 }
 
+// harness paquete assets.wlpk textura.gx formato ancho alto: busca la textura GX en el paquete del conversor como
+// lo hace aurora en el juego, la dibuja a pantalla completa y escribe los cuatro cuadrantes.
+static int packed(int argc, char** argv) {
+  if (argc < 7 || !gx::pack_open(argv[2])) { std::puts("no abrí el paquete"); return 1; }
+  FILE* f = std::fopen(argv[3], "rb");
+  if (!f) return 1;
+  std::vector<uint8_t> raw;
+  for (int c; (c = std::fgetc(f)) != EOF;) raw.push_back(static_cast<uint8_t>(c));
+  std::fclose(f);
+  const uint32_t fmt = std::atoi(argv[4]), w = std::atoi(argv[5]), h = std::atoi(argv[6]);
+  const int64_t entry = gx::pack_lookup(fmt, w, h, raw.data(), raw.size());
+  if (entry < 0) { std::puts("no está en el paquete"); return 3; }
+  if (!gx::texture_from_pack(78, entry)) return 1;
+  gx::PipelineDesc p4 = base_desc();
+  p4.vtxStride = 20;
+  p4.attrs[GX_VA_POS] = {GX_DIRECT, 3, GX_F32, 0, 0, 0, 0, 0};
+  p4.attrs[GX_VA_TEX0] = {GX_DIRECT, 2, GX_F32, 12, 0, 0, 0, 0};
+  p4.sampledChannels = 0; p4.offChanMat[0] = 0; p4.offChanMatA[0] = 0;
+  p4.numTexGens = 1; p4.sampledTexCoords = 1;
+  p4.texgens[0] = {GX_TG_MTX2x4, GX_TG_TEX0, 0xFF, 0};
+  p4.stages[0].cd = GX_CC_TEXC; p4.stages[0].ad = GX_CA_TEXA; p4.stages[0].texCoord = 0; p4.stages[0].texMap = 0;
+  p4.offTexScale[0] = 48; p4.offTexSize[0] = 52;
+  gx::register_pipeline(4, p4);
+  gx::BindDesc bd{};
+  bd.tex[0] = 78;
+  bd.samp[0] = {0, 0, 0, 0, 0, {0, 0, 0}, 0.f, 0.f};
+  gx::register_bind_group(98, bd);
+  std::vector<uint8_t> v4;
+  float q[4][5] = {{-1,1,.5f,0,0},{1,1,.5f,1,0},{-1,-1,.5f,0,1},{1,-1,.5f,1,1}};
+  for (auto& v : q) for (float x : v) put_be_f32(v4, x);
+  std::vector<uint8_t> u4(256, 0);
+  for (int r = 0; r < 4; ++r) put_f(u4, 20 + r * 4 + r, 1.f);
+  for (int r = 0; r < 3; ++r) put_f(u4, 36 + r * 4 + r, 1.f);
+  put_f(u4, 48, 1.f); put_f(u4, 49, 1.f);
+  put_f(u4, 52, 1.f); put_f(u4, 53, 1.f);
+  std::vector<uint16_t> i4 = {0, 1, 2, 2, 1, 3};
+  const float black[4] = {0, 0, 0, 1};
+  gx::capture_begin(v4.data(), v4.size(), u4.data(), u4.size(), (const uint8_t*)i4.data(), 12, nullptr, 0);
+  gx::capture_pass(640, 480, true, true, black, 0.f, true, gx::Rect{0, 0, 640, 480});
+  gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+  gx::capture_scissor(gx::Rect{0, 0, 640, 480});
+  gx::capture_draw(4, 0, 6, 1, 0, UINT32_MAX, 98);
+  gx::capture_end();
+  if (!gx::draw_frame(640, 480)) { std::puts("no dibujó"); return 1; }
+  std::printf("cuadrantes %06X %06X %06X %06X\n", pixel(160, 360), pixel(480, 360), pixel(160, 120), pixel(480, 120));
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (!init_egl(640, 480)) { std::puts("sin contexto GLES"); return 2; }
+  if (argc >= 2 && std::strcmp(argv[1], "paquete") == 0) return packed(argc, argv);
   if (argc >= 3) return replay(argv[1], argv[2]);
   auto GetString = (const char*(*)(unsigned))dlsym(gles, "glGetString");
   std::printf("GL: %s / %s\n", GetString(0x1F02), GetString(0x1F01));

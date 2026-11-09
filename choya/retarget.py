@@ -900,6 +900,14 @@ Intent GamepadIntent() {
 EDITS = [
     # Botón B en el teclado (S o B) y en el mando (gatillo derecho). Los juegos de WiiCompiled se juegan con
     # el Wii Remote de lado y no lo usan; Wii Sports pide "A y B" desde la pantalla de título.
+    # Medición por tramos (choya_perfil.cpp): cada llamada entre funciones del juego pasa por aquí; mientras se mide
+    # se cuenta cuántas veces se llama cada una. Sin medir es una lectura y un salto que no se toma.
+    ("include/abi_bridge.h", "inline void ApplyRuntimeCallOptions(uint32_t target, CpuContext* ctx) {\n",
+     'extern "C" volatile bool g_choyaMidiendo;  // choya: medición por tramos (choya_perfil.cpp)\n'
+     'extern "C" void choya_medir_llamada(uint32_t target, const void* ctx);\n'
+     "inline void ApplyRuntimeCallOptions(uint32_t target, CpuContext* ctx) {\n"
+     "    if (__builtin_expect(g_choyaMidiendo, 0)) choya_medir_llamada(target, ctx);  // choya\n",
+     "medición por tramos (llamadas)"),
     ("include/keybinds.h", "    kMinus,\n    kActionCount,",
      "    kMinus,\n    kButtonB," + _B_NOTE + "\n    kActionCount,", "tecla para el botón B"),
     ("src/keybinds.cpp", '{"minus", "- (Minus)", {SDL_SCANCODE_MINUS, SDL_SCANCODE_TAB}},',
@@ -1128,6 +1136,18 @@ AURORA_EDITS = [
      "  const auto ref = gfx::bind_group_ref(textureBindGroupDescriptor);\n"
      "  choya::register_texture_bind_group(ref, info);  // choya\n",
      "motor de Choya (grupos de texturas)"),
+    # Recursos convertidos: cada textura estática del juego se busca primero en assets.wlpk (CHOYA_PAQUETE); si está,
+    # aurora no la decodifica y el motor de Choya sube la versión convertida (ETC2/EAC, reducida).
+    ("lib/gx/gx.cpp",
+     "    handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),\n"
+     "                                        {static_cast<const uint8_t*>(obj.data), dataSize}, false, nameStr);\n",
+     "    handle = choya::packed_static_texture(obj.width(), obj.height(), obj.mip_count(), obj.format(),\n"
+     "                                          static_cast<const uint8_t*>(obj.data), dataSize, nameStr);  // choya\n"
+     "    if (!handle) {\n"
+     "      handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),\n"
+     "                                          {static_cast<const uint8_t*>(obj.data), dataSize}, false, nameStr);\n"
+     "    }\n",
+     "motor de Choya (recursos convertidos)"),
 ]
 
 # Archivos del motor de Choya que se copian dentro de aurora (siempre se reemplazan: son de Choya).
@@ -1322,11 +1342,30 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
         f.write(missing_stubs(sorted(res.missing)))
     with open(os.path.join(out, HLE_FILE), "w", encoding="utf-8", newline="\n") as f:
         f.write(choya_natives(res.ws, registered, result.changes))
-    shutil.copyfile(os.path.join(os.path.dirname(__file__), "data", "choya_perfil.cpp"), os.path.join(out, PERFIL_FILE))
+    with open(os.path.join(os.path.dirname(__file__), "data", "choya_perfil.cpp"), encoding="utf-8") as f:
+        perfil_src = f.read()
+    with open(os.path.join(out, PERFIL_FILE), "w", encoding="utf-8", newline="\n") as f:
+        f.write(perfil_marcas(perfil_src, res.ws))
     shutil.copyfile(os.path.join(os.path.dirname(__file__), "data", "choya_gles.cpp"), os.path.join(out, GLES_FILE))
     for name in ("choya_mando.cpp", "choya_mando.h"):  # el mando de la consola como en Nebula
         shutil.copyfile(os.path.join(os.path.dirname(__file__), "data", name), os.path.join(out, "src", name))
     return result
+
+
+# Las funciones de Wii Sports que separan los tramos del cuadro en la medición (choya_perfil.cpp).
+TRAMO_CALC = "calc__Q23EGG12SceneManagerFv"   # actualizar el juego (escenas, actores, físicas, animaciones)
+TRAMO_DRAW = "draw__Q23EGG12SceneManagerFv"   # preparar el dibujo (recorrer modelos y llamar a GX)
+
+
+def perfil_marcas(src: str, ws: Symbols) -> str:
+    """Escribe en choya_perfil.cpp las direcciones y tamaños de las funciones que marcan los tramos."""
+    for name, addr_tag, size_tag in ((TRAMO_CALC, "CHOYA_DIR_CALC", "CHOYA_TAM_CALC"),
+                                     (TRAMO_DRAW, "CHOYA_DIR_DRAW", "CHOYA_TAM_DRAW")):
+        addr = ws.funcs.get(name, 0)
+        size = ws.size.get(addr, 0) if addr else 0
+        src = src.replace(f"0x0u /*{addr_tag}*/", f"0x{addr:08X}u /*{addr_tag}*/")
+        src = src.replace(f"0x0u /*{size_tag}*/", f"0x{size:X}u /*{size_tag}*/")
+    return src
 
 
 def choya_natives(ws: Symbols, registered: dict[int, str], changes: list[Change]) -> str:

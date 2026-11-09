@@ -33,6 +33,7 @@
 
 extern "C" bool choya_gx_draw_frame(int screenWidth, int screenHeight);  // motor de Choya (aurora)
 extern "C" void choya_gx_request_dump();  // volcado del siguiente cuadro (aurora)
+extern "C" void choya_medir_empezar(int seconds);  // medición por tramos (choya_perfil.cpp)
 
 namespace {
 
@@ -333,7 +334,13 @@ void CheckGamepads() {
     SDL_JoystickID* ids = SDL_GetGamepads(&count);
     bool dump = false;
     ChoyaMando console{};
-    if (choya_mando_leer(&console) && console.guide && console.rightshoulder) dump = true;
+    const bool haveConsole = choya_mando_leer(&console);
+    if (haveConsole && console.guide && console.rightshoulder) dump = true;
+    // MENU sola (sin ningún otro botón): medición por tramos (no la toca el juego: MENU no es ningún botón de la Wii).
+    const bool menuAlone = haveConsole && console.guide && !console.south && !console.east && !console.west &&
+                           !console.north && !console.back && !console.start && !console.leftshoulder &&
+                           !console.rightshoulder && !console.dpup && !console.dpdown && !console.dpleft &&
+                           !console.dpright && console.lefttrigger < 0.5f && console.righttrigger < 0.5f;
     for (int i = 0; ids && i < count; ++i) {
         SDL_Gamepad* pad = SDL_GetGamepadFromID(ids[i]);
         if (pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_GUIDE) &&
@@ -369,6 +376,19 @@ void CheckGamepads() {
         dumpHeld = 2;
         Log("MENU + R1: volcado del cuadro pedido");
         choya_gx_request_dump();
+    }
+    // MENU sola sostenida 2 s: mide 20 s la escena que se ve (perfil.txt; en la PC: choya perfil perfil.txt).
+    static int measureHeld = 0;
+    static std::chrono::steady_clock::time_point measureSince{};
+    if (!menuAlone) {
+        measureHeld = 0;
+    } else if (measureHeld == 0) {
+        measureHeld = 1;
+        measureSince = now;
+    } else if (measureHeld == 1 && now - measureSince >= std::chrono::seconds(2)) {
+        measureHeld = 2;
+        Log("MENU sola: midiendo los tramos del cuadro 20 s (perfil.txt)");
+        choya_medir_empezar(20);
     }
 }
 } // namespace

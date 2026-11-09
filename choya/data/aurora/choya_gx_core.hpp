@@ -88,6 +88,18 @@ bool has_bind_group(uint64_t ref) noexcept;
 void texture_data(uint64_t id, uint32_t width, uint32_t height, uint32_t mips, const uint8_t* rgba,
                   size_t size) noexcept;
 void texture_released(uint64_t id) noexcept;
+// Paquete de recursos convertidos por el conversor de Choya (assets.wlpk). pack_open lo abre una vez;
+// pack_lookup busca la textura GX (datos crudos del juego, nivel 0 incluido) por la misma clave que el conversor
+// (-1: no está); texture_from_pack hace que el motor use esa versión convertida para el id (aurora ya no la decodifica).
+bool pack_open(const char* path) noexcept;
+bool pack_is_open() noexcept;
+int64_t pack_lookup(uint32_t gxFormat, uint32_t width, uint32_t height, const uint8_t* level0, size_t size) noexcept;
+bool texture_from_pack(uint64_t id, int64_t index) noexcept;
+// Una textura en un formato del paquete (volcados y pruebas): format = formato de salida del conversor (1..10).
+void texture_packed_data(uint64_t id, uint32_t width, uint32_t height, uint32_t mips, uint8_t format, uint8_t flags,
+                         const uint8_t* data, size_t size) noexcept;
+size_t gx_level_size(uint32_t gxFormat, uint32_t width, uint32_t height) noexcept;
+uint64_t texture_key(const uint8_t* level0, size_t size, uint32_t width, uint32_t height, uint32_t gxFormat) noexcept;
 // Guardar copia de las texturas en memoria (solo para volcar cuadros).
 void set_keep_textures(bool keep) noexcept;
 

@@ -57,6 +57,59 @@ class TestMotorGles(unittest.TestCase):
             self.assertIn("programas cargados del caché de disco", second.stdout)
             self.assertEqual(sorted(os.listdir(cache)), saved)
 
+            # Recursos convertidos: el conversor arma un assets.wlpk con texturas sintéticas (32x32 RGB565 en cuatro
+            # colores e I8 gris) y el motor las encuentra por la clave de los datos GX, igual que aurora en el juego.
+            import numpy as np
+            from choya import gxtex, optimize, pack, profiles
+            from tests.fixtures import encode_gx
+            prof = profiles.get("rg35xxh")
+            quad = np.zeros((32, 32, 4), np.uint8)
+            quad[..., 3] = 255
+            quad[:16, :16, 0] = 255                  # arriba a la izquierda rojo
+            quad[:16, 16:, 1] = 255                  # arriba a la derecha verde
+            quad[16:, :16, 2] = 255                  # abajo a la izquierda azul
+            quad[16:, 16:, :3] = 255                 # abajo a la derecha blanco
+            gray = np.full((32, 32, 4), 200, np.uint8)
+            writer = pack.PackWriter(flags=pack.FLAG_GLES3)
+            cases = []
+            for fmt, img, name in ((gxtex.RGB565, quad, "cuatro"), (gxtex.I8, gray, "gris")):
+                raw = encode_gx(fmt, img)
+                tex = gxtex.GXTexture(name=name, fmt=fmt, width=32, height=32, mips=1, data=raw, source="modelo/" + name)
+                conv = optimize.convert(tex, prof)
+                flags = {optimize.OUT_R11_EAC: pack.TEXFLAG_SWIZZLE_I,
+                         optimize.OUT_RG11_EAC: pack.TEXFLAG_SWIZZLE_IA}.get(conv.fmt, 0)
+                writer.add(pack.Entry(kind=pack.KIND_TEXTURE, fmt=conv.fmt, count=conv.mips, flags=flags,
+                                      key=pack.texture_key(raw, 32, 32, fmt), name=name, data=conv.data,
+                                      width=conv.width, height=conv.height, extra0=fmt))
+                path = os.path.join(d, name + ".gx")
+                with open(path, "wb") as f:
+                    f.write(raw)
+                cases.append((path, fmt, conv.fmt))
+            wl = os.path.join(d, "assets.wlpk")
+            writer.write(wl, {"prueba": True})
+            self.assertEqual(cases[0][2], optimize.OUT_ETC2_RGB8)  # de verdad comprimida en ETC2
+            self.assertEqual(cases[1][2], optimize.OUT_R11_EAC)
+            got = []
+            for path, fmt, _ in cases:
+                out = subprocess.run([exe, "paquete", wl, path, str(fmt), "32", "32"], env=env, capture_output=True,
+                                     text=True)
+                self.assertIn("cuadrantes", out.stdout, out.stdout + out.stderr)
+                self.assertIn("texturas convertidas", out.stdout)
+                got.append([int(x, 16) for x in out.stdout.split("cuadrantes")[1].split()])
+            def near(c, rgb):
+                return all(abs(((c >> s) & 0xFF) - v) <= 12 for s, v in zip((16, 8, 0), rgb))
+            tl, tr, bl, br = got[0]
+            self.assertTrue(near(tl, (255, 0, 0)) and near(tr, (0, 255, 0)) and near(bl, (0, 0, 255))
+                            and near(br, (255, 255, 255)), [hex(x) for x in got[0]])
+            self.assertTrue(all(near(c, (200, 200, 200)) for c in got[1]), [hex(x) for x in got[1]])
+            # Una textura que no está en el paquete sigue por aurora.
+            other = os.path.join(d, "otra.gx")
+            with open(other, "wb") as f:
+                f.write(encode_gx(gxtex.RGB565, quad[::-1].copy()))
+            out = subprocess.run([exe, "paquete", wl, other, str(gxtex.RGB565), "32", "32"], env=env,
+                                 capture_output=True, text=True)
+            self.assertEqual(out.returncode, 3, out.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
