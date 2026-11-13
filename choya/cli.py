@@ -189,8 +189,9 @@ def cmd_perfil(a):
     exe = os.path.expanduser(a.exe)
     if not os.path.isfile(exe):
         raise SystemExit(f"no encontré el ejecutable sin recortar: {exe} (usa --exe)")
-    names = perfil.nombrar(exe, perfil.desplazamientos(p))
-    text = perfil.informe(p, names, a.simbolos, a.top)
+    cadenas = perfil.nombrar_cadenas(exe, perfil.desplazamientos(p))
+    names = {o: c[0] for o, c in cadenas.items()}
+    text = perfil.informe(p, names, a.simbolos, a.top, cadenas=cadenas)
     print(text)
     if a.salida:
         with open(a.salida, "w", encoding="utf-8") as f:

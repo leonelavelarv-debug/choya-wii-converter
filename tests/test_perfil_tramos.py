@@ -29,7 +29,9 @@ extern "C" __attribute__((noinline)) void func_80100000() { busy(2.0); }
 extern "C" __attribute__((noinline)) void func_800A4C2C() {
   for (int i = 0; i < 3; ++i) { if (g_choyaMidiendo) choya_medir_llamada(0x80100000u, ctx); func_80100000(); }
 }
-extern "C" __attribute__((noinline)) void func_800A4C78() { busy(3.0); }
+// Como aurora: una función integrada en línea dentro del dibujo (la dirección de regreso ya cae en la siguiente).
+namespace aurora::gx { __attribute__((always_inline)) inline void procesar() { busy(1.0); } }
+extern "C" __attribute__((noinline)) void func_800A4C78() { aurora::gx::procesar(); busy(2.0); }
 int main() {
   std::thread([] {
     for (;;) {
@@ -72,8 +74,10 @@ class TestPerfilTramos(unittest.TestCase):
             p = perfil.leer(os.path.join(d, "perfil.txt"))
             self.assertGreater(p.cuadros, 60)
             self.assertGreater(p.pared, 700)  # 2 s cada 2 ms
-            names = perfil.nombrar(exe, perfil.desplazamientos(p))
-            text = perfil.informe(p, names, top=8)
+            cadenas = perfil.nombrar_cadenas(exe, perfil.desplazamientos(p))
+            names = {o: c[0] for o, c in cadenas.items()}
+            text = perfil.informe(p, names, top=8, cadenas=cadenas)
+            self.assertIn("medido el", text)
             ms = {k: float(re.search(r"([\d.]+) ms\s+[\d.]+%\s+" + k, text).group(1))
                   for k in ("Actualizar", "Preparar", "Esperar")}
             self.assertTrue(4.5 <= ms["Actualizar"] <= 8.0, text)
@@ -81,6 +85,10 @@ class TestPerfilTramos(unittest.TestCase):
             self.assertTrue(3.0 <= ms["Esperar"] <= 6.0, text)  # el usleep(4000) no se acorta al medir
             self.assertRegex(text, r"3\.0×\s+\S+")                # 3 llamadas por cuadro a la "física"
             self.assertRegex(text, r"nanosleep ← .*main")       # quién duerme
+            # La función integrada en línea cuenta su milisegundo dentro del dibujo (dirección de regreso - 1).
+            m = re.search(r"([\d.]+) ms\s+aurora::gx::procesar", text)
+            self.assertIsNotNone(m, text)
+            self.assertTrue(0.5 <= float(m.group(1)) <= 1.6, text)
 
 
 if __name__ == "__main__":

@@ -263,7 +263,8 @@ void Dump(const char* path, int seconds) {
     }
     FILE* f = std::fopen(path, "w");
     if (!f) return;
-    std::fprintf(f, "# choya perfil v2\nmuestras %zu\nsegundos %d\n", n, seconds);
+    std::fprintf(f, "# choya perfil v2\nmuestras %zu\nsegundos %d\nfecha %lld\n", n, seconds,
+                 static_cast<long long>(std::time(nullptr)));
     for (const auto& [tid, count] : perThread) std::fprintf(f, "hilo %u %zu %s\n", tid, count, ThreadName(tid).c_str());
     std::vector<std::pair<size_t, std::pair<uint32_t, uintptr_t>>> exeSorted;
     for (const auto& [key, count] : inExe) exeSorted.push_back({count, key});

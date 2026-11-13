@@ -24,6 +24,7 @@ _FUNC = re.compile(r"\bfunc_([0-9A-Fa-f]{8})\b")
 class Perfil:
     muestras: int = 0
     segundos: int = 0
+    fecha: int = 0                                                          # cuándo se escribió (época), 0.20.1
     hilos: dict[int, tuple[int, str]] = field(default_factory=dict)       # tid -> (muestras, nombre)
     pcs: list[tuple[int, int, int]] = field(default_factory=list)          # (tid, muestras, desplazamiento)
     libs: list[tuple[int, int, str]] = field(default_factory=list)         # (tid, muestras, "lib:símbolo")
@@ -50,6 +51,8 @@ def leer(path: str) -> Perfil:
                 p.muestras = int(parts[1])
             elif parts[0] == "segundos":
                 p.segundos = int(parts[1])
+            elif parts[0] == "fecha":
+                p.fecha = int(parts[1])
             elif parts[0] == "hilo":
                 p.hilos[int(parts[1])] = (int(parts[2]), " ".join(parts[3:]) or "?")
             elif parts[0] == "pc":
@@ -79,12 +82,21 @@ def leer(path: str) -> Perfil:
 
 
 def desplazamientos(p: Perfil) -> list[int]:
-    """Todas las direcciones del ejecutable que hay que nombrar (CPU y pilas de los tramos)."""
+    """Todas las direcciones del ejecutable que hay que nombrar (CPU y pilas de los tramos).
+
+    Las de la pila son direcciones de regreso: apuntan a la instrucción que sigue a la llamada, que puede ser ya
+    de otra función (o de otra función integrada en línea). Se nombran también en dirección - 1, que cae dentro
+    de la llamada misma (0.20.1)."""
     offs = {o for _t, _c, o in p.pcs}
     for _n, _w, pc, lr, hosts, _g in p.pilas:
-        for t in [pc, lr] + hosts:
+        if pc.startswith("x"):
+            offs.add(int(pc[1:], 16))
+        for t in [lr] + hosts:
             if t.startswith("x"):
-                offs.add(int(t[1:], 16))
+                o = int(t[1:], 16)
+                offs.add(o)
+                if o > 0:
+                    offs.add(o - 1)
     return sorted(offs)
 
 
@@ -100,32 +112,59 @@ def _symbolizer_cmd(exe: str) -> list[str]:
     raise FileNotFoundError("no encontré llvm-symbolizer (instala llvm o deja la imagen de Docker de Choya)")
 
 
-def nombrar(exe: str, offsets: list[int]) -> dict[int, str]:
-    """Desplazamiento dentro del ejecutable -> nombre de función (con llvm-symbolizer)."""
+def nombrar_cadenas(exe: str, offsets: list[int]) -> dict[int, list[str]]:
+    """Desplazamiento -> funciones en esa dirección, de la más interna (integrada en línea) a la que la contiene."""
     if not offsets:
         return {}
     cmd = _symbolizer_cmd(exe)
     out = subprocess.run(cmd, input="".join(f"0x{o:x}\n" for o in offsets), capture_output=True, text=True,
                          check=True).stdout
-    names: dict[int, str] = {}
+    chains: dict[int, list[str]] = {}
     blocks = [b for b in out.split("\n\n") if b.strip()]
     for off, block in zip(offsets, blocks):
-        first = block.strip().splitlines()[0].strip()
-        names[off] = "??" if first in ("??", "") else first
-    return names
+        lines = [ln.strip() for ln in block.strip().splitlines()]
+        funcs = [lines[i] for i in range(0, len(lines), 2) if lines[i] not in ("??", "")]
+        chains[off] = funcs or ["??"]
+    return chains
+
+
+def nombrar(exe: str, offsets: list[int]) -> dict[int, str]:
+    """Desplazamiento dentro del ejecutable -> nombre de función (con llvm-symbolizer)."""
+    return {o: c[0] for o, c in nombrar_cadenas(exe, offsets).items()}
 
 
 def _corto(name: str) -> str:
-    """Quita los argumentos de la firma para agrupar por función."""
+    """Quita los argumentos de la firma (y el tipo de regreso, si lo trae) para agrupar por función."""
     depth = 0
+    cut = len(name)
     for i, ch in enumerate(name):
-        if ch == "(" and depth == 0 and i > 0:
-            return name[:i]
-        if ch == "<":
+        if ch == "(" and depth == 0 and i > 0 and not name.startswith("(anonymous namespace)", i):
+            cut = i
+            break
+        if ch in "<(":
             depth += 1
-        elif ch == ">":
+        elif ch in ">)":
             depth = max(0, depth - 1)
-    return name
+    name = name[:cut]
+    depth = 0
+    last_space = -1
+    for i, ch in enumerate(name):
+        if ch in "<(":
+            depth += 1
+        elif ch in ">)":
+            depth = max(0, depth - 1)
+        elif ch == " " and depth == 0:
+            last_space = i
+    return name[last_space + 1:] if last_space >= 0 else name
+
+
+_AYUDANTES = ("std::", "__gnu_cxx", "__cxxabiv1", "absl::", "fmt::", "XXH", "operator", "__libc", "libc.so",
+              "libm.so", "linux-vdso", "decltype", "??")
+
+
+def _es_ayudante(name: str) -> bool:
+    """Funciones de biblioteca que se integran en todo: no dicen de quién es el trabajo."""
+    return name.startswith(_AYUDANTES) or ".so" in name.split(":", 1)[0]
 
 
 def _wii_nombre(ws, rows, keys, addr: int) -> str | None:
@@ -194,7 +233,8 @@ def _funcion_wii(ws, rows, keys, addr: int) -> tuple[int, str] | None:
     return start, name
 
 
-def tramos(p: Perfil, names: dict[int, str], ws, top: int = 20) -> list[str]:
+def tramos(p: Perfil, names: dict[int, str], ws, top: int = 20,
+           cadenas: dict[int, list[str]] | None = None) -> list[str]:
     """Reparte el cuadro del hilo del juego en actualizar / preparar el dibujo / esperar (muestras de pared)."""
     rows = sorted((addr, n) for n, addr in ws.funcs.items())
     keys = [r[0] for r in rows]
@@ -205,16 +245,31 @@ def tramos(p: Perfil, names: dict[int, str], ws, top: int = 20) -> list[str]:
     frame_ms = p.segundos * 1000.0 / frames
     ms = lambda count: frame_ms * count / total  # noqa: E731
     wii_name = {start: name for start, name in rows}
+    if cadenas is None:
+        cadenas = {o: [n] for o, n in names.items()}
 
-    def host_name(token: str) -> str:
-        if token.startswith("x"):
-            return _corto(names.get(int(token[1:], 16), "??"))
-        return token
+    def cadena(token: str, regreso: bool) -> list[str]:
+        """Funciones (de adentro hacia afuera) en una dirección de la pila; las de regreso se miran en dirección - 1."""
+        if not token.startswith("x"):
+            return [token] if token != "-" else []
+        o = int(token[1:], 16)
+        c = cadenas.get(o - 1) if regreso and o > 0 else None
+        c = c or cadenas.get(o) or [names.get(o, "??")]
+        return [_corto(n) for n in c]
 
-    def guest_funcs(pc: str, lr: str, hosts: list[str], guests: list[int]) -> list[int]:
+    def pila(pc: str, lr: str, hosts: list[str]) -> list[str]:
+        """Toda la pila del anfitrión con las funciones integradas en línea, de adentro hacia afuera."""
+        out = cadena(pc, False)
+        if lr != "-" and _es_espera(pc):
+            out += cadena(lr, True)
+        for t in hosts:
+            out += cadena(t, True)
+        return out
+
+    def guest_funcs(nombres: list[str], guests: list[int]) -> list[int]:
         out: list[int] = []
-        for t in [pc] + ([lr] if lr != "-" and _es_espera(pc) else []) + hosts:
-            m = _FUNC.search(host_name(t))
+        for n in nombres:
+            m = _FUNC.search(n)
             if m:
                 a = int(m.group(1), 16)
                 f = _funcion_wii(ws, rows, keys, a)
@@ -227,14 +282,33 @@ def tramos(p: Perfil, names: dict[int, str], ws, top: int = 20) -> list[str]:
                 out.append(f[0])
         return out
 
+    def duena(nombres: list[str]) -> str:
+        """De quién es el trabajo de la muestra: la primera función de la pila que no es de biblioteca."""
+        for n in nombres:
+            if not _es_ayudante(n):
+                return n
+        return nombres[0] if nombres else "??"
+
+    def reparto(n: str) -> str:
+        if _FUNC.search(n):
+            return "código del juego"
+        if categoria(n).startswith("gráficos") or n.startswith("choya"):
+            return "aurora y Choya (convierten el GX y arman el cuadro)"
+        if categoria(n) == "GX (HLE)":
+            return "GX del runtime (funciones GX de la Wii hechas en C++)"
+        if categoria(n) == "audio (HLE)" or "snd" in n:
+            return "audio del runtime"
+        return "runtime y bibliotecas (" + (n.split("::")[0] if n else "?") + ")"
+
     parts: Counter[str] = Counter()
-    draw_parts: Counter[str] = Counter()
+    hojas: dict[str, Counter[str]] = defaultdict(Counter)
     wait_in: Counter[str] = Counter()
     incl: dict[str, Counter[int]] = defaultdict(Counter)
-    host_incl_draw: Counter[str] = Counter()
+    host_incl: dict[str, Counter[str]] = defaultdict(Counter)
     waits: Counter[str] = Counter()
     for n, wait, pc, lr, hosts, guests in p.pilas:
-        funcs = guest_funcs(pc, lr, hosts, guests)
+        nombres = pila(pc, lr, hosts)
+        funcs = guest_funcs(nombres, guests)
         phase = "otros"
         for a in funcs:  # de adentro hacia afuera: el primero de los dos que aparezca
             if a == p.calc:
@@ -247,26 +321,18 @@ def tramos(p: Perfil, names: dict[int, str], ws, top: int = 20) -> list[str]:
             parts["esperar"] += n
             wait_in[phase] += n
             what = _syscall(p.arq, wait) if wait != -2 else pc.split(":", 1)[-1]
-            site = next((host_name(t) for t in [lr] + hosts if t.startswith("x")), "")
-            waits[f"{what} ← {site or host_name(pc)}"] += n
+            sitio = [x for t in [lr] + hosts if t.startswith("x") for x in cadena(t, True)]
+            waits[f"{what} ← {duena(sitio) if sitio else duena(cadena(pc, False))}"] += n
             continue
         parts[phase] += n
         for a in funcs:
             incl[phase][a] += n
-        if phase == "dibujo":
-            pn = host_name(pc)
-            if _FUNC.search(pn):
-                draw_parts["código del juego (recorre modelos y llama a GX)"] += n
-            elif categoria(pn).startswith("gráficos") or "choya" in pn:
-                draw_parts["aurora (convierte el GX y arma el cuadro)"] += n
-            else:
-                draw_parts["runtime y bibliotecas (" + (pn.split("::")[0] if pn else "?") + ")"] += n
-            seen = set()
-            for t in [pc] + hosts:
-                hn = host_name(t)
-                if not _FUNC.search(hn) and hn not in seen and (categoria(hn).startswith("gráficos") or "choya" in hn):
-                    seen.add(hn)
-                    host_incl_draw[hn] += n
+        hojas[phase][reparto(duena(nombres))] += n
+        seen = set()
+        for hn in nombres:
+            if hn not in seen and not _FUNC.search(hn) and not _es_ayudante(hn):
+                seen.add(hn)
+                host_incl[phase][hn] += n
 
     lines = ["\n== Tramos del cuadro (hilo del juego " + (p.hilo_juego or "?") + ", reloj de pared)"]
     lines.append(f"{p.cuadros} cuadros en {p.segundos} s: {p.cuadros / max(1, p.segundos):.1f} cuadros/s, "
@@ -276,11 +342,14 @@ def tramos(p: Perfil, names: dict[int, str], ws, top: int = 20) -> list[str]:
                  "esperar": "Esperar (dormido o bloqueado)", "otros": "Otros (fuera de calc y draw)"}
     for k in ("actualizar", "dibujo", "esperar", "otros"):
         lines.append(f"{ms(parts[k]):7.1f} ms  {100 * parts[k] / total:5.1f}%  {etiquetas[k]}")
-        if k == "dibujo":
-            for name, c in draw_parts.most_common():
+        if k == "esperar":
+            if parts[k]:
+                lines.append("          esperas dentro de: " + ", ".join(f"{ph} {ms(c):.1f} ms"
+                                                                     for ph, c in wait_in.most_common()))
+            continue
+        for name, c in hojas[k].most_common(6):
+            if ms(c) >= 0.05:
                 lines.append(f"          {ms(c):6.1f} ms  de eso: {name}")
-        if k == "esperar" and parts[k]:
-            lines.append("          esperas dentro de: " + ", ".join(f"{ph} {ms(c):.1f} ms" for ph, c in wait_in.most_common()))
 
     def tabla(phase: str, titulo: str) -> None:
         if not incl[phase]:
@@ -290,12 +359,18 @@ def tramos(p: Perfil, names: dict[int, str], ws, top: int = 20) -> list[str]:
             calls = p.llamadas.get(a, 0) / frames
             lines.append(f"{ms(c):7.2f} ms  {calls:9.1f}×  {wii_name.get(a, f'func_{a:08X}')}")
 
+    def tabla_anfitrion(phase: str, titulo: str) -> None:
+        if not host_incl[phase]:
+            return
+        lines.append(f"\n== {titulo}: funciones del runtime, aurora y Choya (inclusivo, ms por cuadro)")
+        for name, c in host_incl[phase].most_common(15):
+            lines.append(f"{ms(c):7.2f} ms  {name}")
+
     tabla("actualizar", "Actualizar el juego")
     tabla("dibujo", "Preparar el dibujo (código del juego)")
-    if host_incl_draw:
-        lines.append("\n== Preparar el dibujo: funciones de aurora (inclusivo, ms por cuadro)")
-        for name, c in host_incl_draw.most_common(12):
-            lines.append(f"{ms(c):7.2f} ms  {name}")
+    tabla_anfitrion("dibujo", "Preparar el dibujo")
+    tabla("otros", "Otros (código del juego)")
+    tabla_anfitrion("otros", "Otros")
     if waits:
         lines.append("\n== Esperas: en qué duerme y quién la pidió (ms por cuadro)")
         for name, c in waits.most_common(12):
@@ -307,7 +382,8 @@ def tramos(p: Perfil, names: dict[int, str], ws, top: int = 20) -> list[str]:
     return lines
 
 
-def informe(p: Perfil, names: dict[int, str], simbolos: str | None = None, top: int = 35) -> str:
+def informe(p: Perfil, names: dict[int, str], simbolos: str | None = None, top: int = 35,
+            cadenas: dict[int, list[str]] | None = None) -> str:
     from . import retarget
     ws = retarget.load_wiisports_symbols(simbolos)
     rows = sorted((addr, n) for n, addr in ws.funcs.items())
@@ -334,6 +410,13 @@ def informe(p: Perfil, names: dict[int, str], simbolos: str | None = None, top: 
         por_hilo_func[tid][where] += count
 
     lines = [f"Muestras: {total} en {p.segundos} s"]
+    if p.fecha:
+        import time
+        lines[0] += time.strftime(" · medido el %d/%m/%Y a las %H:%M", time.localtime(p.fecha))
+    else:
+        lines[0] += " · perfil sin fecha (de una versión anterior a la 0.20.1)"
+    if p.hilo_juego:
+        lines[0] += f" · hilo del juego {p.hilo_juego.split()[0]}"
     lines.append("\n== Por hilo")
     for tid, (count, name) in sorted(p.hilos.items(), key=lambda kv: -kv[1][0]):
         lines.append(f"{100 * count / total:5.1f}%  {name} ({tid})")
@@ -348,5 +431,5 @@ def informe(p: Perfil, names: dict[int, str], simbolos: str | None = None, top: 
         for fn, c in por_hilo_func[tid].most_common(12):
             lines.append(f"{100 * c / max(1, count):5.1f}%  {fn}")
     if p.pilas or p.llamadas:
-        lines.extend(tramos(p, names, ws))
+        lines.extend(tramos(p, names, ws, cadenas=cadenas))
     return "\n".join(lines)

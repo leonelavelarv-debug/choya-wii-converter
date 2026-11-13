@@ -118,8 +118,9 @@ escribir_resumen() {
   {
     echo "modo: $MODO"
     echo "codigo de salida: ${STATUS:-sigue corriendo} (124 = siguio corriendo hasta el limite del modo diagnostico)"
-    [ -f "$DIR/perfil.txt" ] && echo "perfil.txt: $(head -2 "$DIR/perfil.txt" | tail -1)"
+    [ -f "$DIR/perfil.txt" ] && echo "perfil.txt: $(grep -m1 '^muestras' "$DIR/perfil.txt"), escrito el $(date -r "$DIR/perfil.txt" '+%d/%m %H:%M' 2>/dev/null), hilo del juego $(awk '/^hilo_juego/{print $2}' "$DIR/perfil.txt")"
     cat "$DIR/cpu.txt"
+    echo "procesador al jugar: tope $(( $(cat $CPUF/scaling_max_freq 2>/dev/null || echo 0) / 1000 )) MHz, ahora $(( $(cat $CPUF/scaling_cur_freq 2>/dev/null || echo 0) / 1000 )) MHz$([ -f "$DIR/cpu-normal" ] && echo " (archivo cpu-normal: tope de KNULLI)")$([ "$CPU_CALIENTE" = 1 ] && echo " (bajado por temperatura)")"
     echo "--- cuadros volcados"
     ls -la "$DIR"/cuadro-*.bin 2>/dev/null || echo "ninguno"
     echo "--- pantalla GLES de Choya"
@@ -170,6 +171,14 @@ perf_set() {  # archivo valor: lo escribe y apunta el valor anterior para restau
     PERF_SAVED="$PERF_SAVED $1=$old"; echo "rendimiento: $1 $old -> $2"
   else echo "rendimiento: no se pudo escribir $2 en $1 (sigue en $old)"; fi
 }
+CPU_BASE=""; CPU_TOPE=""; CPU_CALIENTE=0
+cpu_tope() {  # kHz: el tope de todos los núcleos, sin tocar lo que se restaura al salir
+  local dir
+  for dir in /sys/devices/system/cpu/cpufreq/policy*; do
+    [ -d "$dir" ] || continue
+    echo "$1" > "$dir/scaling_max_freq" 2>/dev/null || { [ -n "${ESUDO:-}" ] && echo "$1" | $ESUDO tee "$dir/scaling_max_freq" >/dev/null 2>&1; }
+  done
+}
 top_freq() { tr ' ' '\n' < "$1" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1; }
 {
   for dir in /sys/devices/system/cpu/cpufreq/policy*; do
@@ -189,6 +198,20 @@ if [ "${CHOYA_PERF:-1}" = "1" ]; then
       [ -n "$top" ] && perf_set "$dir/scaling_max_freq" "$top" && perf_set "$dir/scaling_min_freq" "$top"
     fi
   done >> "$DIR/rendimiento.txt" 2>&1
+  # Tope del procesador (0.20.1): KNULLI deja scaling_max_freq en 1512 MHz aunque el H700 anuncia más
+  # (cpuinfo_max_freq 1704 MHz). El hilo del juego es lo que limita los cuadros/s, así que son ~12 % más.
+  # Si pasa de 80 °C vuelve al tope de KNULLI hasta bajar de 72 °C (lo vigila el ciclo de cada 10 s).
+  # Un archivo vacío llamado "cpu-normal" junto al juego lo deja como lo tiene KNULLI.
+  if [ ! -f "$DIR/cpu-normal" ]; then
+    for dir in /sys/devices/system/cpu/cpufreq/policy*; do
+      [ -d "$dir" ] || continue
+      top=$(cat "$dir/cpuinfo_max_freq" 2>/dev/null); cur=$(cat "$dir/scaling_max_freq" 2>/dev/null)
+      if [ -n "$top" ] && [ -n "$cur" ] && [ "$top" -gt "$cur" ]; then
+        CPU_BASE=$cur; CPU_TOPE=$top
+        perf_set "$dir/scaling_max_freq" "$top"
+      fi
+    done >> "$DIR/rendimiento.txt" 2>&1
+  fi
   for dir in /sys/class/devfreq/*; do
     case "$(basename "$dir")" in *gpu*|*mali*|*1800000*|*dmc*) ;; *) continue ;; esac
     if grep -qw performance "$dir/available_governors" 2>/dev/null; then
@@ -235,6 +258,18 @@ esperar_juego() {
         "$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo 0) / 1000 ))" \
         "$(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 ))C"
     } >> "$DIR/memoria.txt" 2>/dev/null
+    # Vigilancia de temperatura con el tope del procesador subido.
+    if [ -n "$CPU_TOPE" ]; then
+      local temp
+      temp=$(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 ))
+      if [ "$temp" -ge 80 ] && [ "$CPU_CALIENTE" = 0 ]; then
+        cpu_tope "$CPU_BASE"; CPU_CALIENTE=1
+        echo "procesador: ${t}s ${temp} °C -> tope $((CPU_BASE / 1000)) MHz hasta que baje de 72 °C" >> "$DIR/rendimiento.txt"
+      elif [ "$temp" -le 72 ] && [ "$CPU_CALIENTE" = 1 ]; then
+        cpu_tope "$CPU_TOPE"; CPU_CALIENTE=0
+        echo "procesador: ${t}s ${temp} °C -> tope $((CPU_TOPE / 1000)) MHz otra vez" >> "$DIR/rendimiento.txt"
+      fi
+    fi
     # Qué zonas de memoria del juego son las grandes (smaps: archivo o dispositivo de cada zona; /dev/mali0 o
     # dmabuf = la GPU) y la memoria total de la Mali si el kernel la muestra.
     local jp
