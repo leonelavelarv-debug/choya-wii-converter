@@ -128,6 +128,17 @@ class TestMotorGles(unittest.TestCase):
                 out = subprocess.run([exe, "paleta", str(variant)], env=env, capture_output=True, text=True)
                 self.assertIn(f"paleta {color} {color}", out.stdout, out.stdout + out.stderr)
 
+            # TEV exacto (0.20.9): redondeo en enteros, desborde de 8 bits y resultado de la última etapa, matriz
+            # posterior de las coordenadas, niebla y textura indirecta. En flotante (CHOYA_GX_TEV=flotante) los dos primeros cambian.
+            for mode, exact, flot in ((0, "650000", "640000"), (1, "FEFEFE", None), (2, "FF0000", "FF0000"),
+                                      (3, "808080", "808080"), (4, "00FF00", "00FF00")):
+                out = subprocess.run([exe, "tev", str(mode)], env=env, capture_output=True, text=True)
+                self.assertIn(f"tev {mode} {exact}", out.stdout, out.stdout + out.stderr)
+                if flot:
+                    out = subprocess.run([exe, "tev", str(mode)], env=dict(env, CHOYA_GX_TEV="flotante"),
+                                         capture_output=True, text=True)
+                    self.assertIn(f"tev {mode} {flot}", out.stdout, out.stdout + out.stderr)
+
             # Una copia hecha en un cuadro anterior (caras, texturas de luz) viaja en el volcado del siguiente.
             vieja = os.path.join(d, "vieja.bin")
             out = subprocess.run([exe, "copia-vieja", vieja], env=env, capture_output=True, text=True)

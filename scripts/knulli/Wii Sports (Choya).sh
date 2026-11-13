@@ -94,6 +94,9 @@ if [ -f "$DIR/con-reverb" ]; then export CHOYA_SIN_REVERB=0; else export CHOYA_S
 # Un archivo vacío llamado "volcados" junto al juego: MENU + R1 guarda el cuadro con sus texturas también al jugar
 # (para dibujarlo igual en la PC). Ocupa algo más de memoria mientras se juega.
 if [ -f "$DIR/volcados" ]; then export CHOYA_GX_GUARDAR_TEXTURAS=1; fi
+# TEV exacto (0.20.9): la combinación de colores se cuenta en enteros de 8 bits como la Wii. Un archivo vacío llamado
+# "tev-flotante" junto al juego vuelve a la cuenta en flotante de antes (para comparar velocidad o colores).
+if [ -f "$DIR/tev-flotante" ]; then export CHOYA_GX_TEV=flotante; fi
 # Recursos convertidos por el conversor de Choya (assets.wlpk junto al juego): texturas en ETC2/EAC ya reducidas.
 # CHOYA_PAQUETE=0 usa solo las del disco.
 if [ "${CHOYA_PAQUETE:-}" != "0" ] && [ -f "$DIR/assets.wlpk" ]; then
@@ -112,6 +115,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "PortMaster: ${controlfolder:-no encontrado}  dispositivo: ${DEVICE_NAME:-?}  CFW: ${CFW_NAME:-?}"
   echo "mapeo del mando: ${SDL_GAMECONTROLLERCONFIG:-ninguno}" | cut -c1-200
   echo "efectos de audio: $([ "${CHOYA_SIN_REVERB:-0}" = 1 ] && echo "apagados (para oírlos: archivo con-reverb)" || echo "encendidos (archivo con-reverb)")"
+  echo "TEV: $([ "${CHOYA_GX_TEV:-}" = flotante ] && echo "en flotante (archivo tev-flotante)" || echo "exacto en enteros (para el de antes: archivo vacío tev-flotante)")"
   echo "volcados con texturas (MENU + R1): $([ "${CHOYA_GX_GUARDAR_TEXTURAS:-0}" = 1 ] && echo "sí (archivo volcados)" || echo "no (crea un archivo vacío llamado volcados en wiisports-choya)")"
   echo "recursos convertidos: $([ "$CHOYA_PAQUETE" = 0 ] && echo "no (texturas del disco)" || echo "$CHOYA_PAQUETE ($(du -h "$CHOYA_PAQUETE" 2>/dev/null | cut -f1))")"
   echo "gptokeyb: ${GPTOKEYB:-no}  salir: $CHOYA_QUIT_COMBO + START  botones: $CHOYA_FACE_LAYOUT"

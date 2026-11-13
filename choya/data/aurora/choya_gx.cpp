@@ -99,6 +99,45 @@ core::PipelineDesc describe(const gx::PipelineConfig& c) {
     }
   }
 
+  // TEV exacto (0.20.9): coordenadas posteriores, niebla, texturas indirectas y de profundidad, como build_shader.
+  auto& e = d.ext;
+  e.valid = 1;
+  e.dualTex = s.dualTexEnabled ? 1 : 0;
+  e.fogType = s.fogType;
+  e.fogRange = s.fogRangeAdjust ? 1 : 0;
+  e.zFreeze = s.zFreeze ? 1 : 0;
+  e.zTexture = s.zTexture;
+  const int zStage = gx::tev_z_texture_stage(s);
+  e.zTexStage = gx::tev_z_texture_enabled(s) ? static_cast<uint8_t>(zStage >= 0 ? zStage : 0xFE) : 0xFF;
+  d.attrs[GX_VA_NRM].pad = s.attrs[GX_VA_NRM].nrmIndexCount;
+  for (u32 i = 0; i < 8; ++i) {
+    const auto& tcg = s.tcgs[i];
+    e.tgFlags[i] = static_cast<uint8_t>((tcg.normalize ? 1 : 0) | (tcg.inputFormAB11 ? 2 : 0));
+    e.tgPost[i] = 0xFF;
+    if (s.dualTexEnabled && tcg.postMtx != GX_PTIDENTITY) {
+      e.tgPost[i] = static_cast<uint8_t>((tcg.postMtx - GX_PTTEXMTX0) / 3);
+    }
+  }
+  e.numIndStages = static_cast<uint8_t>(std::min<u32>(s.numIndStages, 4));
+  e.usedIndStages = static_cast<uint8_t>(info.usedIndStages.to_ulong());
+  for (u32 i = 0; i < 4; ++i) {
+    const auto& is = s.indStages[i];
+    const int tc = gx::tev_effective_texcoord(s, is.texCoordId);
+    e.ind[i] = {static_cast<uint8_t>(tc >= 0 ? tc : 0xFF), static_cast<uint8_t>(is.texMapId),
+                static_cast<uint8_t>(is.scaleS), static_cast<uint8_t>(is.scaleT)};
+  }
+  for (u32 i = 0; i < d.tevStageCount; ++i) {
+    const auto& st = s.tevStages[i];
+    const auto dep = gx::tev_stage_texture_dependency(s, i);
+    d.stages[i].pad = static_cast<uint8_t>(dep.texCoordId >= 0 ? dep.texCoordId : 0xFF);
+    e.tind[i] = {static_cast<uint8_t>(st.indTexStage), static_cast<uint8_t>(st.indTexFormat),
+                 static_cast<uint8_t>(st.indTexBiasSel), static_cast<uint8_t>(st.indTexAlphaSel),
+                 static_cast<uint8_t>(st.indTexMtxId), static_cast<uint8_t>(st.indTexWrapS),
+                 static_cast<uint8_t>(st.indTexWrapT),
+                 static_cast<uint8_t>((st.indTexAddPrev ? 1 : 0) | (dep.needsFixedTexcoordState ? 2 : 0) |
+                                      (dep.combinerUsesTexture ? 4 : 0))};
+  }
+
   // Desplazamientos de los uniformes, en el mismo orden y tamaños que gx::build_uniform.
   const auto& gs = gx::g_gxState;
   size_t b = 32 + 4 * gx::MaxIndexAttr;  // vtx_start, pnmtx, 4 flotantes, relleno, array_start[]
@@ -137,9 +176,18 @@ core::PipelineDesc describe(const gx::PipelineConfig& c) {
       b += sizeof(gs.kcolors[0]);
     }
   }
-  if (info.usesPTTexMtx.any()) b += sizeof(gs.ptTexMtxs);
-  if (info.usesFog) b += sizeof(gx::Fog);
-  if (info.usedIndTexMtxs.any()) b += gx::MaxIndTexMtxs * 2 * sizeof(Vec4<s32>);
+  if (info.usesPTTexMtx.any()) {
+    e.offPostMtx = word();
+    b += sizeof(gs.ptTexMtxs);
+  }
+  if (info.usesFog) {
+    e.offFog = word();
+    b += sizeof(gx::Fog);
+  }
+  if (info.usedIndTexMtxs.any()) {
+    e.offIndMtx = word();
+    b += gx::MaxIndTexMtxs * 2 * sizeof(Vec4<s32>);
+  }
   for (size_t i = 0; i < 8; ++i) {
     if (info.sampledTexCoords.test(i)) {
       d.offTexScale[i] = word();
@@ -152,6 +200,7 @@ core::PipelineDesc describe(const gx::PipelineConfig& c) {
       b += sizeof(Vec4<float>);
     }
   }
+  if (s.zFreeze) e.offZFreeze = word();
 
   d.depthCompare = c.depthCompare;
   d.depthUpdate = c.depthUpdate;

@@ -512,6 +512,9 @@ uint64_t shader_key(const PipelineDesc& d) {
   for (size_t i = 0; i < kShaderKeyBytes; ++i) {
     h = (h ^ p[i]) * 1099511628211ull;
   }
+  for (size_t i = kPipelineDescV4Bytes; i < sizeof(PipelineDesc); ++i) {  // extensión del TEV exacto (0.20.9)
+    h = (h ^ p[i]) * 1099511628211ull;
+  }
   return h;
 }
 
@@ -748,7 +751,16 @@ std::string uvec(u32 word) { return "uv4(" + num(word) + ")"; }
 // Componente de un canal según la tabla de intercambio (GX_CH_RED..GX_CH_ALPHA).
 char swz(u8 ch) { return "rgba"[ch & 3]; }
 
-// --- TEV en flotante (motor de Choya). El TEV exacto en enteros llega en el paso 2b-2. ---
+// --- TEV (0.20.9: exacto como aurora, en enteros de 8 bits con desborde) ---
+// CHOYA_GX_TEV=flotante vuelve a la cuenta en flotante de antes (para comparar velocidad o colores).
+bool tev_float() {
+  static const bool on = [] {
+    const char* v = std::getenv("CHOYA_GX_TEV");
+    return v != nullptr && std::strcmp(v, "flotante") == 0;
+  }();
+  return on;
+}
+
 std::string tev_kc(u8 sel) {
   if (sel <= GX_TEV_KCSEL_1_8) return "vec3(" + std::to_string(8 - sel) + ".0 / 8.0)";
   if (sel >= GX_TEV_KCSEL_K0 && sel <= GX_TEV_KCSEL_K3) return "k" + std::to_string(sel - GX_TEV_KCSEL_K0) + ".rgb";
@@ -767,13 +779,26 @@ std::string tev_ka(u8 sel) {
   return "1.0";
 }
 
+// Alfa de la textura indirecta (GX_ALPHA_BUMP / GX_ALPHA_BUMPN), como alpha_bump_sel de aurora.
+std::string alpha_bump(const PipelineDesc& cfg, const TevStageDesc& s, u32 idx) {
+  const auto& e = cfg.ext;
+  if (!e.valid) return "0.0";
+  const auto& ti = e.tind[idx];
+  if (ti.indStage >= e.numIndStages || ti.alphaSel == GX_ITBA_OFF) return "0.0";
+  const char comp = ti.alphaSel == GX_ITBA_S ? 'x' : ti.alphaSel == GX_ITBA_T ? 'y' : 'z';
+  const u32 mask = ti.format == GX_ITF_5 ? 0xE0u : ti.format == GX_ITF_4 ? 0xF0u : 0xF8u;
+  std::string v = "(float(ind" + std::to_string(ti.indStage) + "." + comp + " & " + std::to_string(mask) + ") / 255.0)";
+  if (s.channel == GX_ALPHA_BUMPN) v = "(" + v + " * (255.0 / 248.0))";
+  return v;
+}
+
 std::string tev_color_arg(const PipelineDesc& cfg, const TevStageDesc& s, u32 idx, u8 arg) {
   const bool hasTex = s.texMap != 0xFF;
   const u8* tsw = cfg.swap[s.swapTex & 3];
   const u8* rsw = cfg.swap[s.swapRas & 3];
   const std::string ras = s.channel == GX_COLOR1A1 || s.channel == GX_COLOR1 || s.channel == GX_ALPHA1 ? "rast1" : "rast0";
-  const bool noRas = s.channel == GX_COLOR_ZERO || s.channel == GX_COLOR_NULL || s.channel == GX_ALPHA_BUMP ||
-                     s.channel == GX_ALPHA_BUMPN;
+  const bool noRas = s.channel == GX_COLOR_ZERO || s.channel == GX_COLOR_NULL;
+  const bool bump = s.channel == GX_ALPHA_BUMP || s.channel == GX_ALPHA_BUMPN;
   const std::string si = "s" + std::to_string(idx);
   switch (arg) {
   case GX_CC_CPREV: return "prev.rgb";
@@ -792,9 +817,11 @@ std::string tev_color_arg(const PipelineDesc& cfg, const TevStageDesc& s, u32 id
     return "vec3(" + si + "." + swz(tsw[3]) + ")";
   case GX_CC_RASC:
     if (noRas) return "vec3(0.0)";
+    if (bump) return "vec3(" + alpha_bump(cfg, s, idx) + ")";
     return ras + "." + swz(rsw[0]) + swz(rsw[1]) + swz(rsw[2]);
   case GX_CC_RASA:
     if (noRas) return "vec3(0.0)";
+    if (bump) return "vec3(" + alpha_bump(cfg, s, idx) + ")";
     return "vec3(" + ras + "." + swz(rsw[3]) + ")";
   case GX_CC_ONE: return "vec3(1.0)";
   case GX_CC_HALF: return "vec3(0.5)";
@@ -808,8 +835,8 @@ std::string tev_alpha_arg(const PipelineDesc& cfg, const TevStageDesc& s, u32 id
   const u8* tsw = cfg.swap[s.swapTex & 3];
   const u8* rsw = cfg.swap[s.swapRas & 3];
   const std::string ras = s.channel == GX_COLOR1A1 || s.channel == GX_COLOR1 || s.channel == GX_ALPHA1 ? "rast1" : "rast0";
-  const bool noRas = s.channel == GX_COLOR_ZERO || s.channel == GX_COLOR_NULL || s.channel == GX_ALPHA_BUMP ||
-                     s.channel == GX_ALPHA_BUMPN;
+  const bool noRas = s.channel == GX_COLOR_ZERO || s.channel == GX_COLOR_NULL;
+  const bool bump = s.channel == GX_ALPHA_BUMP || s.channel == GX_ALPHA_BUMPN;
   switch (arg) {
   case GX_CA_APREV: return "prev.a";
   case GX_CA_A0: return "r0.a";
@@ -820,6 +847,7 @@ std::string tev_alpha_arg(const PipelineDesc& cfg, const TevStageDesc& s, u32 id
     return "s" + std::to_string(idx) + "." + swz(tsw[3]);
   case GX_CA_RASA:
     if (noRas) return "0.0";
+    if (bump) return alpha_bump(cfg, s, idx);
     return ras + "." + swz(rsw[3]);
   case GX_CA_KONST: return tev_ka(s.kaSel);
   default: return "0.0";
@@ -845,58 +873,148 @@ std::string tev_scale(u8 scale) {
   }
 }
 
-// Una operación TEV (color con vec3, alfa con float).
-std::string tev_op(bool alpha, u8 op, u8 bias, u8 scale, u8 clampOut, const std::string& a, const std::string& b,
-                   const std::string& c, const std::string& d) {
+// Condición de una comparación del TEV (valores de 8 bits). alpha: a y b son escalares (A8); si no, vectores.
+std::string tev_compare_cond(u8 op, bool alphaScalar, const std::string& a, const std::string& b) {
+  auto q = [](const std::string& x) { return "round(" + x + " * 255.0)"; };
+  switch (op) {
+  case GX_TEV_COMP_R8_GT: return q(a + ".r") + " > " + q(b + ".r");
+  case GX_TEV_COMP_R8_EQ: return q(a + ".r") + " == " + q(b + ".r");
+  case GX_TEV_COMP_GR16_GT:
+    return "round(dot(" + a + ".rg * 255.0, vec2(1.0, 256.0))) > round(dot(" + b + ".rg * 255.0, vec2(1.0, 256.0)))";
+  case GX_TEV_COMP_GR16_EQ:
+    return "round(dot(" + a + ".rg * 255.0, vec2(1.0, 256.0))) == round(dot(" + b + ".rg * 255.0, vec2(1.0, 256.0)))";
+  case GX_TEV_COMP_BGR24_GT:
+    return "round(dot(" + a + ".rgb * 255.0, vec3(1.0, 256.0, 65536.0))) > round(dot(" + b +
+           ".rgb * 255.0, vec3(1.0, 256.0, 65536.0)))";
+  case GX_TEV_COMP_BGR24_EQ:
+    return "round(dot(" + a + ".rgb * 255.0, vec3(1.0, 256.0, 65536.0))) == round(dot(" + b +
+           ".rgb * 255.0, vec3(1.0, 256.0, 65536.0)))";
+  default:  // RGB8 (color, por componente) / A8 (alfa)
+    if (alphaScalar) return q(a) + (op == GX_TEV_COMP_A8_GT ? " > " : " == ") + q(b);
+    return std::string(op == GX_TEV_COMP_RGB8_GT ? "greaterThan(" : "equal(") + q(a) + ", " + q(b) + ")";
+  }
+}
+
+// Una operación TEV en flotante (la de antes; CHOYA_GX_TEV=flotante).
+std::string tev_op_float(bool alpha, u8 op, u8 bias, u8 scale, u8 clampOut, const std::string& a, const std::string& b,
+                         const std::string& c, const std::string& d, const std::string& colorA,
+                         const std::string& colorB) {
   const std::string T = alpha ? "float" : "vec3";
   std::string v;
   if (op == GX_TEV_ADD || op == GX_TEV_SUB) {
     const std::string lerp = "mix(" + a + ", " + b + ", " + c + ")";
     v = "((" + d + (op == GX_TEV_SUB ? " - " : " + ") + lerp + ")" + tev_bias(bias) + ")" + tev_scale(scale);
+  } else if (!alpha && (op == GX_TEV_COMP_RGB8_GT || op == GX_TEV_COMP_RGB8_EQ)) {
+    v = "(" + d + " + " + c + " * vec3(" + tev_compare_cond(op, false, a, b) + "))";
   } else {
-    // Comparaciones: d + (a ? b : 0) ? c : 0, con valores de 8 bits (sin escala ni sesgo).
-    auto q = [](const std::string& x) { return "floor(" + x + " * 255.0 + 0.5)"; };
-    std::string cond;
-    switch (op) {
-    case GX_TEV_COMP_R8_GT: cond = q(a + ".r") + " > " + q(b + ".r"); break;
-    case GX_TEV_COMP_R8_EQ: cond = q(a + ".r") + " == " + q(b + ".r"); break;
-    case GX_TEV_COMP_GR16_GT:
-      cond = "dot(" + q(a + ".rg") + ", vec2(1.0, 256.0)) > dot(" + q(b + ".rg") + ", vec2(1.0, 256.0))"; break;
-    case GX_TEV_COMP_GR16_EQ: cond = "all(equal(" + q(a + ".rg") + ", " + q(b + ".rg") + "))"; break;
-    case GX_TEV_COMP_BGR24_GT:
-      cond = "dot(" + q(a + ".rgb") + ", vec3(1.0, 256.0, 65536.0)) > dot(" + q(b + ".rgb") + ", vec3(1.0, 256.0, 65536.0))";
-      break;
-    case GX_TEV_COMP_BGR24_EQ: cond = "all(equal(" + q(a + ".rgb") + ", " + q(b + ".rgb") + "))"; break;
-    default:  // RGB8 / A8 por componente
-      if (alpha) {
-        cond = q(a) + (op == GX_TEV_COMP_A8_GT ? " > " : " == ") + q(b);
-      } else {
-        const std::string cmp = op == GX_TEV_COMP_RGB8_GT ? "greaterThan(" : "equal(";
-        return "(" + d + " + " + c + " * vec3(" + cmp + q(a) + ", " + q(b) + ")))";
-      }
-      break;
-    }
-    v = "(" + d + " + ((" + cond + ") ? " + c + " : " + T + "(0.0)))";
+    const bool colorIn = alpha && op <= GX_TEV_COMP_BGR24_EQ;  // R8/GR16/BGR24 en el alfa: entradas de color
+    v = "(" + d + " + ((" + tev_compare_cond(op, alpha && !colorIn, colorIn ? colorA : a, colorIn ? colorB : b) +
+        ") ? " + c + " : " + T + "(0.0)))";
   }
   return clampOut ? "clamp(" + v + ", 0.0, 1.0)" : "clamp(" + v + ", -4.0, 4.0)";
 }
 
+// Una operación TEV exacta (aurora, shader.cpp: tev_color_op / tev_alpha_op y tev_regular_i32): a, b y c se toman en
+// 8 bits con desborde, d en 11 bits con signo; la interpolación y el redondeo en enteros, con la escala y el sesgo
+// fijos en el programa. Las comparaciones de R8/GR16/BGR24 en el alfa usan las entradas A y B del color.
+std::string tev_op_exact(bool alpha, u8 op, u8 bias, u8 scale, u8 clampOut, const std::string& a, const std::string& b,
+                         const std::string& c, const std::string& d, const std::string& colorA,
+                         const std::string& colorB) {
+  const std::string T = alpha ? "float" : "vec3";
+  const std::string lo = clampOut ? "0.0" : "-1024.0 / 255.0", hi = clampOut ? "1.0" : "1023.0 / 255.0";
+  std::string v;
+  if (op == GX_TEV_ADD || op == GX_TEV_SUB) {
+    // Las entradas en 8 bits las declara la etapa: xA, xB, xC (con desborde) y xD (11 bits), x = c (color) o a (alfa).
+    const std::string x = alpha ? "a" : "c";
+    const std::string A = x + "A", B = x + "B", C = x + "C", D = x + "D";
+    const bool sub = op == GX_TEV_SUB;
+    const int sh = scale == GX_CS_SCALE_2 ? 1 : scale == GX_CS_SCALE_4 ? 2 : 0;
+    const std::string bi = bias == GX_TB_ADDHALF ? " + 128" : bias == GX_TB_SUBHALF ? " - 128" : "";
+    const std::string shs = sh ? " << " + std::to_string(sh) : "";
+    std::string lp = "(((" + A + " << 8) + (" + B + " - " + A + ") * (" + C + " + (" + C + " >> 7)))" + shs + ")";
+    if (scale != GX_CS_DIVIDE_2) lp = "(" + lp + (sub ? " + 127" : " + 128") + ")";
+    std::string r = "(((" + D + bi + ")" + shs + ")" + (sub ? " - " : " + ") + "(" + lp + " >> 8))";
+    if (scale == GX_CS_DIVIDE_2) r = "(" + r + " >> 1)";
+    v = (alpha ? "float(" : "vec3(") + r + ") / 255.0";
+  } else {
+    // a, b, c (y colorA/colorB) ya llegan con el desborde de 8 bits si son registros (ver build_sources).
+    const bool colorIn = alpha && op <= GX_TEV_COMP_BGR24_EQ;  // R8/GR16/BGR24 en el alfa: entradas A y B del color
+    const std::string A = colorIn ? colorA : a;
+    const std::string B = colorIn ? colorB : b;
+    if (!alpha && (op == GX_TEV_COMP_RGB8_GT || op == GX_TEV_COMP_RGB8_EQ)) {
+      v = c + " * vec3(" + tev_compare_cond(op, false, A, B) + ") + " + d;
+    } else {
+      v = "((" + tev_compare_cond(op, alpha && !colorIn, A, B) + ") ? " + c + " : " + T + "(0.0)) + " + d;
+    }
+  }
+  return "clamp(" + v + ", " + lo + ", " + hi + ")";
+}
+
 std::string alpha_test(u8 comp, u8 ref) {
-  const std::string r = std::to_string(ref) + ".0";
-  const std::string a = "floor(prev.a * 255.0 + 0.5)";
+  const std::string r = std::to_string(ref) + "u";
+  const std::string a = "alphaCmp";
   switch (comp) {
   case GX_NEVER: return "false";
-  case GX_LESS: return a + " < " + r;
+  case GX_LESS: return ref == 0 ? "false" : a + " < " + r;
   case GX_EQUAL: return a + " == " + r;
-  case GX_LEQUAL: return a + " <= " + r;
-  case GX_GREATER: return a + " > " + r;
+  case GX_LEQUAL: return ref == 255 ? "true" : a + " <= " + r;
+  case GX_GREATER: return ref == 255 ? "false" : a + " > " + r;
   case GX_NEQUAL: return a + " != " + r;
-  case GX_GEQUAL: return a + " >= " + r;
+  case GX_GEQUAL: return ref == 0 ? "true" : a + " >= " + r;
   default: return "true";
   }
 }
 
+// Carga de un grupo de la normal NBT (0 normal, 1 binormal/tangente de GX_TG_BINRM, 2 la de GX_TG_TANGENT), como
+// normal_group_load de aurora. attrs[GX_VA_NRM].pad es nrmIndexCount (3: un índice por grupo).
+std::string nrm_group(const PipelineDesc& cfg, u32 group) {
+  const auto& m = cfg.attrs[GX_VA_NRM];
+  if (m.attrType == GX_NONE) return "vec3(1.0, 0.0, 0.0)";
+  if (m.cnt != 9) return vec_attr(cfg, GX_VA_NRM, 3);
+  const bool indexed = m.attrType == GX_INDEX8 || m.attrType == GX_INDEX16;
+  const u32 size = comp_size(m.compType);
+  const u32 groupOffset = (indexed && m.pad == 3) ? 0 : group * 3u * size;
+  std::string offs = "(vtx_start + vidx * " + std::to_string(cfg.vtxStride) + "u + " + std::to_string(m.offset) + "u)";
+  char buf = 'V';
+  bool le = false;
+  const std::string arrayStart = "uw(" + std::to_string(8 + (GX_VA_NRM - GX_VA_POS)) + "u)";
+  if (m.attrType == GX_INDEX8) {
+    offs = "(" + arrayStart + " + lb_V(" + plus(offs, m.pad == 3 ? group : 0) + ") * " + std::to_string(m.stride) +
+           "u + " + std::to_string(groupOffset) + "u)";
+    buf = 'A';
+    le = m.le;
+  } else if (m.attrType == GX_INDEX16) {
+    offs = "(" + arrayStart + " + lh_V(" + plus(offs, m.pad == 3 ? group * 2u : 0) + ", false) * " +
+           std::to_string(m.stride) + "u + " + std::to_string(groupOffset) + "u)";
+    buf = 'A';
+    le = m.le;
+  } else {
+    offs = plus(offs, groupOffset);
+  }
+  std::string s = "vec3(";
+  for (u32 i = 0; i < 3; ++i) s += (i ? ", " : "") + comp_expr(buf, m.compType, plus(offs, i * size), m.frac, le);
+  return s + ")";
+}
+
+// Atributo crudo del vértice como lo nombra aurora (vtx_attr): sin color, blanco; sin coordenada, (0, 0).
+std::string raw_color_attr(const PipelineDesc& cfg, GXAttr attr) {
+  return cfg.attrs[attr].attrType == GX_NONE ? "vec4(1.0)" : color_attr(cfg, attr);
+}
+
+constexpr const char* kFsHelpers = R"(
+float ovf1(float x) { float b = x * 255.0; return (b - floor(b / 256.0) * 256.0) / 255.0; }
+vec3 ovf3(vec3 x) { vec3 b = x * 255.0; return (b - floor(b / 256.0) * 256.0) / 255.0; }
+vec4 ovf4(vec4 x) { vec4 b = x * 255.0; return (b - floor(b / 256.0) * 256.0) / 255.0; }
+int tb1(float x) { return int(round(x * 255.0)); }
+ivec3 tb3(vec3 x) { return ivec3(round(x * 255.0)); }
+ivec2 s24(ivec2 v) { return (v << 8) >> 8; }
+ivec4 iv4(uint w) { return ivec4(u[w >> 2u]); }
+)";
+
 void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
+  const auto& e = cfg.ext;
+  const bool ex = e.valid != 0;
+  const bool exact = !tev_float();
   // ---------------- vertex shader ----------------
   vs = "#version 320 es\nprecision highp float;\nprecision highp int;\n"
        "uniform highp usampler2D vbuf;\nuniform highp usampler2D abuf;\n"
@@ -930,12 +1048,20 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
         "  vec4 mv = vec4(dot(p, uv4(m)), dot(p, uv4(m + 4u)), dot(p, uv4(m + 8u)), 1.0);\n"
         "  gl_Position = vec4(dot(mv, " + uvec(cfg.offProj) + "), dot(mv, " + uvec(cfg.offProj + 4u) + "), dot(mv, " +
         uvec(cfg.offProj + 8u) + "), dot(mv, " + uvec(cfg.offProj + 12u) + "));\n";
-  // Normal (0.20.8): la del vértice por la matriz de normales (después de las de posición, con el mismo índice), para
-  // la iluminación y las coordenadas de textura que salen de la normal (GX_TG_NRM).
+  if (ex && e.zFreeze && e.offZFreeze != 0) {
+    // GX coplanar: la profundidad sale del plano del triángulo de referencia (z/w es lineal en pantalla).
+    vs += "  { vec2 zf = gl_Position.xy / gl_Position.w; vec4 pl = " + uvec(e.offZFreeze) +
+          ";\n    gl_Position.z = (pl.x * zf.x + pl.y * zf.y + pl.z) * gl_Position.w; }\n";
+  }
+  if (ex) {
+    // GX rasteriza con el centro del píxel a 7/12 (sin antialias); GL a 1/2 (aurora hace lo mismo).
+    vs += "  gl_Position.xy += gl_Position.w * vec2(-1.0, 1.0) / (6.0 * max(abs(uintBitsToFloat(u[0].zw)), vec2(1.0)));\n";
+  }
+  // Normal: la del vértice (o (1, 0, 0) como aurora si no trae) por la matriz de normales.
   if (cfg.attrs[GX_VA_NRM].attrType != GX_NONE) {
     vs += "  vec3 in_nrm = " + vec_attr(cfg, GX_VA_NRM, 3) + ";\n";
   } else {
-    vs += "  vec3 in_nrm = vec3(0.0, 0.0, 1.0);\n";
+    vs += "  vec3 in_nrm = vec3(1.0, 0.0, 0.0);\n";
   }
   if (cfg.nrmCount != 0) {
     vs += "  uint nm = " + num(cfg.offPostex + 12u * cfg.postexCount) + " + pnmtx * 12u;\n"
@@ -946,8 +1072,12 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
     vs += "  vec3 mv_nrm = in_nrm;\n";
   }
 
-  // Canales de color: material o color del vértice y, con iluminación (0.20.8), ambiente + luces como el XF de GX.
+  // Canales de color: material o color del vértice y, con iluminación, ambiente + luces como el XF de GX. Sin luz el
+  // XF igual pasa el color por 8 bits.
   const ChannelLayout lay = channel_layout(cfg);
+  auto q8 = [](const std::string& x, bool scalar) {
+    return scalar ? "(float(int(round(" + x + " * 255.0))) / 255.0)" : "(vec3(ivec3(round(" + x + " * 255.0))) / 255.0)";
+  };
   for (u32 ch = 0; ch < 2; ++ch) {
     const std::string out = "v_color" + std::to_string(ch);
     if (((cfg.sampledChannels >> ch) & 1) == 0) {
@@ -968,17 +1098,21 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
       const std::string amb = cc.ambSrc == GX_SRC_VTX ? vc + ".rgb" : uvec(lay.amb[ch]) + ".rgb";
       rgb = "gx_light(" + num(lay.lights) + ", uw(" + num(lay.lights + 160u + ch) + "), mv.xyz, mv_nrm, " + amb + ", " +
             rgb + ", " + std::to_string(chan_diff_fn(cc)) + ", " + std::to_string(chan_attn_fn(cc)) + ", false)";
+    } else if (exact) {
+      rgb = q8(rgb, false);
     }
     if (litA) {
       const std::string amb = cca.ambSrc == GX_SRC_VTX ? vc + ".a" : uvec(lay.ambA[ch]) + ".a";
       a = "gx_light(" + num(lay.lights) + ", uw(" + num(lay.lights + 162u + ch) + "), mv.xyz, mv_nrm, vec3(" + amb +
           "), vec3(" + a + "), " + std::to_string(chan_diff_fn(cca)) + ", " + std::to_string(chan_attn_fn(cca)) +
           ", true).x";
+    } else if (exact) {
+      a = q8(a, true);
     }
     vs += "  " + out + " = vec4(" + rgb + ", " + a + ");\n";
   }
 
-  // Coordenadas de textura.
+  // Coordenadas de textura (aurora: build_shader, tcgs).
   for (u32 i = 0; i < 8; ++i) {
     if (((cfg.sampledTexCoords >> i) & 1) == 0) continue;
     const auto& tg = cfg.texgens[i];
@@ -995,12 +1129,19 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
     } else if (tg.src == GX_MAX_TEXGENSRC) {
       vs += "  vec4 " + tc + " = " + tex_src(i) + ";\n";
     } else if (tg.src == GX_TG_COLOR0 || tg.src == GX_TG_COLOR1) {
-      vs += "  vec4 " + tc + " = vec4(" + vertex_color(cfg, tg.src - GX_TG_COLOR0) + ".rgb, 1.0);\n";
-    } else if (tg.src == GX_TG_NRM) {  // 0.20.8: antes usaba la posición (las texturas de luz salían mal)
+      const std::string col = ex ? raw_color_attr(cfg, tg.src == GX_TG_COLOR0 ? GX_VA_CLR0 : GX_VA_CLR1)
+                                 : vertex_color(cfg, tg.src - GX_TG_COLOR0);
+      vs += "  vec4 " + tc + " = vec4(" + col + ".rgb, 1.0);\n";
+    } else if (tg.src == GX_TG_NRM) {
       vs += "  vec4 " + tc + " = vec4(in_nrm, 1.0);\n";
-    } else {  // posición (y por ahora también binormales y tangentes)
+    } else if (ex && tg.src == GX_TG_BINRM) {  // fila 3 de GX: el grupo de la tangente en las normales NBT
+      vs += "  vec4 " + tc + " = vec4(" + nrm_group(cfg, 1) + ", 1.0);\n";
+    } else if (ex && tg.src == GX_TG_TANGENT) {
+      vs += "  vec4 " + tc + " = vec4(" + nrm_group(cfg, 2) + ", 1.0);\n";
+    } else {  // posición
       vs += "  vec4 " + tc + " = vec4(in_pos, 1.0);\n";
     }
+    if (ex && (e.tgFlags[i] & 2)) vs += "  " + tc + ".z = 1.0;\n";  // entrada AB11
     std::string tmp;
     if (tg.type == GX_TG_MTX2x4 || tg.type == GX_TG_MTX3x4) {
       std::string base;
@@ -1022,7 +1163,15 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
       tmp = "vec3(" + tc + ".xy, 1.0)";
     }
     const std::string out = "v_tex" + std::to_string(i);
-    vs += "  " + out + " = " + tmp + ";\n";
+    vs += "  vec3 " + tc + "t = " + tmp + ";\n";
+    // Segunda transformación (GXSetTexCoordGen2 con dualTex): normalizar y la matriz posterior (0.20.9).
+    if (ex && e.dualTex && (e.tgFlags[i] & 1)) vs += "  " + tc + "t = normalize(" + tc + "t);\n";
+    if (ex && e.dualTex && e.tgPost[i] != 0xFF && e.offPostMtx != 0) {
+      const std::string pm = num(e.offPostMtx + 12u * e.tgPost[i]);
+      vs += "  { vec4 pt = vec4(" + tc + "t, 1.0); " + tc + "t = vec3(dot(pt, uv4(" + pm + ")), dot(pt, uv4(" + pm +
+            " + 4u)), dot(pt, uv4(" + pm + " + 8u))); }\n";
+    }
+    vs += "  " + out + " = " + tc + "t;\n";
     if (tg.type == GX_TG_MTX2x4 || tg.type == GX_TG_MTX3x4) {
       vs += "  if (" + out + ".z == 0.0) { " + out + ".xy = clamp(" + out + ".xy / 2.0, -1.0, 1.0); }\n";
     }
@@ -1030,6 +1179,7 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
   vs += "}\n";
 
   // ---------------- fragment shader ----------------
+  const bool zTex = ex && e.zTexStage != 0xFF && ((e.zTexture >> 26) & 3u) != GX_ZT_DISABLE;
   fs = "#version 320 es\nprecision highp float;\nprecision highp int;\n"
        "layout(std140) uniform U { uvec4 u[1024]; };\nin vec4 v_color0;\nin vec4 v_color1;\n";
   for (u32 i = 0; i < 8; ++i) {
@@ -1037,8 +1187,9 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
   }
   for (u32 i = 0; i < 8; ++i) fs += "uniform sampler2D tex" + std::to_string(i) + ";\n";
   fs += "uniform vec4 u_debug;\nlayout(location = 0) out vec4 o_color;\n"
-        "vec4 uv4(uint w) { return uintBitsToFloat(u[w >> 2u]); }\n"
-        "void main() {\n  vec4 rast0 = v_color0;\n  vec4 rast1 = v_color1;\n";
+        "vec4 uv4(uint w) { return uintBitsToFloat(u[w >> 2u]); }\n";
+  fs += kFsHelpers;
+  fs += "void main() {\n  vec4 rast0 = v_color0;\n  vec4 rast1 = v_color1;\n";
   for (u32 r = 0; r < 4; ++r) {
     const std::string name = r == 0 ? "prev" : "r" + std::to_string(r - 1);
     fs += "  vec4 " + name + " = " + (cfg.offTevReg[r] ? uvec(cfg.offTevReg[r]) : std::string("vec4(0.0)")) + ";\n";
@@ -1047,32 +1198,230 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
     fs += "  vec4 k" + std::to_string(k) + " = " + (cfg.offKColor[k] ? uvec(cfg.offKColor[k]) : std::string("vec4(1.0)")) +
           ";\n";
   }
+  // Coordenada en punto fijo (aurora: texN_fixed_uv = vec2i(uv * escala * 128)).
+  std::array<bool, 8> fixedDone{};
+  auto fixed_uv = [&](u32 n) {
+    const std::string name = "tcf" + std::to_string(n);
+    if (!fixedDone[n]) {
+      fixedDone[n] = true;
+      const auto& tg = cfg.texgens[n];
+      const std::string tn = "v_tex" + std::to_string(n);
+      const std::string uv =
+          tg.type == GX_TG_MTX3x4 ? "(" + tn + ".z != 0.0 ? " + tn + ".xy / " + tn + ".z : " + tn + ".xy)" : tn + ".xy";
+      const std::string scale = cfg.offTexScale[n] ? uvec(cfg.offTexScale[n]) + ".xy" : "vec2(1.0)";
+      fs += "  ivec2 " + name + " = ivec2(" + uv + " * " + scale + " * 128.0);\n";
+    }
+    return name;
+  };
+  auto tex_size = [&](u32 map) {
+    return cfg.offTexSize[map] ? uvec(cfg.offTexSize[map]) : std::string("vec4(1.0, 1.0, 0.0, 0.0)");
+  };
+  if (ex) {
+    // Texturas indirectas: cada una se muestrea una vez (t_IndTexCoord de aurora, en 0..255).
+    for (u32 j = 0; j < 4; ++j) {
+      if (((e.usedIndStages >> j) & 1) == 0) continue;
+      const auto& is = e.ind[j];
+      const std::string fx = is.texCoord != 0xFF && ((cfg.sampledTexCoords >> is.texCoord) & 1) ? fixed_uv(is.texCoord)
+                                                                                                  : "ivec2(0)";
+      if (is.texMap >= 8) {
+        fs += "  ivec3 ind" + std::to_string(j) + " = ivec3(0);\n";
+        continue;
+      }
+      const std::string m = std::to_string(is.texMap);
+      fs += "  ivec3 ind" + std::to_string(j) + " = ivec3(round(texture(tex" + m + ", vec2(" + fx + " >> ivec2(" +
+            std::to_string(is.scaleS) + ", " + std::to_string(is.scaleT) + ")) / (" + tex_size(is.texMap) +
+            ".xy * 128.0), " + tex_size(is.texMap) + ".z).abg * 255.0));\n";
+    }
+    bool fixedState = false;
+    for (u32 i = 0; i < cfg.tevStageCount && i < 16; ++i) fixedState = fixedState || (e.tind[i].flags & 2);
+    if (fixedState) fs += "  ivec2 tTex = ivec2(0);\n";
+  }
   for (u32 i = 0; i < cfg.tevStageCount && i < 16; ++i) {
     const auto& s = cfg.stages[i];
     const std::string si = "s" + std::to_string(i);
-    if (s.texMap != 0xFF && s.texCoord < 8) {
-      const std::string tci = std::to_string(s.texCoord), tmi = std::to_string(s.texMap);
-      const std::string scale = cfg.offTexScale[s.texCoord] ? uvec(cfg.offTexScale[s.texCoord]) + ".xy" : "vec2(1.0)";
-      const std::string size = cfg.offTexSize[s.texMap] ? uvec(cfg.offTexSize[s.texMap]) : "vec4(1.0, 1.0, 0.0, 0.0)";
-      const auto& tg = cfg.texgens[s.texCoord];
-      const std::string uv = tg.type == GX_TG_MTX3x4
-                                 ? "(v_tex" + tci + ".xy / (v_tex" + tci + ".z == 0.0 ? 1.0 : v_tex" + tci + ".z))"
-                                 : "v_tex" + tci + ".xy";
-      fs += "  vec4 sz" + std::to_string(i) + " = " + size + ";\n";
-      fs += "  vec4 " + si + " = texture(tex" + tmi + ", " + uv + " * " + scale + " / sz" + std::to_string(i) +
-            ".xy, sz" + std::to_string(i) + ".z);\n";
+    if (!ex) {
+      if (s.texMap != 0xFF && s.texCoord < 8) {
+        const std::string tci = std::to_string(s.texCoord), tmi = std::to_string(s.texMap);
+        const std::string scale = cfg.offTexScale[s.texCoord] ? uvec(cfg.offTexScale[s.texCoord]) + ".xy" : "vec2(1.0)";
+        const auto& tg = cfg.texgens[s.texCoord];
+        const std::string uv = tg.type == GX_TG_MTX3x4
+                                   ? "(v_tex" + tci + ".xy / (v_tex" + tci + ".z == 0.0 ? 1.0 : v_tex" + tci + ".z))"
+                                   : "v_tex" + tci + ".xy";
+        fs += "  vec4 sz" + std::to_string(i) + " = " + tex_size(s.texMap) + ";\n";
+        fs += "  vec4 " + si + " = texture(tex" + tmi + ", " + uv + " * " + scale + " / sz" + std::to_string(i) +
+              ".xy, sz" + std::to_string(i) + ".z);\n";
+      } else {
+        fs += "  vec4 " + si + " = vec4(1.0);\n";
+      }
     } else {
-      fs += "  vec4 " + si + " = vec4(1.0);\n";
+      // Muestreo como aurora: coordenada fija, indirecta (matriz, sesgo, envoltura, suma de la anterior) y s24.
+      const auto& ti = e.tind[i];
+      const bool needsCoord = (ti.flags & 2) != 0;
+      const bool canSample = s.texMap != 0xFF && s.texCoord < 8;
+      const bool willSample = canSample && ((ti.flags & 4) || (zTex && e.zTexStage == i));
+      const bool hasBase = s.pad != 0xFF && s.pad < 8 && ((cfg.sampledTexCoords >> s.pad) & 1);
+      std::string uvIn;
+      if (needsCoord) {
+        std::string off;
+        const std::string is = std::to_string(i);
+        if (ti.mtxId != GX_ITM_OFF && ti.indStage < e.numIndStages && e.offIndMtx != 0) {
+          const u32 fmtShift = ti.format == GX_ITF_5 ? 3 : ti.format == GX_ITF_4 ? 4 : ti.format == GX_ITF_3 ? 5 : 0;
+          fs += "  ivec3 ic" + is + " = ind" + std::to_string(ti.indStage) +
+                (fmtShift ? " >> " + std::to_string(fmtShift) : std::string()) + ";\n";
+          if (ti.biasSel != GX_ITB_NONE) {
+            const int bS = (ti.biasSel == GX_ITB_S || ti.biasSel == GX_ITB_ST || ti.biasSel == GX_ITB_SU ||
+                            ti.biasSel == GX_ITB_STU) ? 1 : 0;
+            const int bT = (ti.biasSel == GX_ITB_T || ti.biasSel == GX_ITB_ST || ti.biasSel == GX_ITB_TU ||
+                            ti.biasSel == GX_ITB_STU) ? 1 : 0;
+            const int bU = (ti.biasSel == GX_ITB_U || ti.biasSel == GX_ITB_SU || ti.biasSel == GX_ITB_TU ||
+                            ti.biasSel == GX_ITB_STU) ? 1 : 0;
+            fs += "  ic" + is + " += ivec3(" + std::to_string(bS) + ", " + std::to_string(bT) + ", " +
+                  std::to_string(bU) + ") * " + (ti.format == GX_ITF_8 ? "-128" : "1") + ";\n";
+          }
+          int mtxIdx = -1;
+          std::string offExpr;
+          if (ti.mtxId >= GX_ITM_0 && ti.mtxId <= GX_ITM_2) {
+            mtxIdx = ti.mtxId - GX_ITM_0;
+            const std::string c0 = "iv4(" + num(e.offIndMtx + 8u * mtxIdx) + ")";
+            const std::string c1 = "iv4(" + num(e.offIndMtx + 8u * mtxIdx + 4u) + ")";
+            fs += "  ivec4 ia" + is + " = " + c0 + ", ib" + is + " = " + c1 + ";\n";
+            offExpr = "ivec2((ia" + is + ".x * ic" + is + ".x + ia" + is + ".z * ic" + is + ".y + ib" + is + ".x * ic" + is +
+                      ".z) >> 3, (ia" + is + ".y * ic" + is + ".x + ia" + is + ".w * ic" + is + ".y + ib" + is + ".y * ic" +
+                      is + ".z) >> 3)";
+          } else if (ti.mtxId >= GX_ITM_S0 && ti.mtxId <= GX_ITM_S2 && hasBase) {
+            mtxIdx = ti.mtxId - GX_ITM_S0;
+            offExpr = "(" + fixed_uv(s.pad) + " * ivec2(ic" + is + ".x)) >> 8";
+          } else if (ti.mtxId >= GX_ITM_T0 && ti.mtxId <= GX_ITM_T2 && hasBase) {
+            mtxIdx = ti.mtxId - GX_ITM_T0;
+            offExpr = "(" + fixed_uv(s.pad) + " * ivec2(ic" + is + ".y)) >> 8";
+          }
+          if (mtxIdx >= 0) {
+            fs += "  ivec2 io" + is + " = " + offExpr + ";\n  { int sh = iv4(" + num(e.offIndMtx + 8u * mtxIdx + 4u) +
+                  ").z; io" + is + " = sh >= 0 ? (io" + is + " >> sh) : (io" + is + " << (-sh)); }\n";
+            off = "io" + is;
+          }
+        }
+        auto wrap = [](u8 w, const std::string& c) -> std::string {
+          int mask;
+          switch (w) {
+          case GX_ITW_OFF: return c;
+          case GX_ITW_256: mask = (256 << 7) - 1; break;
+          case GX_ITW_128: mask = (128 << 7) - 1; break;
+          case GX_ITW_64: mask = (64 << 7) - 1; break;
+          case GX_ITW_32: mask = (32 << 7) - 1; break;
+          case GX_ITW_16: mask = (16 << 7) - 1; break;
+          default: return "0";
+          }
+          return "(" + c + " & " + std::to_string(mask) + ")";
+        };
+        const std::string base = hasBase ? fixed_uv(s.pad) : "ivec2(0)";
+        std::string fin = "ivec2(" + wrap(ti.wrapS, base + ".x") + ", " + wrap(ti.wrapT, base + ".y") + ")";
+        if (!off.empty()) fin += " + " + off;
+        fs += std::string("  tTex ") + ((ti.flags & 1) ? "+= " : "= ") + fin + ";\n  tTex = s24(tTex);\n";
+        if (willSample) uvIn = "vec2(tTex) / (" + tex_size(s.texMap) + ".xy * 128.0)";
+      }
+      if (willSample) {
+        if (uvIn.empty()) uvIn = "vec2(s24(" + fixed_uv(s.texCoord) + ")) / (" + tex_size(s.texMap) + ".xy * 128.0)";
+        fs += "  vec4 " + si + " = texture(tex" + std::to_string(s.texMap) + ", " + uvIn + ", " + tex_size(s.texMap) +
+              ".z);\n";
+      } else {
+        fs += "  vec4 " + si + " = vec4(1.0);\n";
+      }
     }
     const std::string ca = tev_color_arg(cfg, s, i, s.ca), cb = tev_color_arg(cfg, s, i, s.cb),
                       cc = tev_color_arg(cfg, s, i, s.cc), cd = tev_color_arg(cfg, s, i, s.cd);
     const std::string aa = tev_alpha_arg(cfg, s, i, s.aa), ab = tev_alpha_arg(cfg, s, i, s.ab),
                       ac = tev_alpha_arg(cfg, s, i, s.ac), ad = tev_alpha_arg(cfg, s, i, s.ad);
     // Las dos operaciones leen los registros de antes de la etapa.
-    fs += "  {\n    vec3 c_out = " + tev_op(false, s.cop, s.cbias, s.cscale, s.cclamp, ca, cb, cc, cd) + ";\n";
-    fs += "    float a_out = " + tev_op(true, s.aop, s.abias, s.ascale, s.aclamp, aa, ab, ac, ad) + ";\n";
+    fs += "  {\n";
+    if (!exact) {
+      fs += "    vec3 c_out = " + tev_op_float(false, s.cop, s.cbias, s.cscale, s.cclamp, ca, cb, cc, cd, ca, cb) + ";\n";
+      fs += "    float a_out = " + tev_op_float(true, s.aop, s.abias, s.ascale, s.aclamp, aa, ab, ac, ad, ca, cb) + ";\n";
+    } else {
+      // Desborde de 8 bits solo donde puede pasar: los registros (texturas, rasterizador y constantes ya están en
+      // 0..1, y ahí el desborde no cambia nada).
+      auto regC = [](u8 a) { return a <= GX_CC_A2; };
+      auto regA = [](u8 a) { return a <= GX_CA_A2; };
+      auto w3 = [&](u8 a, const std::string& x) { return regC(a) ? "ovf3(" + x + ")" : x; };
+      auto w1 = [&](u8 a, const std::string& x) { return regA(a) ? "ovf1(" + x + ")" : x; };
+      const std::string wa = w3(s.ca, ca), wb = w3(s.cb, cb), wc = w3(s.cc, cc);
+      if (s.cop == GX_TEV_ADD || s.cop == GX_TEV_SUB) {
+        fs += "    ivec3 cA = tb3(" + wa + "), cB = tb3(" + wb + "), cC = tb3(" + wc + "), cD = tb3(" + cd + ");\n";
+      }
+      if (s.aop == GX_TEV_ADD || s.aop == GX_TEV_SUB) {
+        fs += "    int aA = tb1(" + w1(s.aa, aa) + "), aB = tb1(" + w1(s.ab, ab) + "), aC = tb1(" + w1(s.ac, ac) +
+              "), aD = tb1(" + ad + ");\n";
+      }
+      fs += "    vec3 c_out = " + tev_op_exact(false, s.cop, s.cbias, s.cscale, s.cclamp, wa, wb, wc, cd, wa, wb) + ";\n";
+      fs += "    float a_out = " +
+            tev_op_exact(true, s.aop, s.abias, s.ascale, s.aclamp, w1(s.aa, aa), w1(s.ab, ab), w1(s.ac, ac), ad, wa, wb) +
+            ";\n";
+    }
     fs += std::string("    ") + tev_reg(s.cout) + ".rgb = c_out;\n    " + tev_reg(s.aout) + ".a = a_out;\n  }\n";
   }
+  // El resultado del TEV es el de la última etapa aunque no escriba en prev.
+  if (exact && cfg.tevStageCount > 0) {
+    const auto& last = cfg.stages[std::min<u32>(cfg.tevStageCount, 16) - 1];
+    if (last.cout != GX_TEVPREV) fs += "  prev.rgb = " + std::string(tev_reg(last.cout)) + ".rgb;\n";
+    if (last.aout != GX_TEVPREV) fs += "  prev.a = " + std::string(tev_reg(last.aout)) + ".a;\n";
+  }
+  // Profundidad de GX del fragmento (0 cerca, 1 lejos): en GL la z de la ventana es (z_aurora + lejano) / 2.
+  const bool fog = ex && e.fogType != GX_FOG_NONE && e.offFog != 0;
+  std::string fogZ = "uint(round(clamp(gx_z, 0.0, 1.0) * 16777216.0))";
+  if (fog || zTex) {
+    fs += std::string("  float gx_z = 2.0 * gl_FragCoord.z - gl_DepthRange.far;\n") +
+          (g_reversedZ ? "  gx_z = 1.0 - gx_z;\n" : "");
+  }
+  if (zTex) {
+    const u32 bias = e.zTexture & 0x00FFFFFFu, zfmt = (e.zTexture >> 24) & 3u, zop = (e.zTexture >> 26) & 3u;
+    const std::string smp = e.zTexStage < 16 ? "s" + std::to_string(e.zTexStage) : "vec4(0.0)";
+    fs += "  uvec4 zr = uvec4(round(clamp(" + smp + ", vec4(0.0), vec4(1.0)) * 255.0));\n";
+    if (zfmt == 0) {
+      fs += "  uint zc = (" + std::to_string(bias) + "u + zr.a) & 0xFFFFFFu;\n";
+    } else if (zfmt == 1) {
+      fs += "  uint zc = (" + std::to_string(bias) + "u + ((zr.a << 8u) | zr.r)) & 0xFFFFFFu;\n";
+    } else {
+      fs += "  uint zc = (" + std::to_string(bias) + "u + ((zr.r << 16u) | (zr.g << 8u) | zr.b)) & 0xFFFFFFu;\n";
+    }
+    if (zop == GX_ZT_ADD) fs += "  zc = (zc + " + fogZ + ") & 0xFFFFFFu;\n";
+    fs += "  float zd = float(zc) / 16777216.0;\n";
+    fs += std::string("  gl_FragDepth = (") + (g_reversedZ ? "1.0 - zd" : "zd") + " + gl_DepthRange.far) * 0.5;\n";
+    fogZ = "zc";
+  }
+  if (fog) {
+    const u32 f = e.offFog;
+    const std::string fa = "uv4(" + num(f + 4u) + ")";  // a, b, c, desplazamiento de b
+    fs += "  // Niebla\n  uint fz = " + fogZ + ";\n";
+    if ((e.fogType & 0x8u) == 0) {
+      fs += "  float fze = (" + fa + ".x * 16777216.0) / (" + fa + ".y - float(fz >> uint(" + fa + ".w)));\n";
+    } else {
+      fs += "  float fze = " + fa + ".x * float(fz) / 16777216.0;\n";
+    }
+    if (e.fogRange) {
+      const std::string rb = "uv4(" + num(f + 8u) + ")";
+      fs += "  { float ro = (2.0 * (gl_FragCoord.x / " + rb + ".y)) - 1.0 - " + rb + ".x;\n"
+            "    float rfi = clamp(9.0 - abs(ro) * 9.0, 0.0, 9.0);\n"
+            "    uint rl = uint(rfi), ru = rl + 1u;\n"
+            "    float kl = uv4(" + num(f + 12u) + " + (rl >> 2u) * 4u)[rl & 3u];\n"
+            "    float ku = uv4(" + num(f + 12u) + " + (ru >> 2u) * 4u)[ru & 3u];\n"
+            "    float rk = mix(kl, ku, fract(rfi));\n"
+            "    fze *= sqrt(ro * ro + rk * rk) / rk; }\n";
+    }
+    fs += "  float ff = clamp(fze - " + fa + ".z, 0.0, 1.0);\n";
+    switch (e.fogType) {
+    case GX_FOG_PERSP_EXP:
+    case GX_FOG_ORTHO_EXP: fs += "  float fogv = 1.0 - exp2(-8.0 * ff);\n"; break;
+    case GX_FOG_PERSP_EXP2:
+    case GX_FOG_ORTHO_EXP2: fs += "  float fogv = 1.0 - exp2(-8.0 * ff * ff);\n"; break;
+    case GX_FOG_PERSP_REVEXP:
+    case GX_FOG_ORTHO_REVEXP: fs += "  float fogv = exp2(-8.0 * (1.0 - ff));\n"; break;
+    case GX_FOG_PERSP_REVEXP2:
+    case GX_FOG_ORTHO_REVEXP2: fs += "  ff = 1.0 - ff;\n  float fogv = exp2(-8.0 * ff * ff);\n"; break;
+    default: fs += "  float fogv = ff;\n"; break;
+    }
+    fs += "  prev.rgb = mix(prev.rgb, uv4(" + num(f) + ").rgb, clamp(fogv, 0.0, 1.0));\n";
+  }
+  if (exact) fs += "  prev = ovf4(prev);\n";
   // Comparación de alfa.
   if (cfg.alphaComp0 != GX_ALWAYS || cfg.alphaComp1 != GX_ALWAYS) {
     const std::string t0 = "(" + alpha_test(cfg.alphaComp0, cfg.alphaRef0) + ")";
@@ -1084,6 +1433,7 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
     case GX_AOP_XNOR: pass = t0 + " == " + t1; break;
     default: pass = t0 + " && " + t1; break;
     }
+    fs += "  uint alphaCmp = uint(round(clamp(prev.a, 0.0, 1.0) * 255.0));\n";
     fs += "  if (!(" + pass + ")) discard;\n";
   }
   fs += debug_colors() ? "  o_color = u_debug;\n}\n" : "  o_color = clamp(prev, 0.0, 1.0);\n}\n";
@@ -1242,6 +1592,17 @@ const Program& program_for(const PipelineDesc& cfg) {
   Program prog;
   std::string vs, fs, err;
   build_sources(cfg, vs, fs);
+  // CHOYA_GX_FUENTES=carpeta: escribe cada programa como <clave>.vert / <clave>.frag (depuración, 0.20.9).
+  if (const char* dir = std::getenv("CHOYA_GX_FUENTES")) {
+    char name[64];
+    for (int k = 0; k < 2; ++k) {
+      std::snprintf(name, sizeof(name), "/%016llx.%s", static_cast<unsigned long long>(key), k ? "frag" : "vert");
+      if (FILE* f = std::fopen((std::string(dir) + name).c_str(), "w")) {
+        std::fputs(k ? fs.c_str() : vs.c_str(), f);
+        std::fclose(f);
+      }
+    }
+  }
   uint64_t h = fnv64(vs.data(), vs.size() + 1, g_driverHash ? g_driverHash : 1469598103934665603ull);
   h = fnv64(fs.data(), fs.size() + 1, h);
   prog.id = gl.CreateProgram();
@@ -2860,7 +3221,7 @@ void capture_discard() noexcept { g_recordingActive = false; }
 
 // --- Volcado ------------------------------------------------------------------------------------------------
 namespace {
-constexpr char kDumpMagic[8] = {'C', 'H', 'O', 'Y', 'A', 'G', 'X', '4'};  // 4: texturas del paquete; 3 y 2 también se leen
+constexpr char kDumpMagic[8] = {'C', 'H', 'O', 'Y', 'A', 'G', 'X', '5'};  // 5: TEV exacto; 4 (paquete), 3 y 2 se leen
 
 void write_blob(FILE* f, const std::vector<uint8_t>& v) {
   const uint64_t n = v.size();
@@ -2982,9 +3343,9 @@ bool load_frame(const char* path) noexcept {
   char magic[8];
   uint32_t header[4];
   bool ok = std::fread(magic, 1, 8, in) == 8 && std::memcmp(magic, kDumpMagic, 7) == 0 &&
-            (magic[7] == '2' || magic[7] == '3' || magic[7] == '4') &&
-            std::fread(header, sizeof(header), 1, in) == 1 && header[0] == sizeof(PipelineDesc) &&
-            header[1] == sizeof(Item);
+            magic[7] >= '2' && magic[7] <= '5' && std::fread(header, sizeof(header), 1, in) == 1 &&
+            (header[0] == sizeof(PipelineDesc) || header[0] == kPipelineDescV4Bytes) && header[1] == sizeof(Item);
+  const size_t pipeBytes = ok ? header[0] : 0;  // volcados hasta la 0.20.8: sin la extensión (ext.valid = 0)
   Frame f;
   uint64_t items = 0, np = 0, nc = 0;
   ok = ok && read_blob(in, f.verts) && read_blob(in, f.uniforms) && read_blob(in, f.indices) &&
@@ -2996,8 +3357,8 @@ bool load_frame(const char* path) noexcept {
   ok = ok && std::fread(&np, sizeof(np), 1, in) == 1;
   for (uint64_t i = 0; ok && i < np; ++i) {
     uint64_t ref;
-    PipelineDesc d;
-    ok = std::fread(&ref, sizeof(ref), 1, in) == 1 && std::fread(&d, sizeof(d), 1, in) == 1;
+    PipelineDesc d{};
+    ok = std::fread(&ref, sizeof(ref), 1, in) == 1 && std::fread(&d, pipeBytes, 1, in) == 1;
     if (ok) register_pipeline(ref, d);
   }
   ok = ok && std::fread(&nc, sizeof(nc), 1, in) == 1;
@@ -3020,7 +3381,7 @@ bool load_frame(const char* path) noexcept {
     uint64_t id;
     uint32_t hdr[4] = {0, 0, 0, 0};
     std::vector<uint8_t> data;
-    const size_t words = magic[7] == '4' ? 4 : 3;
+    const size_t words = magic[7] >= '4' ? 4 : 3;
     ok = std::fread(&id, sizeof(id), 1, in) == 1 && std::fread(hdr, sizeof(uint32_t), words, in) == words &&
          read_blob(in, data);
     if (ok && (hdr[3] & 0xFF) != 0) {

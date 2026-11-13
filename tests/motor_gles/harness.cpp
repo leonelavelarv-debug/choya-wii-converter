@@ -336,6 +336,100 @@ static int old_copy_test(const char* path) {
   return 0;
 }
 
+// harness tev N (0.20.9): casos del TEV exacto contra lo que da aurora (enteros de 8 bits).
+//  0: d + lerp(0, 200, 128) = 101 (en flotante daba 100).
+//  1: una etapa sin límite deja 510; la siguiente lo lee con desborde (254) y escribe en r0: el resultado es el de
+//     la última etapa aunque no escriba en prev (FEFEFE).
+//  2: matriz posterior de las coordenadas (dualTex): (1, 1) * 0.25 cae en el texel de arriba a la izquierda (rojo).
+//  3: niebla lineal ortográfica con a = 1 a la profundidad 0.5: mitad del color de la niebla (blanco) sobre negro.
+//  4: textura indirecta con matriz: la coordenada se mueve medio cuadro a la derecha (verde en vez de rojo).
+static int tev_test(int mode) {
+  gx::PipelineDesc p = base_desc();
+  p.vtxStride = 20;
+  p.attrs[GX_VA_POS] = {GX_DIRECT, 3, GX_F32, 0, 0, 0, 0, 0};
+  p.attrs[GX_VA_TEX0] = {GX_DIRECT, 2, GX_F32, 12, 0, 0, 0, 0};
+  p.sampledChannels = 0; p.offChanMat[0] = 0; p.offChanMatA[0] = 0;
+  p.ext.valid = 1;
+  p.ext.zTexStage = 0xFF;
+  for (auto& x : p.ext.tgPost) x = 0xFF;
+  for (auto& x : p.ext.ind) x = {0xFF, 0xFF, 0, 0};
+  auto& s0 = p.stages[0];
+  s0.pad = 0xFF;
+  std::vector<uint8_t> u(2048, 0);
+  for (int r = 0; r < 4; ++r) put_f(u, 20 + r * 4 + r, 1.f);
+  for (int r = 0; r < 3; ++r) put_f(u, 36 + r * 4 + r, 1.f);
+  float tc = 0.f;
+  if (mode == 0) {
+    p.offTevReg[1] = 52;
+    put_f(u, 52, 200.f / 255.f);
+    s0.ca = GX_CC_ZERO; s0.cb = GX_CC_C0; s0.cc = GX_CC_HALF; s0.cd = GX_CC_ZERO;
+  } else if (mode == 1) {
+    p.tevStageCount = 2;
+    s0.ca = GX_CC_ZERO; s0.cb = GX_CC_ONE; s0.cc = GX_CC_ONE; s0.cd = GX_CC_ONE; s0.cclamp = 0;
+    auto& s1 = p.stages[1];
+    s1 = s0;
+    s1.ca = GX_CC_ZERO; s1.cb = GX_CC_CPREV; s1.cc = GX_CC_ONE; s1.cd = GX_CC_ZERO; s1.cclamp = 1; s1.cout = GX_TEVREG0;
+  } else if (mode == 2) {
+    tc = 1.f;
+    p.numTexGens = 1; p.sampledTexCoords = 1;
+    p.texgens[0] = {GX_TG_MTX2x4, GX_TG_TEX0, 0xFF, 0};
+    s0.cd = GX_CC_TEXC; s0.ad = GX_CA_TEXA; s0.texCoord = 0; s0.texMap = 0; s0.pad = 0;
+    p.ext.tind[0].flags = 4;
+    p.ext.dualTex = 1; p.ext.tgPost[0] = 0; p.ext.offPostMtx = 60;
+    put_f(u, 60, 0.25f); put_f(u, 65, 0.25f); put_f(u, 70, 1.f);
+    p.offTexScale[0] = 300; p.offTexSize[0] = 304;
+    put_f(u, 300, 1.f); put_f(u, 301, 1.f); put_f(u, 304, 1.f); put_f(u, 305, 1.f);
+    const uint8_t quad[16] = {255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255};
+    gx::texture_data(79, 2, 2, 1, quad, sizeof(quad));
+  } else if (mode == 4) {
+    // Textura indirecta: (A, B, G) = (192, 128, 128) con sesgo -128 en S y T da (64, 0); la matriz 0 con 8 en S
+    // mueve S en (8 * 64) >> 3 = 64/128: de 0.25 a 0.75, el texel de arriba a la derecha (verde).
+    tc = 0.25f;
+    p.numTexGens = 1; p.sampledTexCoords = 1;
+    p.texgens[0] = {GX_TG_MTX2x4, GX_TG_TEX0, 0xFF, 0};
+    s0.cd = GX_CC_TEXC; s0.ad = GX_CA_TEXA; s0.texCoord = 0; s0.texMap = 0; s0.pad = 0;
+    p.ext.numIndStages = 1; p.ext.usedIndStages = 1;
+    p.ext.ind[0] = {0, 1, GX_ITS_1, GX_ITS_1};
+    p.ext.tind[0] = {0, GX_ITF_8, GX_ITB_ST, GX_ITBA_OFF, GX_ITM_0, GX_ITW_OFF, GX_ITW_OFF, 2 | 4};
+    p.ext.offIndMtx = 320;
+    put_u32(u, 320, 8);
+    p.offTexScale[0] = 300; p.offTexSize[0] = 304; p.offTexSize[1] = 308;
+    put_f(u, 300, 1.f); put_f(u, 301, 1.f); put_f(u, 304, 1.f); put_f(u, 305, 1.f);
+    put_f(u, 308, 1.f); put_f(u, 309, 1.f);
+    const uint8_t quad[16] = {255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255};
+    gx::texture_data(79, 2, 2, 1, quad, sizeof(quad));
+    uint8_t ind[16];
+    for (int k = 0; k < 4; ++k) { ind[k * 4] = 0; ind[k * 4 + 1] = 128; ind[k * 4 + 2] = 128; ind[k * 4 + 3] = 192; }
+    gx::texture_data(80, 2, 2, 1, ind, sizeof(ind));
+  } else {
+    s0.cd = GX_CC_ZERO;
+    p.ext.fogType = GX_FOG_ORTHO_LIN; p.ext.offFog = 60;
+    for (int c = 0; c < 4; ++c) put_f(u, 60 + c, 1.f);  // color de la niebla
+    put_f(u, 64, 1.f); put_f(u, 65, 0.5f); put_f(u, 66, 0.f); put_f(u, 67, 0.f);  // a, b, c, desplazamiento
+  }
+  gx::register_pipeline(40 + mode, p);
+  gx::BindDesc bd{};
+  bd.tex[0] = mode == 2 || mode == 4 ? 79 : 0;
+  bd.tex[1] = mode == 4 ? 80 : 0;
+  bd.samp[0] = {0, 0, 0, 0, 0, {0, 0, 0}, 0.f, 0.f};
+  bd.samp[1] = bd.samp[0];
+  gx::register_bind_group(140 + mode, bd);
+  std::vector<uint8_t> v;
+  float q[4][5] = {{-1,1,.5f,tc,tc},{1,1,.5f,tc,tc},{-1,-1,.5f,tc,tc},{1,-1,.5f,tc,tc}};
+  for (auto& r : q) for (float x : r) put_be_f32(v, x);
+  std::vector<uint16_t> i = {0, 1, 2, 2, 1, 3};
+  const float black[4] = {0, 0, 0, 1};
+  gx::capture_begin(v.data(), v.size(), u.data(), u.size(), (const uint8_t*)i.data(), 12, nullptr, 0);
+  gx::capture_pass(640, 480, true, true, black, 0.f, true, gx::Rect{0, 0, 640, 480});
+  gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+  gx::capture_scissor(gx::Rect{0, 0, 640, 480});
+  gx::capture_draw(40 + mode, 0, 6, 1, 0, UINT32_MAX, 140 + mode);
+  gx::capture_end();
+  if (!gx::draw_frame(640, 480)) { std::puts("no dibujó"); return 1; }
+  std::printf("tev %d %06X\n", mode, pixel(320, 240));
+  return 0;
+}
+
 // harness borrado: pase borrado en negro y un borrado de aurora (GXCopyTex con borrado) en la mitad izquierda, azul.
 static int clear_test() {
   gx::register_clear(500, gx::ClearDesc{1, 1, 1, 0});
@@ -360,6 +454,7 @@ int main(int argc, char** argv) {
   if (argc >= 2 && std::strcmp(argv[1], "paquete") == 0) return packed(argc, argv);
   if (argc >= 3 && std::strcmp(argv[1], "paleta") == 0) return palette_test(std::atoi(argv[2]));
   if (argc >= 2 && std::strcmp(argv[1], "cola") == 0) return queue_test();
+  if (argc >= 3 && std::strcmp(argv[1], "tev") == 0) return tev_test(std::atoi(argv[2]));
   if (argc >= 3 && std::strcmp(argv[1], "copia-vieja") == 0) return old_copy_test(argv[2]);
   if (argc >= 5 && std::strcmp(argv[1], "sonda") == 0) return probe(argc, argv);
   if (argc >= 5 && std::strcmp(argv[1], "copia") == 0) return read_copy(argv[2], argv[3], argv[4]);

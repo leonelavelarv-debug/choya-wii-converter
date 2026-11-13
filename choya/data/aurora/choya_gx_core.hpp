@@ -46,9 +46,32 @@ struct PipelineDesc {
   // --- estado de render ---
   uint8_t depthCompare, depthUpdate, colorUpdate, alphaUpdate, depthFunc, cullMode, blendMode, blendSrc;
   uint8_t blendDst, blendOp, pixelFmt, pad1[5];
+  // --- TEV exacto (0.20.9): lo que faltaba para hacer el mismo programa que aurora. valid = 0 en volcados viejos
+  // (el motor dibuja entonces como antes). También es parte de la clave del programa. Con valid = 1, el byte pad de
+  // cada TevStageDesc es la coordenada de textura efectiva de la etapa (0xFF ninguna) y attrs[GX_VA_NRM].pad es
+  // nrmIndexCount (normales NBT con tres índices).
+  struct IndStageDesc {
+    uint8_t texCoord, texMap, scaleS, scaleT;  // texCoord efectiva (0xFF ninguna)
+  };
+  // Indirecta de cada etapa. flags: 1 suma la anterior, 2 lleva coordenada fija, 4 la combinación usa la textura.
+  struct TevIndDesc {
+    uint8_t indStage, format, biasSel, alphaSel, mtxId, wrapS, wrapT, flags;
+  };
+  struct Ext {
+    uint8_t valid, dualTex, fogType, fogRange, numIndStages, zFreeze, zTexStage, usedIndStages;
+    uint8_t tgFlags[8];  // 1 normalizar (con dualTex), 2 entrada AB11
+    uint8_t tgPost[8];   // matriz posterior 0..19 (GX_PTTEXMTXn), 0xFF identidad
+    IndStageDesc ind[4];
+    TevIndDesc tind[16];
+    uint32_t zTexture;  // sesgo[0:23], formato[24:25], operación[26:27]
+    uint16_t offPostMtx, offFog, offIndMtx, offZFreeze;
+  } ext;
 };
 constexpr size_t kShaderKeyBytes = offsetof(PipelineDesc, depthCompare);
-static_assert(sizeof(PipelineDesc) == kShaderKeyBytes + 16);
+constexpr size_t kPipelineDescV4Bytes = offsetof(PipelineDesc, ext);  // tamaño en volcados hasta la 0.20.8
+static_assert(kPipelineDescV4Bytes == kShaderKeyBytes + 16);
+static_assert(sizeof(PipelineDesc::Ext) == 180);
+static_assert(sizeof(PipelineDesc) == kPipelineDescV4Bytes + 180);
 
 // Muestreo de una textura (independiente de WebGPU/GL). wrap: 0 borde, 1 repetir, 2 espejo.
 // filtros: 0 cercano, 1 lineal; mip: 0 sin mipmaps, 1 cercano, 2 lineal.
