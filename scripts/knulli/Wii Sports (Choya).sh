@@ -112,6 +112,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "PortMaster: ${controlfolder:-no encontrado}  dispositivo: ${DEVICE_NAME:-?}  CFW: ${CFW_NAME:-?}"
   echo "mapeo del mando: ${SDL_GAMECONTROLLERCONFIG:-ninguno}" | cut -c1-200
   echo "efectos de audio: $([ "${CHOYA_SIN_REVERB:-0}" = 1 ] && echo "apagados (para oírlos: archivo con-reverb)" || echo "encendidos (archivo con-reverb)")"
+  echo "volcados con texturas (MENU + R1): $([ "${CHOYA_GX_GUARDAR_TEXTURAS:-0}" = 1 ] && echo "sí (archivo volcados)" || echo "no (crea un archivo vacío llamado volcados en wiisports-choya)")"
   echo "recursos convertidos: $([ "$CHOYA_PAQUETE" = 0 ] && echo "no (texturas del disco)" || echo "$CHOYA_PAQUETE ($(du -h "$CHOYA_PAQUETE" 2>/dev/null | cut -f1))")"
   echo "gptokeyb: ${GPTOKEYB:-no}  salir: $CHOYA_QUIT_COMBO + START  botones: $CHOYA_FACE_LAYOUT"
   echo "dispositivos de entrada: $(grep -h "^N: Name=" /proc/bus/input/devices 2>/dev/null | cut -d= -f2- | tr "\n" " ")"
@@ -146,6 +147,8 @@ escribir_resumen() {
     grep -h "motor: hilo del juego\|no pude fijar" "$DIR/choya-gles.txt" 2>/dev/null | tail -2
     echo "--- texturas sin datos en el motor (las primeras; tamaño y formato que dio aurora)"
     grep -h "textura sin datos" "$DIR/choya-gles.txt" 2>/dev/null | head -40
+    echo "--- cola de cuadros del motor (copias que el juego no repite, como las caras de los Miis)"
+    grep -h "cola de cuadros" "$DIR/choya-gles.txt" 2>/dev/null | tail -2
     echo "--- recursos convertidos (assets.wlpk)"
     grep -hE "paquete" "$DIR/choya-gles.txt" 2>/dev/null | tail -4
     echo "--- motor: estado GL y programas"

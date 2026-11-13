@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -342,6 +343,10 @@ void recycle(Frame&& f) {
 Frame g_last;  // el último cuadro dibujado (para volcarlo)
 bool g_recordingActive = false;
 std::mutex g_frameMutex;
+std::condition_variable g_queueCv;          // el motor tomó la cola (para el que captura, si estaba llena)
+std::atomic<uint64_t> g_openFlushes{0};     // grupos de lotes sin mostrarse mandados al motor (pantallas de carga)
+std::atomic<uint64_t> g_queueWaits{0};      // veces que el que captura esperó al motor con la cola llena
+std::atomic<uint64_t> g_lostCopies{0};      // copias únicas tiradas porque el motor no avanzó en 1 s
 
 std::mutex g_pipelineMutex;
 std::unordered_map<uint64_t, PipelineDesc> g_pipelines;
@@ -2665,16 +2670,14 @@ void capture_end(bool present) noexcept {
       std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - g_captureStart).count());
   g_recording.present = present;
   g_recording.ready = true;
-  std::lock_guard lock(g_frameMutex);
+  std::unique_lock lock(g_frameMutex);
   g_open.push_back(std::move(g_recording));
   g_recording = Frame{};
-  if (!present) {
-    if (g_open.size() > 16) {  // un cuadro que nunca termina: no acumular memoria sin fin
-      recycle(std::move(g_open.front()));
-      g_open.erase(g_open.begin());
-    }
-    return;
-  }
+  // Lotes partidos sin cuadro que los muestre todavía. Con más de 16 (una pantalla de carga: el juego arma las caras
+  // de los Miis con muchas copias del EFB sin mostrar nada) antes se tiraba el más viejo, y con él copias que el
+  // juego no repite (las caras quedaban en blanco). Ahora se mandan al motor como un grupo que no se muestra.
+  if (!present && g_open.size() <= 16) return;
+  if (!present) g_openFlushes.fetch_add(1, std::memory_order_relaxed);
   Group g;
   g.frames.swap(g_open);
   for (const Frame& f : g.frames) {
@@ -2700,8 +2703,14 @@ void capture_end(bool present) noexcept {
       later.swap(merged);
     }
   }
-  // El motor no avanza: no acumular trabajo ni memoria sin fin (aquí ya solo quedan grupos con copias únicas).
+  // Aquí ya solo quedan grupos con copias que nadie repite: en vez de tirarlos (se perdían caras de Miis), el que
+  // captura espera a que el motor los tome (hasta 1 s). Solo si el motor no avanza se tiran, y se anota.
+  if (g_queue.size() > 6) {
+    g_queueWaits.fetch_add(1, std::memory_order_relaxed);
+    g_queueCv.wait_for(lock, std::chrono::seconds(1), [] { return g_queue.size() <= 6; });
+  }
   while (g_queue.size() > 6) {
+    g_lostCopies.fetch_add(g_queue.front().copies.size(), std::memory_order_relaxed);
     for (Frame& f : g_queue.front().frames) recycle(std::move(f));
     g_queue.pop_front();
   }
@@ -2885,6 +2894,7 @@ bool draw_frame(int screenWidth, int screenHeight) noexcept {
     if (g_queue.empty()) return false;
     groups.swap(g_queue);
   }
+  g_queueCv.notify_all();
   std::vector<Frame> batch;
   for (Group& g : groups) {
     for (Frame& f : g.frames) batch.push_back(std::move(f));
@@ -3434,6 +3444,10 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
              g_textures.size(), static_cast<unsigned long long>(g_stats.texUploads), g_copyTextures.size(),
              g_stats.copies / n, static_cast<unsigned long long>(g_stats.missingTextures), g_convTextures.size(),
              g_stats.paletteConvs / n, static_cast<unsigned long long>(g_stats.paletteMissing));
+    log_line("motor: cola de cuadros: %llu grupos de lotes sin mostrarse, %llu esperas del juego con la cola llena, "
+             "%llu copias únicas perdidas (desde el inicio)",
+             static_cast<unsigned long long>(g_openFlushes.load()), static_cast<unsigned long long>(g_queueWaits.load()),
+             static_cast<unsigned long long>(g_lostCopies.load()));
     log_line("motor: %llu cuadros, por cuadro: %.1f dibujos, %.1f borrados, %.1f pases; saltados: %llu sin config, "
          "%llu líneas/puntos, %llu alineación, %llu sin programa; programas %zu; error GL 0x%04X",
          static_cast<unsigned long long>(g_stats.frames), g_stats.draws / n, g_stats.clears / n,
