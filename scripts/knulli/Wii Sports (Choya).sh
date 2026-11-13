@@ -91,6 +91,9 @@ export CHOYA_GX_CACHE="${CHOYA_GX_CACHE:-$DIR/cache-shaders}"
 # Efectos de audio (reverberación): apagados por omisión, cuestan ~10 ms por cuadro del hilo del juego en Golf
 # (0.19.1). Un archivo vacío llamado "con-reverb" junto al juego los vuelve a encender.
 if [ -f "$DIR/con-reverb" ]; then export CHOYA_SIN_REVERB=0; else export CHOYA_SIN_REVERB=1; fi
+# Un archivo vacío llamado "volcados" junto al juego: MENU + R1 guarda el cuadro con sus texturas también al jugar
+# (para dibujarlo igual en la PC). Ocupa algo más de memoria mientras se juega.
+if [ -f "$DIR/volcados" ]; then export CHOYA_GX_GUARDAR_TEXTURAS=1; fi
 # Recursos convertidos por el conversor de Choya (assets.wlpk junto al juego): texturas en ETC2/EAC ya reducidas.
 # CHOYA_PAQUETE=0 usa solo las del disco.
 if [ "${CHOYA_PAQUETE:-}" != "0" ] && [ -f "$DIR/assets.wlpk" ]; then
@@ -141,6 +144,8 @@ escribir_resumen() {
     grep -h "aurora: por cuadro" "$DIR/choya-gles.txt" 2>/dev/null | tail -6
     echo "--- núcleos"
     grep -h "motor: hilo del juego\|no pude fijar" "$DIR/choya-gles.txt" 2>/dev/null | tail -2
+    echo "--- texturas sin datos en el motor (las primeras; tamaño y formato que dio aurora)"
+    grep -h "textura sin datos" "$DIR/choya-gles.txt" 2>/dev/null | head -40
     echo "--- recursos convertidos (assets.wlpk)"
     grep -hE "paquete" "$DIR/choya-gles.txt" 2>/dev/null | tail -4
     echo "--- motor: estado GL y programas"

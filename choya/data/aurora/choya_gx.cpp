@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -200,8 +201,10 @@ bool enabled() noexcept {
     core::set_reversed_z(gx::UseReversedZ);
     core::set_logger(log_to_runtime);
     // Los volcados llevan las texturas: hay que guardarlas desde que se crean.
+    // CHOYA_GX_GUARDAR_TEXTURAS=1 (archivo "volcados" junto al juego): MENU + R1 también lleva texturas al jugar.
     const char* dumps = std::getenv("CHOYA_GX_VOLCADO");
-    core::set_keep_textures(dumps != nullptr && *dumps != '\0');
+    const char* keep = std::getenv("CHOYA_GX_GUARDAR_TEXTURAS");
+    core::set_keep_textures((dumps != nullptr && *dumps != '\0') || (keep != nullptr && std::strcmp(keep, "1") == 0));
     // Recursos convertidos por el conversor de Choya (python -m choya convert): CHOYA_PAQUETE=ruta de assets.wlpk.
     // CHOYA_PAQUETE=0 (o sin la variable) usa solo las texturas del disco, como antes.
     if (const char* pk = std::getenv("CHOYA_PAQUETE"); pk != nullptr && *pk != '\0' && std::strcmp(pk, "0") != 0) {
@@ -260,6 +263,17 @@ void register_texture_bind_group(gfx::BindGroupRef ref, const gx::ShaderInfo& in
     const auto& tex = gx::g_gxState.textures[i];
     if (!tex || !(info.sampledTextures[i] || info.sampledIndTextures[i])) continue;
     d.tex[i] = reinterpret_cast<uintptr_t>(tex.ref.get());
+    {  // Qué es (al aparecer, o si otra textura reusa la dirección): para nombrarla en el registro si falta.
+      static std::unordered_map<uintptr_t, uint64_t> described;  // solo el hilo del juego
+      const auto& r = *tex.ref;
+      const uint64_t sig = (uint64_t{r.size.width} << 48) ^ (uint64_t{r.size.height} << 32) ^
+                           (uint64_t{r.gxFormat} << 8) ^ r.mipCount;
+      auto [it, added] = described.try_emplace(d.tex[i], sig);
+      if (added || it->second != sig) {
+        it->second = sig;
+        core::describe_texture(d.tex[i], r.size.width, r.size.height, r.gxFormat, r.mipCount);
+      }
+    }
     const auto sd = tex.get_descriptor();
     auto& o = d.samp[i];
     o.wrapS = wrap_mode(sd.addressModeU);

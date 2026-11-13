@@ -106,6 +106,8 @@ void pin_game_thread() noexcept;
 // de aurora suelte el cuadro anterior, 1 sellar, 2 codificar, 3 publicar, 4 esperar permiso para preparar, 5 preparar
 // el siguiente, 6 listas de dibujo (GXCallDisplayList), 7 cuántas listas, 8 bytes de listas, 9 ciclos (cuadros).
 void note_aurora(int what, uint64_t value) noexcept;
+// Qué es cada textura que aparece en un grupo (para nombrar en el registro las que se dibujan sin datos, 0.20.4).
+void describe_texture(uint64_t id, uint32_t width, uint32_t height, uint32_t gxFormat, uint32_t mips) noexcept;
 // Guardar copia de las texturas en memoria (solo para volcar cuadros).
 void set_keep_textures(bool keep) noexcept;
 

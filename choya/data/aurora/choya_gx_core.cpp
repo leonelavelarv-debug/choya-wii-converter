@@ -25,6 +25,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <deque>
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -41,6 +42,7 @@
 #include <vector>
 
 namespace choya::gx {
+void log_missing_texture(uint64_t id);  // más abajo, junto a describe_texture
 namespace {
 
 using u8 = uint8_t;
@@ -1754,6 +1756,7 @@ const ResolvedBind& resolve_bind(uint64_t bindGroup) {
         tex = c->second.tex;  // copia del EFB
       } else {
         ++g_stats.missingTextures;  // paleta, o una copia que todavía no se hace
+        log_missing_texture(bd.tex[i]);
         r.texGen = 0;               // volver a buscarla la próxima vez (la copia puede llegar en este cuadro)
       }
       samp = sampler_for(bd.samp[i]);
@@ -2356,6 +2359,58 @@ static std::atomic<uint64_t> g_aurora[10]{};
 
 void note_aurora(int what, uint64_t value) noexcept {
   if (what >= 0 && what < 10) g_aurora[what].fetch_add(value, std::memory_order_relaxed);
+}
+
+struct TexInfo {
+  uint32_t width, height, gxFormat, mips;
+};
+std::mutex g_texInfoMutex;
+std::unordered_map<uint64_t, TexInfo> g_texInfo;     // lo que dijo aurora de cada textura de los grupos
+std::unordered_set<uint64_t> g_missingLogged;          // las que ya se anotaron sin datos
+
+void describe_texture(uint64_t id, uint32_t width, uint32_t height, uint32_t gxFormat, uint32_t mips) noexcept {
+  std::lock_guard lock(g_texInfoMutex);
+  g_texInfo[id] = TexInfo{width, height, gxFormat, mips};
+}
+
+const char* gx_format_name(uint32_t f) {
+  switch (f) {
+  case 0x0: return "I4";
+  case 0x1: return "I8";
+  case 0x2: return "IA4";
+  case 0x3: return "IA8";
+  case 0x4: return "RGB565";
+  case 0x5: return "RGB5A3";
+  case 0x6: return "RGBA8";
+  case 0x8: return "C4 (paleta)";
+  case 0x9: return "C8 (paleta)";
+  case 0xA: return "C14X2 (paleta)";
+  case 0xE: return "CMPR";
+  default: return nullptr;
+  }
+}
+
+// Una textura de un grupo que el motor no tiene: se anota una vez (hasta 40) con lo que se sabe de ella.
+void log_missing_texture(uint64_t id) {
+  TexInfo info{};
+  bool known = false;
+  {
+    std::lock_guard lock(g_texInfoMutex);
+    if (g_missingLogged.size() >= 40 || !g_missingLogged.insert(id).second) return;
+    if (auto it = g_texInfo.find(id); it != g_texInfo.end()) {
+      info = it->second;
+      known = true;
+    }
+  }
+  if (!known) {
+    log_line("motor: textura sin datos %016llx (aurora no la describió)", static_cast<unsigned long long>(id));
+    return;
+  }
+  const char* name = gx_format_name(info.gxFormat);
+  char fmt[32];
+  if (name == nullptr) std::snprintf(fmt, sizeof(fmt), "0x%X", info.gxFormat);
+  log_line("motor: textura sin datos %016llx: %ux%u, formato %s, %u mips", static_cast<unsigned long long>(id),
+           info.width, info.height, name ? name : fmt, info.mips);
 }
 
 void capture_begin(const uint8_t* verts, size_t vertsSize, const uint8_t* uniforms, size_t uniformsSize,
