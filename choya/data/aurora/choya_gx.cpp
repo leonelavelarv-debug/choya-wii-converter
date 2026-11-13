@@ -20,6 +20,7 @@
 // la pantalla de Choya siguen enlazando, y el motor simplemente no arranca.
 extern "C" __attribute__((weak)) void* choya_gl_proc(const char* name);
 extern "C" __attribute__((weak)) void choya_gles_log(const char* line);
+extern "C" __attribute__((weak)) void choya_gles_wake();  // despierta al hilo de la pantalla (choya_gles.cpp)
 
 namespace aurora::choya {
 namespace core = ::choya::gx;
@@ -200,6 +201,7 @@ bool enabled() noexcept {
     if (v == nullptr || std::strcmp(v, "1") != 0) return false;
     core::set_reversed_z(gx::UseReversedZ);
     core::set_logger(log_to_runtime);
+    if (choya_gles_wake != nullptr) core::set_wake(choya_gles_wake);
     // Los volcados llevan las texturas: hay que guardarlas desde que se crean.
     // CHOYA_GX_GUARDAR_TEXTURAS=1 (archivo "volcados" junto al juego): MENU + R1 también lleva texturas al jugar.
     const char* dumps = std::getenv("CHOYA_GX_VOLCADO");

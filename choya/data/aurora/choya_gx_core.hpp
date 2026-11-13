@@ -74,6 +74,14 @@ struct Rect {
 using LogFn = void (*)(const char* line);
 using ProcFn = void* (*)(const char* name);
 void set_logger(LogFn fn) noexcept;
+// Despierta al hilo que dibuja (el de la pantalla) cuando hay trabajo que no viene con un cuadro mostrado: lotes de
+// una pantalla de carga, o la cola llena (0.20.7). Sin esto el motor solo dibujaba al presentar el juego un cuadro.
+using WakeFn = void (*)();
+void set_wake(WakeFn fn) noexcept;
+// Desde el inicio: grupos de lotes sin mostrarse, esperas con la cola llena, copias únicas perdidas (pruebas).
+void queue_stats(uint64_t out[3]) noexcept;
+// ¿El motor ya hizo esa copia del EFB? (solo desde el hilo que dibuja; pruebas)
+bool has_copy_texture(uint64_t id) noexcept;
 void set_gl_loader(ProcFn fn) noexcept;
 void set_reversed_z(bool reversed) noexcept;
 

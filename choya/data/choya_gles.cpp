@@ -393,6 +393,17 @@ void CheckGamepads() {
 }
 } // namespace
 
+// El motor pide dibujar sin un cuadro mostrado (pantalla de carga, cola llena): mismo aviso que un cuadro del juego.
+// Si el lote no se muestra, choya_gx_draw_frame devuelve false y no se presenta nada (no parpadea).
+extern "C" void choya_gles_wake() {
+    if (!g_threadStarted) return;
+    {
+        std::lock_guard lock(g_threadMutex);
+        ++g_requested;
+    }
+    g_threadCv.notify_one();
+}
+
 extern "C" void choya_gles_frame() {
     CheckGamepads();
     if (!g.tried) {

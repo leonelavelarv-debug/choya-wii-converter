@@ -50,6 +50,7 @@ using u8 = uint8_t;
 using u32 = uint32_t;
 
 LogFn g_logger = nullptr;
+WakeFn g_wake = nullptr;
 ProcFn g_loader = nullptr;
 bool g_reversedZ = true;
 
@@ -346,7 +347,7 @@ std::mutex g_frameMutex;
 std::condition_variable g_queueCv;          // el motor tomó la cola (para el que captura, si estaba llena)
 std::atomic<uint64_t> g_openFlushes{0};     // grupos de lotes sin mostrarse mandados al motor (pantallas de carga)
 std::atomic<uint64_t> g_queueWaits{0};      // veces que el que captura esperó al motor con la cola llena
-std::atomic<uint64_t> g_lostCopies{0};      // copias únicas tiradas porque el motor no avanzó en 1 s
+std::atomic<uint64_t> g_lostCopies{0};      // copias únicas tiradas porque el motor no avanzó en 2 s
 
 std::mutex g_pipelineMutex;
 std::unordered_map<uint64_t, PipelineDesc> g_pipelines;
@@ -2286,6 +2287,13 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
 } // namespace
 
 void set_logger(LogFn fn) noexcept { g_logger = fn; }
+void set_wake(WakeFn fn) noexcept { g_wake = fn; }
+bool has_copy_texture(uint64_t id) noexcept { return g_copyTextures.contains(id); }
+void queue_stats(uint64_t out[3]) noexcept {
+  out[0] = g_openFlushes.load();
+  out[1] = g_queueWaits.load();
+  out[2] = g_lostCopies.load();
+}
 void set_gl_loader(ProcFn fn) noexcept { g_loader = fn; }
 void set_reversed_z(bool reversed) noexcept { g_reversedZ = reversed; }
 
@@ -2677,7 +2685,8 @@ void capture_end(bool present) noexcept {
   // de los Miis con muchas copias del EFB sin mostrar nada) antes se tiraba el más viejo, y con él copias que el
   // juego no repite (las caras quedaban en blanco). Ahora se mandan al motor como un grupo que no se muestra.
   if (!present && g_open.size() <= 16) return;
-  if (!present) g_openFlushes.fetch_add(1, std::memory_order_relaxed);
+  const bool loading = !present;  // lotes sin cuadro que los muestre: nadie va a despertar al motor por ellos
+  if (loading) g_openFlushes.fetch_add(1, std::memory_order_relaxed);
   Group g;
   g.frames.swap(g_open);
   for (const Frame& f : g.frames) {
@@ -2704,10 +2713,12 @@ void capture_end(bool present) noexcept {
     }
   }
   // Aquí ya solo quedan grupos con copias que nadie repite: en vez de tirarlos (se perdían caras de Miis), el que
-  // captura espera a que el motor los tome (hasta 1 s). Solo si el motor no avanza se tiran, y se anota.
+  // captura despierta al motor y espera a que los tome (hasta 2 s). Solo si el motor no avanza se tiran, y se anota.
+  if (loading && g_wake != nullptr) g_wake();
   if (g_queue.size() > 6) {
     g_queueWaits.fetch_add(1, std::memory_order_relaxed);
-    g_queueCv.wait_for(lock, std::chrono::seconds(1), [] { return g_queue.size() <= 6; });
+    if (g_wake != nullptr) g_wake();
+    g_queueCv.wait_for(lock, std::chrono::seconds(2), [] { return g_queue.size() <= 6; });
   }
   while (g_queue.size() > 6) {
     g_lostCopies.fetch_add(g_queue.front().copies.size(), std::memory_order_relaxed);

@@ -3,6 +3,7 @@
 Se salta si no hay clang++, Mesa EGL o las cabeceras GX de aurora (BrawlRecompiled)."""
 import ctypes.util
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -27,7 +28,7 @@ class TestMotorGles(unittest.TestCase):
             data = os.path.join(REPO, "choya", "data", "aurora")
             subprocess.run(["clang++", "-std=c++20", "-I", data, "-I", AURORA_INCLUDE,
                             os.path.join(AQUI, "motor_gles", "harness.cpp"), os.path.join(data, "choya_gx_core.cpp"),
-                            "-o", exe, "-ldl"], check=True, capture_output=True)
+                            "-o", exe, "-ldl", "-lpthread"], check=True, capture_output=True)
             dump = os.path.join(d, "cuadro.bin")
             env = dict(os.environ, EGL_PLATFORM="surfaceless", CHOYA_PRUEBA_VOLCADO=dump)
             out = subprocess.run([exe], env=env, capture_output=True, text=True)
@@ -114,6 +115,13 @@ class TestMotorGles(unittest.TestCase):
             for extra in ({}, {"CHOYA_GX_BORRAR_CON_GL": "1"}):
                 out = subprocess.run([exe, "borrado"], env=dict(env, **extra), capture_output=True, text=True)
                 self.assertIn("borrado 0000FF 000000", out.stdout, (extra, out.stdout + out.stderr))
+
+            # Pantalla de carga: 40 lotes sin mostrar, cada uno con una copia distinta; no se pierde ninguna.
+            out = subprocess.run([exe, "cola"], env=env, capture_output=True, text=True, timeout=60)
+            m = re.search(r"cola (\d+) (\d+) (\d+) (\d+)", out.stdout)
+            self.assertIsNotNone(m, out.stdout + out.stderr)
+            self.assertEqual(m.group(3), "0", out.stdout)    # copias perdidas
+            self.assertEqual(m.group(4), "40", out.stdout)   # todas hechas
 
             # Paleta sobre una copia del EFB (C8 con R*255 y C4 con R*15): la entrada 3 es magenta y la 5 cian.
             for variant, color in ((1, "FF00FF"), (2, "00FFFF")):

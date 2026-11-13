@@ -8,6 +8,10 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 using namespace choya;
 static void* egl; static void* gles;
 static void* (*egl_get_proc)(const char*) = nullptr;
@@ -188,6 +192,55 @@ static int palette_test(int variant) {
   return 0;
 }
 
+// harness cola: como una pantalla de carga. Otro hilo captura 40 lotes sin mostrar, cada uno con una copia del EFB
+// distinta (las caras de los Miis); este hilo (el del contexto GL) dibuja solo cuando el motor lo despierta. No debe
+// perderse ninguna copia: imprime "cola <grupos> <esperas> <perdidas> <copias hechas>".
+static std::mutex g_wakeMutex;
+static std::condition_variable g_wakeCv;
+static int g_wakes = 0;
+static void wake() {
+  { std::lock_guard l(g_wakeMutex); ++g_wakes; }
+  g_wakeCv.notify_one();
+}
+static int queue_test() {
+  gx::set_wake(wake);
+  std::vector<uint8_t> v(64, 0), u(16384 + 256, 0);
+  std::vector<uint16_t> i = {0, 0, 0};
+  const float grey[4] = {0.5f, 0.5f, 0.5f, 1};
+  std::atomic<bool> done{false};
+  std::thread producer([&] {
+    for (int n = 0; n < 40; ++n) {
+      gx::capture_begin(v.data(), v.size(), u.data(), u.size(), (const uint8_t*)i.data(), 6, nullptr, 0);
+      gx::capture_pass(640, 480, true, true, grey, 1.f, false, gx::Rect{0, 0, 0, 0});
+      gx::capture_copy(1000 + n, gx::Rect{0, 0, 64, 64}, 64, 64, 0x6, true);
+      gx::capture_end(false);
+    }
+    // Termina la carga: el primer cuadro que se muestra lleva los lotes que quedaban.
+    gx::capture_begin(v.data(), v.size(), u.data(), u.size(), (const uint8_t*)i.data(), 6, nullptr, 0);
+    gx::capture_pass(640, 480, true, true, grey, 1.f, true, gx::Rect{0, 0, 640, 480});
+    gx::capture_end(true);
+    done = true;
+    wake();
+  });
+  int copies = 0;
+  for (;;) {
+    {
+      std::unique_lock l(g_wakeMutex);
+      g_wakeCv.wait_for(l, std::chrono::milliseconds(50), [] { return g_wakes > 0; });
+      g_wakes = 0;
+    }
+    gx::draw_frame(640, 480);
+    if (done) { gx::draw_frame(640, 480); break; }
+  }
+  producer.join();
+  uint64_t st[3];
+  gx::queue_stats(st);
+  for (int n = 0; n < 40; ++n) copies += gx::has_copy_texture(1000 + n) ? 1 : 0;
+  std::printf("cola %llu %llu %llu %d\n", (unsigned long long)st[0], (unsigned long long)st[1],
+              (unsigned long long)st[2], copies);
+  return 0;
+}
+
 // harness borrado: pase borrado en negro y un borrado de aurora (GXCopyTex con borrado) en la mitad izquierda, azul.
 static int clear_test() {
   gx::register_clear(500, gx::ClearDesc{1, 1, 1, 0});
@@ -211,6 +264,7 @@ int main(int argc, char** argv) {
   if (argc >= 2 && std::strcmp(argv[1], "borrado") == 0) return clear_test();
   if (argc >= 2 && std::strcmp(argv[1], "paquete") == 0) return packed(argc, argv);
   if (argc >= 3 && std::strcmp(argv[1], "paleta") == 0) return palette_test(std::atoi(argv[2]));
+  if (argc >= 2 && std::strcmp(argv[1], "cola") == 0) return queue_test();
   if (argc >= 3) return replay(argv[1], argv[2]);
   auto GetString = (const char*(*)(unsigned))dlsym(gles, "glGetString");
   std::printf("GL: %s / %s\n", GetString(0x1F02), GetString(0x1F01));
