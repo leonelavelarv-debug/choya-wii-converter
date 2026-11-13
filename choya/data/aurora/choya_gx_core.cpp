@@ -2352,6 +2352,11 @@ void set_keep_textures(bool keep) noexcept {
 
 static std::chrono::steady_clock::time_point g_captureStart;
 static std::atomic<uint64_t> g_captureUs{0};
+static std::atomic<uint64_t> g_aurora[10]{};
+
+void note_aurora(int what, uint64_t value) noexcept {
+  if (what >= 0 && what < 10) g_aurora[what].fetch_add(value, std::memory_order_relaxed);
+}
 
 void capture_begin(const uint8_t* verts, size_t vertsSize, const uint8_t* uniforms, size_t uniformsSize,
                    const uint8_t* indices, size_t indicesSize, const uint8_t* storage, size_t storageSize) noexcept {
@@ -3193,6 +3198,19 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
              g_stats.bytesVerts / n / 1024, g_stats.bytesUniforms / n / 1024, g_stats.bytesIndices / n / 1024,
              g_stats.bytesStorage / n / 1024, g_stats.cpuMs / n, g_captureUs.exchange(0) / n / 1000.0,
              g_stats.gpuWaitMs / n);
+    {
+      uint64_t a[10];
+      for (int i = 0; i < 10; ++i) a[i] = g_aurora[i].exchange(0, std::memory_order_relaxed);
+      if (a[9] > 0) {
+        const double c = static_cast<double>(a[9]);
+        const auto msf = [c](uint64_t ns) { return static_cast<double>(ns) / c / 1e6; };
+        log_line("aurora: por cuadro del juego (%llu cuadros): el juego esperó %.2f ms al hilo de aurora; ese hilo: "
+                 "sellar %.2f, codificar %.2f, publicar %.2f, esperar al juego %.2f, preparar el siguiente %.2f ms; "
+                 "listas de dibujo %.0f (%.0f KB) en %.2f ms",
+                 static_cast<unsigned long long>(a[9]), msf(a[0]), msf(a[1]), msf(a[2]), msf(a[3]), msf(a[4]),
+                 msf(a[5]), static_cast<double>(a[7]) / c, static_cast<double>(a[8]) / c / 1024, msf(a[6]));
+      }
+    }
     log_line("motor: texturas: %zu en GL, %llu subidas, %zu copias del EFB (%.1f por cuadro), %llu enlaces sin textura "
              "(paletas u otras)",
              g_textures.size(), static_cast<unsigned long long>(g_stats.texUploads), g_copyTextures.size(),

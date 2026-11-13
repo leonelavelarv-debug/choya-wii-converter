@@ -177,11 +177,20 @@ void guest_stack(Wall& w) {
 }
 
 volatile int g_wallTarget = -1;  // índice de la muestra que llena la señal en curso
+std::atomic<uint64_t> g_wallNs{0};  // tiempo total dentro de OnWall (lo que la medición le quita al hilo del juego)
+std::atomic<uint64_t> g_wallSignals{0};
+
+inline uint64_t now_ns() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+}
 
 void OnWall(int, siginfo_t*, void* raw) {
     const int i = g_wallTarget;
     if (!g_wallOn.load(std::memory_order_relaxed) || g_wall == nullptr || i < 0) return;
     g_wallTarget = -1;
+    const uint64_t t0 = now_ns();
     Wall& w = g_wall[i];
     const auto* uc = static_cast<const ucontext_t*>(raw);
     uintptr_t fp = 0, sp = 0;
@@ -212,6 +221,8 @@ void OnWall(int, siginfo_t*, void* raw) {
     }
     w.wait = -2;
     guest_stack(w);
+    g_wallNs.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+    g_wallSignals.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::string ThreadName(uint32_t tid) {
@@ -279,6 +290,8 @@ void Dump(const char* path, int seconds) {
 #elif defined(__x86_64__)
     std::fprintf(f, "arq x86_64\n");
 #endif
+    std::fprintf(f, "costo_senal %llu %llu\n", static_cast<unsigned long long>(g_wallNs.load()),
+                 static_cast<unsigned long long>(g_wallSignals.load()));
     std::fprintf(f, "cuadros %u\nhilo_juego %d %s\npared %zu\ndirs %08x %08x\n", g_frames.load(), g_gameTid.load(),
                  ThreadName(static_cast<uint32_t>(g_gameTid.load())).c_str(), nw, kCalc, kDraw);
     std::map<std::string, size_t> stacks;
@@ -333,6 +346,9 @@ void Dump(const char* path, int seconds) {
                       frames / static_cast<double>(seconds), frameMs, ms(upd), ms(drw), ms(wt), ms(oth));
         std::fprintf(f, "# %s\n", line + 8);
         std::fprintf(stderr, "%s\n", line);
+        std::fprintf(stderr, "[choya] la medición le quitó al hilo del juego %.2f ms por cuadro en las señales (%llu)\n",
+                     static_cast<double>(g_wallNs.load()) / 1e6 / frames,
+                     static_cast<unsigned long long>(g_wallSignals.load()));
         std::string waits = "[choya] esperas (ms por cuadro):";
         for (const auto& [nr, c] : waitBy) {
             const char* name = nr == -1 ? "fallo de página" : nullptr;
@@ -381,6 +397,8 @@ void Measure(int seconds) {
     }
     g_count = 0;
     g_wallCount = 0;
+    g_wallNs = 0;
+    g_wallSignals = 0;
     g_frames = 0;
     g_guestOk = CHOYA_GUEST_BASE != 0 && CHOYA_GUEST_ACTIVE();
     if (g_textHi == 0) find_text();
@@ -394,6 +412,7 @@ void Measure(int seconds) {
     prof.sa_sigaction = OnProf;
     prof.sa_flags = SA_SIGINFO | SA_RESTART;
     sigemptyset(&prof.sa_mask);
+    sigaddset(&prof.sa_mask, SIGRTMIN + 6);  // la de pared espera a que termine esta (y al revés, abajo)
     sigaction(SIGPROF, &prof, nullptr);
     itimerval on{};
     on.it_interval.tv_usec = 1000;  // 1 ms (el núcleo lo redondea a su tick)
@@ -411,6 +430,7 @@ void Measure(int seconds) {
         wall.sa_sigaction = OnWall;
         wall.sa_flags = SA_SIGINFO | SA_RESTART;
         sigemptyset(&wall.sa_mask);
+        sigaddset(&wall.sa_mask, SIGPROF);
         sigaction(g_wallSignal, &wall, nullptr);
         char path[96];
         std::snprintf(path, sizeof(path), "/proc/self/task/%d/stat", gameTid);

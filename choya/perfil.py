@@ -25,6 +25,8 @@ class Perfil:
     muestras: int = 0
     segundos: int = 0
     fecha: int = 0                                                          # cuándo se escribió (época), 0.20.1
+    senal_ns: int = 0                                                       # tiempo dentro de la señal de pared, 0.20.2
+    senales: int = 0
     hilos: dict[int, tuple[int, str]] = field(default_factory=dict)       # tid -> (muestras, nombre)
     pcs: list[tuple[int, int, int]] = field(default_factory=list)          # (tid, muestras, desplazamiento)
     libs: list[tuple[int, int, str]] = field(default_factory=list)         # (tid, muestras, "lib:símbolo")
@@ -53,6 +55,8 @@ def leer(path: str) -> Perfil:
                 p.segundos = int(parts[1])
             elif parts[0] == "fecha":
                 p.fecha = int(parts[1])
+            elif parts[0] == "costo_senal":
+                p.senal_ns, p.senales = int(parts[1]), int(parts[2])
             elif parts[0] == "hilo":
                 p.hilos[int(parts[1])] = (int(parts[2]), " ".join(parts[3:]) or "?")
             elif parts[0] == "pc":
@@ -337,6 +341,9 @@ def tramos(p: Perfil, names: dict[int, str], ws, top: int = 20,
     lines = ["\n== Tramos del cuadro (hilo del juego " + (p.hilo_juego or "?") + ", reloj de pared)"]
     lines.append(f"{p.cuadros} cuadros en {p.segundos} s: {p.cuadros / max(1, p.segundos):.1f} cuadros/s, "
                  f"{frame_ms:.1f} ms por cuadro ({total} muestras)")
+    if p.senales:
+        lines.append(f"(la medición le quitó al hilo del juego {p.senal_ns / 1e6 / frames:.2f} ms por cuadro en "
+                     f"{p.senales} señales: {p.senal_ns / 1e3 / p.senales:.1f} µs cada una)")
     etiquetas = {"actualizar": "Actualizar el juego (EGG::SceneManager::calc)",
                  "dibujo": "Preparar el dibujo (EGG::SceneManager::draw)",
                  "esperar": "Esperar (dormido o bloqueado)", "otros": "Otros (fuera de calc y draw)"}

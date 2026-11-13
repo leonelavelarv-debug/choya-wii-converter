@@ -78,6 +78,8 @@ class TestPerfilTramos(unittest.TestCase):
             names = {o: c[0] for o, c in cadenas.items()}
             text = perfil.informe(p, names, top=8, cadenas=cadenas)
             self.assertIn("medido el", text)
+            self.assertGreater(p.senales, 100)
+            self.assertRegex(text, r"la medición le quitó al hilo del juego [\d.]+ ms por cuadro")
             ms = {k: float(re.search(r"([\d.]+) ms\s+[\d.]+%\s+" + k, text).group(1))
                   for k in ("Actualizar", "Preparar", "Esperar")}
             self.assertTrue(4.5 <= ms["Actualizar"] <= 8.0, text)

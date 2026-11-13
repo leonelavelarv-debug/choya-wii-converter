@@ -1175,6 +1175,64 @@ AURORA_EDITS = [
      "  if (!g_gxState.zFreeze && !choya::enabled()) update_zfreeze_reference(prim, fmt, data + pos, vtxCount, vtxSize,"
      " bigEndian);  // choya\n",
      "motor de Choya (sin plano zfreeze, FIFO)"),
+    # Contador de dibujos sin instrucción atómica (0.20.2): el A53 no tiene LSE y cada fetch_add era una llamada a
+    # __aarch64_ldadd8_relax con un bucle LL/SC, ~8000 por cuadro. Solo lo escribe el hilo del juego; el informe que lo
+    # vacía puede perder alguno de vez en cuando, da igual para una estadística.
+    ("lib/gx/command_processor.cpp",
+     "  ProcessTimer timer;\n  g_statDraws.fetch_add(1, std::memory_order_relaxed);\n",
+     "  ProcessTimer timer;\n  g_statDraws.store(g_statDraws.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);"
+     "  // choya\n",
+     "motor de Choya (contador de dibujos, directo)"),
+    ("lib/gx/command_processor.cpp",
+     "  ZoneScoped;\n  g_statDraws.fetch_add(1, std::memory_order_relaxed);\n  GXVtxFmt fmt",
+     "  ZoneScoped;\n  g_statDraws.store(g_statDraws.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);"
+     "  // choya\n  GXVtxFmt fmt",
+     "motor de Choya (contador de dibujos, FIFO)"),
+    # Tiempos de aurora para el informe (0.20.2): cuánto espera el juego al hilo de aurora y en qué se le va el ciclo a
+    # ese hilo, y cuánto cuestan las listas de dibujo (GXCallDisplayList).
+    ("lib/gx/fifo.cpp", '#include "../internal.hpp"\n',
+     '#include "../internal.hpp"\n#include "../choya/choya_gx_core.hpp"  // choya\n',
+     "motor de Choya (tiempos de aurora: cabecera en fifo)"),
+    ("lib/gx/fifo.cpp",
+     '  ZoneScopedN("FIFO drain wait");\n',
+     '  ZoneScopedN("FIFO drain wait");\n  choya::gx::note_aurora(0, nanos);  // choya\n',
+     "motor de Choya (tiempos de aurora: espera del juego)"),
+    ("lib/aurora.cpp", '#include "internal.hpp"\n',
+     '#include "internal.hpp"\n#include "choya/choya_gx_core.hpp"  // choya\n',
+     "motor de Choya (tiempos de aurora: cabecera)"),
+    ("lib/aurora.cpp",
+     "    const double busy = msOf(published - cycleStart) + msOf(prepareEnd - prepareStart);\n",
+     "    const double busy = msOf(published - cycleStart) + msOf(prepareEnd - prepareStart);\n"
+     "    {  // choya: tiempos del ciclo para el informe\n"
+     "      const auto nsOf = [](WorkerClock::duration d) {\n"
+     "        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());\n"
+     "      };\n"
+     "      choya::gx::note_aurora(1, nsOf(sealed - cycleStart));\n"
+     "      choya::gx::note_aurora(2, nsOf(encoded - sealed));\n"
+     "      choya::gx::note_aurora(3, nsOf(published - encoded));\n"
+     "      choya::gx::note_aurora(4, nsOf(prepareStart - published));\n"
+     "      choya::gx::note_aurora(5, nsOf(prepareEnd - prepareStart));\n"
+     "      choya::gx::note_aurora(9, 1);\n"
+     "    }\n",
+     "motor de Choya (tiempos de aurora: ciclo del hilo)"),
+    ("lib/dolphin/gx/GXDispList.cpp", '#include "../../gfx/common.hpp"\n',
+     '#include "../../gfx/common.hpp"\n#include "../../choya/choya_gx_core.hpp"  // choya\n\n#include <chrono>\n',
+     "motor de Choya (tiempos de las listas: cabecera)"),
+    ("lib/dolphin/gx/GXDispList.cpp",
+     "  } replayScope;\n  u32 consumed = 0;\n",
+     "  } replayScope;\n"
+     "  struct ChoyaListTimer {  // choya: tiempo y tamaño de las listas para el informe\n"
+     "    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();\n"
+     "    u32 bytes;\n"
+     "    ~ChoyaListTimer() {\n"
+     "      choya::gx::note_aurora(6, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(\n"
+     "                                    std::chrono::steady_clock::now() - start).count()));\n"
+     "      choya::gx::note_aurora(7, 1);\n"
+     "      choya::gx::note_aurora(8, bytes);\n"
+     "    }\n"
+     "  } choyaListTimer{std::chrono::steady_clock::now(), nbytes};\n"
+     "  u32 consumed = 0;\n",
+     "motor de Choya (tiempos de las listas)"),
 ]
 
 # Archivos del motor de Choya que se copian dentro de aurora (siempre se reemplazan: son de Choya).

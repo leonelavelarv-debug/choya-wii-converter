@@ -99,7 +99,7 @@ else
   export CHOYA_PAQUETE=0
 fi
 mkdir -p "$CHOYA_GX_CACHE"
-rm -f "$DIR/choya-gles.txt"
+rm -f "$DIR/choya-gles.txt" "$DIR/procesador.txt"
 
 CPUF=/sys/devices/system/cpu/cpu0/cpufreq
 {
@@ -120,7 +120,7 @@ escribir_resumen() {
     echo "codigo de salida: ${STATUS:-sigue corriendo} (124 = siguio corriendo hasta el limite del modo diagnostico)"
     [ -f "$DIR/perfil.txt" ] && echo "perfil.txt: $(grep -m1 '^muestras' "$DIR/perfil.txt"), escrito el $(date -r "$DIR/perfil.txt" '+%d/%m %H:%M' 2>/dev/null), hilo del juego $(awk '/^hilo_juego/{print $2}' "$DIR/perfil.txt")"
     cat "$DIR/cpu.txt"
-    echo "procesador al jugar: tope $(( $(cat $CPUF/scaling_max_freq 2>/dev/null || echo 0) / 1000 )) MHz, ahora $(( $(cat $CPUF/scaling_cur_freq 2>/dev/null || echo 0) / 1000 )) MHz$([ -f "$DIR/cpu-normal" ] && echo " (archivo cpu-normal: tope de KNULLI)")$([ "$CPU_CALIENTE" = 1 ] && echo " (bajado por temperatura)")"
+    cat "$DIR/procesador.txt" 2>/dev/null
     echo "--- cuadros volcados"
     ls -la "$DIR"/cuadro-*.bin 2>/dev/null || echo "ninguno"
     echo "--- pantalla GLES de Choya"
@@ -136,7 +136,9 @@ escribir_resumen() {
     echo "--- memoria de la Mali por partes del cuadro"
     grep -hE "motor: (Mali|la Mali|midiendo)" "$DIR/choya-gles.txt" 2>/dev/null | head -60
     echo "--- tramos del cuadro (MENU sola 2 s mide 20 s; detalle en la PC: choya perfil perfil.txt)"
-    grep -hE "\[choya\] (midiendo|tramos|esperas|perfil escrito)|MENU sola" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | tail -6
+    grep -hE "\[choya\] (midiendo|tramos|esperas|perfil escrito|la medición)|MENU sola" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | tail -7
+    echo "--- hilo de aurora y listas de dibujo (por cuadro del juego)"
+    grep -h "aurora: por cuadro" "$DIR/choya-gles.txt" 2>/dev/null | tail -6
     echo "--- núcleos"
     grep -h "motor: hilo del juego\|no pude fijar" "$DIR/choya-gles.txt" 2>/dev/null | tail -2
     echo "--- recursos convertidos (assets.wlpk)"
@@ -258,6 +260,7 @@ esperar_juego() {
         "$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo 0) / 1000 ))" \
         "$(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 ))C"
     } >> "$DIR/memoria.txt" 2>/dev/null
+    echo "procesador al jugar (a los ${t} s): tope $(( $(cat $CPUF/scaling_max_freq 2>/dev/null || echo 0) / 1000 )) MHz, ahora $(( $(cat $CPUF/scaling_cur_freq 2>/dev/null || echo 0) / 1000 )) MHz, $(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 )) °C$([ -f "$DIR/cpu-normal" ] && echo " (archivo cpu-normal: tope de KNULLI)")$([ "$CPU_CALIENTE" = 1 ] && echo " (bajado por temperatura)")" > "$DIR/procesador.txt"
     # Vigilancia de temperatura con el tope del procesador subido.
     if [ -n "$CPU_TOPE" ]; then
       local temp
