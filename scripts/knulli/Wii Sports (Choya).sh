@@ -91,9 +91,13 @@ export CHOYA_GX_CACHE="${CHOYA_GX_CACHE:-$DIR/cache-shaders}"
 # Efectos de audio (reverberación): apagados por omisión, cuestan ~10 ms por cuadro del hilo del juego en Golf
 # (0.19.1). Un archivo vacío llamado "con-reverb" junto al juego los vuelve a encender.
 if [ -f "$DIR/con-reverb" ]; then export CHOYA_SIN_REVERB=0; else export CHOYA_SIN_REVERB=1; fi
-# Un archivo vacío llamado "volcados" junto al juego: MENU + R1 guarda el cuadro con sus texturas también al jugar
-# (para dibujarlo igual en la PC). Ocupa algo más de memoria mientras se juega.
-if [ -f "$DIR/volcados" ]; then export CHOYA_GX_GUARDAR_TEXTURAS=1; fi
+# Memoria del juego: si un bloque grande (como el de un Mii) no cabe en su montón, otro montón con espacio lo presta
+# en vez de cerrarse el juego (choya_perfil.cpp). Un archivo vacío llamado "sin-prestamos" lo deja solo anotando.
+if [ -f "$DIR/sin-prestamos" ]; then export CHOYA_PRESTAMOS=0; else export CHOYA_PRESTAMOS=1; fi
+# MENU + R1 guarda el cuadro con sus texturas (para dibujarlo igual en la PC). Desde la 0.20.10 siempre: un volcado
+# sin texturas no sirve para revisar colores (ocupa unos MB más mientras se juega). Un archivo vacío llamado
+# "volcados-sin-texturas" lo apaga.
+if [ -f "$DIR/volcados-sin-texturas" ]; then export CHOYA_GX_GUARDAR_TEXTURAS=0; else export CHOYA_GX_GUARDAR_TEXTURAS=1; fi
 # TEV exacto (0.20.9): la combinación de colores se cuenta en enteros de 8 bits como la Wii. Un archivo vacío llamado
 # "tev-flotante" junto al juego vuelve a la cuenta en flotante de antes (para comparar velocidad o colores).
 if [ -f "$DIR/tev-flotante" ]; then export CHOYA_GX_TEV=flotante; fi
@@ -105,7 +109,7 @@ else
   export CHOYA_PAQUETE=0
 fi
 mkdir -p "$CHOYA_GX_CACHE"
-rm -f "$DIR/choya-gles.txt" "$DIR/procesador.txt"
+rm -f "$DIR/choya-gles.txt" "$DIR/procesador.txt" "$DIR/ultimo-cierre.tar.gz"
 
 CPUF=/sys/devices/system/cpu/cpu0/cpufreq
 {
@@ -116,7 +120,8 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "mapeo del mando: ${SDL_GAMECONTROLLERCONFIG:-ninguno}" | cut -c1-200
   echo "efectos de audio: $([ "${CHOYA_SIN_REVERB:-0}" = 1 ] && echo "apagados (para oírlos: archivo con-reverb)" || echo "encendidos (archivo con-reverb)")"
   echo "TEV: $([ "${CHOYA_GX_TEV:-}" = flotante ] && echo "en flotante (archivo tev-flotante)" || echo "exacto en enteros (para el de antes: archivo vacío tev-flotante)")"
-  echo "volcados con texturas (MENU + R1): $([ "${CHOYA_GX_GUARDAR_TEXTURAS:-0}" = 1 ] && echo "sí (archivo volcados)" || echo "no (crea un archivo vacío llamado volcados en wiisports-choya)")"
+  echo "memoria del juego: $([ "$CHOYA_PRESTAMOS" = 0 ] && echo "solo anota (archivo sin-prestamos)" || echo "un montón presta si a otro no le cabe un bloque (para solo anotar: archivo vacío sin-prestamos)")"
+  echo "volcados con texturas (MENU + R1): $([ "${CHOYA_GX_GUARDAR_TEXTURAS:-0}" = 1 ] && echo "sí (para quitarlas: archivo vacío volcados-sin-texturas)" || echo "no (archivo volcados-sin-texturas)")"
   echo "recursos convertidos: $([ "$CHOYA_PAQUETE" = 0 ] && echo "no (texturas del disco)" || echo "$CHOYA_PAQUETE ($(du -h "$CHOYA_PAQUETE" 2>/dev/null | cut -f1))")"
   echo "gptokeyb: ${GPTOKEYB:-no}  salir: $CHOYA_QUIT_COMBO + START  botones: $CHOYA_FACE_LAYOUT"
   echo "dispositivos de entrada: $(grep -h "^N: Name=" /proc/bus/input/devices 2>/dev/null | cut -d= -f2- | tr "\n" " ")"
@@ -160,8 +165,22 @@ escribir_resumen() {
     echo "programas en el caché: $(ls "$CHOYA_GX_CACHE" 2>/dev/null | grep -c '\.bin$')"
     echo "--- mandos"
     grep -hE "mando|gamepad|joystick|\[input\]|volcado" "$DIR/choya-gles.txt" "$DIR/run.log" 2>/dev/null | grep -v "^\[choya-gles\]" | head -80
+    echo "--- memoria del juego (montones de Wii Sports; si un bloque no cabe, otro montón lo presta; CHOYA_PRESTAMOS=0 solo anota)"
+    grep -hE "\[choya\] (memoria del juego|montones del juego|el juego saltó)|\[choya\]   " "$DIR/run.log" 2>/dev/null | head -80
+    echo "--- cierre (pila completa del juego)"
+    if grep -q "crash artifacts written" "$DIR/run.log" 2>/dev/null; then
+      grep -E "^\[runtime\] +#[0-9]+ |^\[runtime\] (PC|SRR0|SP\(r1\)|GPR)" "$DIR/run.log" | sed 's/ tail:.*//' | head -60
+      carpeta=$(grep -m1 -o "crash artifacts written to .*" "$DIR/run.log" | sed 's/crash artifacts written to //')
+      if [ -n "$carpeta" ] && [ -d "$carpeta" ] && \
+         tar -czf "$DIR/ultimo-cierre.tar.gz" -C "$(dirname "$carpeta")" "$(basename "$carpeta")" 2>/dev/null; then
+        echo "carpeta del cierre: wiisports-choya/ultimo-cierre.tar.gz (mándala junto con este resumen)"
+      fi
+    else
+      echo "sin cierre"
+    fi
     echo "--- errores"
-    grep -iE "fatal|error|abort|AccessViolation|choya\]|not found|cannot open" "$DIR/run.log" | head -20
+    grep -iE "fatal|error|abort|AccessViolation|choya\]|not found|cannot open" "$DIR/run.log" | \
+      grep -vE "memoria del juego|montones del juego|\[choya\]   |el juego saltó" | head -20
     echo "--- final del log"
     tail -15 "$DIR/run.log"
   } > "$DIR/resumen.txt" 2>&1

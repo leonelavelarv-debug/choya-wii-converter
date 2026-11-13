@@ -25,12 +25,18 @@ volatile bool g_choyaMidiendo = false;
 uint32_t g_choyaSinEfectos = 0;
 }
 extern "C" bool choya_sin_efectos(void* ctx);
+// Memoria del juego (montones de MEM/EGG): abi_bridge.h avisa al entrar a MEMAllocFromExpHeapEx,
+// MEMAllocFromFrmHeapEx, MEMFreeToExpHeap, MEMResizeForMBlockExpHeap y EGG::Heap::alloc (la comparación es con una
+// constante: en las llamadas directas no cuesta nada fuera de esas funciones), y al cerrarse por un salto a 0.
+extern "C" void choya_vigila_memoria(uint32_t target, void* ctx);
+extern "C" void choya_informe_memoria(uint32_t target, const void* ctx);
 extern "C" void choya_medir_llamada(uint32_t target, const void* ctx);
 extern "C" int choya_medir_empezar(int seconds);  // 1: empezó; 0: ya estaba midiendo
 
 #if defined(__linux__)
 #include <algorithm>
 #include <atomic>
+#include <cstdarg>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -54,6 +60,11 @@ extern "C" int choya_medir_empezar(int seconds);  // 1: empezó; 0: ya estaba mi
 #include "guest_flat_memory.h"
 #define CHOYA_GUEST_BASE (static_cast<uintptr_t>(GuestFlat::kFixedFlatGuestBase))
 #define CHOYA_GUEST_ACTIVE() (GuestFlat::IsActive())
+#define CHOYA_CON_SIMBOLOS 1  // la tabla de nombres del juego del runtime (guest_symbol_table.cpp o su stub)
+#elif defined(CHOYA_PRUEBA_MEMORIA)  // prueba de la memoria del juego en la PC: una memoria "de la Wii" falsa
+extern "C" uint8_t* choya_prueba_base;
+#define CHOYA_GUEST_BASE (reinterpret_cast<uintptr_t>(choya_prueba_base))
+#define CHOYA_GUEST_ACTIVE() (choya_prueba_base != nullptr)
 #else  // fuera del runtime (pruebas): sin pila del juego
 #define CHOYA_GUEST_BASE (uintptr_t{0})
 #define CHOYA_GUEST_ACTIVE() false
@@ -589,6 +600,315 @@ extern "C" bool choya_sin_efectos(void* ctx) {
     return true;
 }
 
+// --- Memoria del juego -----------------------------------------------------------------------------------------
+// Wii Sports arma cada Mii con nw4r::g3d::ScnRfl::Construct, que pide un bloque grande (la cara, las expresiones)
+// al montón de modelos y, si no cabe, devuelve NULL; RPGrpModelRfl::Construct no lo revisa y el juego salta a 0 al
+// llamar a G3dProc (0.20.9: "Missing translated function ... 0x0" con LR en RPGrpModelRfl::Construct). Aquí:
+//  - Cuando una petición de 16 KB o más no cabe en un montón expandible, se anota quién la pidió, cuánto había libre
+//    y el árbol de montones (una vez), y se le presta el bloque de otro montón expandible con espacio de sobra (el
+//    que tenga el bloque libre más grande y le queden al menos 2 MB): así el Mii se arma en vez de cerrarse el
+//    juego. Los bloques prestados se devuelven al montón correcto: MEMFreeToExpHeap y MEMResizeForMBlockExpHeap
+//    reciben el montón que los contiene (EGG ya lo busca así para delete). Hasta 24 MB prestados en total.
+//    CHOYA_PRESTAMOS=0 solo anota.
+//  - EGG::Heap::alloc devuelve NULL sin mirar el espacio si el juego dejó asignar solo de un montón
+//    (disableAllocationAllBut) y la petición va a otro: también se anota.
+//  - Al cerrarse por un salto a 0 se escribe el árbol de montones con lo libre de cada uno.
+constexpr uint32_t kMemAllocExp = 0x0u /*CHOYA_SYM:MEMAllocFromExpHeapEx*/;
+constexpr uint32_t kMemAllocFrm = 0x0u /*CHOYA_SYM:MEMAllocFromFrmHeapEx*/;
+constexpr uint32_t kMemFreeExp = 0x0u /*CHOYA_SYM:MEMFreeToExpHeap*/;
+constexpr uint32_t kMemResizeExp = 0x0u /*CHOYA_SYM:MEMResizeForMBlockExpHeap*/;
+constexpr uint32_t kEggHeapAlloc = 0x0u /*CHOYA_SYM:alloc__Q23EGG4HeapFUliPQ23EGG4Heap*/;
+constexpr uint32_t kMemRootList = 0x0u /*CHOYA_SYM:sRootList*/;
+constexpr uint32_t kEggAllocatable = 0x0u /*CHOYA_SYM:sAllocatableHeap__Q23EGG4Heap*/;
+constexpr uint32_t kEggCurrent = 0x0u /*CHOYA_SYM:sCurrentHeap__Q23EGG4Heap*/;
+constexpr uint32_t kExpMagic = 0x45585048u, kFrmMagic = 0x46524D48u, kUnitMagic = 0x554E5448u;  // EXPH FRMH UNTH
+constexpr uint32_t kWatchMin = 16 * 1024;            // peticiones más chicas no se revisan (las grandes son las raras)
+constexpr uint32_t kLendKeep = 2u << 20;             // lo que le queda al montón que presta, como mínimo
+constexpr uint32_t kLendBudget = 24u << 20;          // total prestado
+constexpr int kMaxNotes = 24;
+
+struct HeapStat {
+    bool ok = false;
+    uint32_t magic = 0, start = 0, end = 0, free = 0, largest = 0, blocks = 0;
+};
+struct Loan { uint32_t block, size, owner, lender; };
+std::vector<Loan> g_loans;
+uint32_t g_lent = 0;
+int g_notes = 0;
+bool g_treeShown = false;
+int g_lendMode = -1;  // -1: sin leer CHOYA_PRESTAMOS
+
+inline bool guest_range(uint32_t a, uint32_t n) { return guest_ram(a) && n > 0 && guest_ram(a + n - 1); }
+inline uint32_t round_up(uint32_t v, uint32_t a) { return a <= 1 ? v : (v + a - 1) & ~(a - 1); }
+inline uint32_t round_down(uint32_t v, uint32_t a) { return a <= 1 ? v : v & ~(a - 1); }
+
+bool heap_ok(uint32_t h) {
+    if (!guest_range(h, 0x48)) return false;
+    const uint32_t m = guest_read32(h);
+    return m == kExpMagic || m == kFrmMagic || m == kUnitMagic;
+}
+
+// ¿Cabe size (alineado a align; negativo = desde el final) en el montón? Y lo libre que tiene.
+HeapStat heap_stat(uint32_t h, uint32_t size = 0, int32_t align = 4, bool* fits = nullptr) {
+    HeapStat st;
+    if (fits) *fits = false;
+    if (!heap_ok(h)) return st;
+    st.magic = guest_read32(h);
+    st.start = guest_read32(h + 0x18);
+    st.end = guest_read32(h + 0x1C);
+    const uint32_t al = static_cast<uint32_t>(align < 0 ? -align : align);
+    if (st.magic == kExpMagic) {
+        uint32_t b = guest_read32(h + 0x3C);  // freeMBlocks.head
+        for (int n = 0; b != 0 && n < 4096; ++n) {
+            if (!guest_range(b, 16)) return st;
+            const uint32_t bsz = guest_read32(b + 4), mem = b + 16, bend = mem + bsz;
+            st.free += bsz;
+            st.largest = std::max(st.largest, bsz);
+            ++st.blocks;
+            if (fits && size != 0 && bend >= mem) {
+                // Como MEMAllocFromExpHeapEx: el bloque usado lleva su cabecera de 16 bytes delante.
+                if (align >= 0) {
+                    const uint32_t p = round_up(mem, al);
+                    if (p >= mem && p + size <= bend && p + size >= p) *fits = true;
+                } else if (bend >= size + mem) {
+                    if (round_down(bend - size, al) >= mem) *fits = true;
+                }
+            }
+            b = guest_read32(b + 0xC);
+        }
+    } else if (st.magic == kFrmMagic) {
+        const uint32_t head = guest_read32(h + 0x3C), tail = guest_read32(h + 0x40);
+        st.free = tail > head ? tail - head : 0;
+        st.largest = st.free;
+        st.blocks = 1;
+        if (fits && size != 0 && tail > head) {
+            if (align >= 0) *fits = round_up(head, al) + size <= tail;
+            else *fits = tail >= size && round_down(tail - size, al) >= head;
+        }
+    } else {
+        st.blocks = 0;  // montón por unidades: no se usa para modelos
+    }
+    st.ok = true;
+    return st;
+}
+
+// Recorre el árbol de montones de MEM en orden (cada montón y luego sus hijos): sRootList y la lista de hijos de cada
+// uno (MEMList en +0xC; el enlace del objeto, MEMLink, en el desplazamiento que dice la lista).
+template <typename F>
+void walk_heaps(uint32_t list, int depth, int& seen, F& f) {
+    if (depth > 8 || !guest_range(list, 12)) return;
+    const uint32_t offset = guest_read32(list + 8) & 0xFFFFu;
+    uint32_t h = guest_read32(list);
+    for (int n = 0; h != 0 && n < 128 && seen < 256 && heap_ok(h); ++n, ++seen) {
+        f(h, depth);
+        walk_heaps(h + 0xC, depth + 1, seen, f);
+        h = guest_read32(h + offset + 4);  // MEMLink.next
+    }
+}
+template <typename F>
+void for_each_heap(F&& f) {
+    if (kMemRootList == 0) return;
+    int seen = 0;
+    walk_heaps(kMemRootList, 0, seen, f);
+}
+
+uint32_t heap_containing(uint32_t addr) {
+    uint32_t best = 0, bestSize = ~0u;
+    for_each_heap([&](uint32_t h, int) {
+        const uint32_t s = guest_read32(h + 0x18), e = guest_read32(h + 0x1C);
+        if (addr >= s && addr < e && e - s < bestSize) { best = h; bestSize = e - s; }
+    });
+    return best;
+}
+
+const char* heap_kind(uint32_t magic) {
+    return magic == kExpMagic ? "expandible" : magic == kFrmMagic ? "de cuadro" : "por unidades";
+}
+
+}  // namespace choya_medida
+#if defined(CHOYA_CON_SIMBOLOS)
+extern "C" {
+extern const uint32_t kGuestMapSymbolCount;
+extern const uint32_t kGuestMapSymbolAddresses[];
+extern const char* const kGuestMapSymbolNames[];
+}
+#endif
+namespace choya_medida {
+
+// Nombre de una dirección del juego con la tabla de símbolos del runtime (la misma de los informes de cierre).
+std::string guest_name(uint32_t a) {
+    char buf[160];
+#if defined(CHOYA_CON_SIMBOLOS)
+    if (kGuestMapSymbolCount != 0) {
+        uint32_t lo = 0, hi = kGuestMapSymbolCount;
+        while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2;
+            if (kGuestMapSymbolAddresses[mid] <= a) lo = mid + 1; else hi = mid;
+        }
+        if (lo > 0 && a - kGuestMapSymbolAddresses[lo - 1] < 0x10000u) {
+            std::snprintf(buf, sizeof(buf), "%08X <%s+0x%X>", a, kGuestMapSymbolNames[lo - 1],
+                          a - kGuestMapSymbolAddresses[lo - 1]);
+            return buf;
+        }
+    }
+#endif
+    std::snprintf(buf, sizeof(buf), "%08X", a);
+    return buf;
+}
+
+// Quién pidió: LR y la cadena de marcos desde r1 (hasta 8).
+std::string guest_callers(const uint32_t* c) {
+    std::string out = guest_name(c[33]);
+    uint32_t sp = c[1];
+    for (int n = 0; n < 8 && guest_range(sp, 8) && (sp & 7) == 0; ++n) {
+        const uint32_t prev = guest_read32(sp);
+        if (!guest_range(prev, 8) || prev <= sp || prev - sp > 0x20000u) break;
+        const uint32_t lr = guest_read32(prev + 4);
+        if (lr < 0x80000000u || lr >= 0x81800000u) break;
+        out += " ← " + guest_name(lr);
+        sp = prev;
+    }
+    return out;
+}
+
+void show_tree(const char* why) {
+    std::fprintf(stderr, "[choya] montones del juego (%s):\n", why);
+    for_each_heap([](uint32_t h, int depth) {
+        const HeapStat st = heap_stat(h);
+        uint32_t lent = 0;
+        for (const Loan& l : g_loans) if (l.lender == h) lent += l.size;
+        std::fprintf(stderr, "[choya]   %*s0x%08X %s %u KB: libre %u KB en %u bloques, el mayor %u KB%s",
+                     depth * 2, "", h, heap_kind(st.magic), (st.end - st.start) >> 10, st.free >> 10, st.blocks,
+                     st.largest >> 10, lent ? "" : "\n");
+        if (lent) std::fprintf(stderr, "; prestó %u KB\n", lent >> 10);
+    });
+    if (kEggAllocatable != 0 && guest_range(kEggAllocatable, 4) && guest_read32(kEggAllocatable) != 0) {
+        std::fprintf(stderr, "[choya]   EGG solo deja asignar del montón EGG 0x%08X\n", guest_read32(kEggAllocatable));
+    }
+    std::fflush(stderr);
+}
+
+// Otro montón expandible que tenga el bloque (con 2 MB de sobra después), el de bloque libre más grande.
+uint32_t pick_lender(uint32_t owner, uint32_t size, int32_t align) {
+    uint32_t best = 0, bestLargest = 0;
+    for_each_heap([&](uint32_t h, int) {
+        if (h == owner || guest_read32(h) != kExpMagic) return;
+        // Ni un montón dentro del que se quedó sin espacio: el bloque caería en su zona y, al devolverlo con
+        // MEMFreeToExpHeap(owner, ...), no se notaría que es prestado.
+        const uint32_t os = guest_read32(owner + 0x18), oe = guest_read32(owner + 0x1C);
+        if (guest_read32(h + 0x18) >= os && guest_read32(h + 0x1C) <= oe) return;
+        bool fits = false;
+        const HeapStat st = heap_stat(h, size, align, &fits);
+        if (!fits || st.largest < size + kLendKeep) return;
+        if (st.largest > bestLargest) { best = h; bestLargest = st.largest; }
+    });
+    return best;
+}
+
+void note(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+void note(const char* fmt, ...) {
+    if (g_notes >= kMaxNotes) return;
+    if (++g_notes == kMaxNotes) {
+        std::fprintf(stderr, "[choya] memoria del juego: ya no anoto más avisos\n");
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    std::fputs("[choya] memoria del juego: ", stderr);
+    std::vfprintf(stderr, fmt, ap);
+    std::fputc('\n', stderr);
+    va_end(ap);
+    std::fflush(stderr);
+}
+
+void watch_alloc(uint32_t* c, bool frame) {
+    const uint32_t heap = c[3], size = c[4];
+    const int32_t align = static_cast<int32_t>(c[5]);
+    if (size < kWatchMin) return;
+    bool fits = false;
+    const HeapStat st = heap_stat(heap, size, align, &fits);
+    if (!st.ok || fits) return;
+    if (g_lendMode < 0) {
+        const char* v = std::getenv("CHOYA_PRESTAMOS");
+        g_lendMode = (v != nullptr && std::strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    const std::string who = guest_callers(c);
+    uint32_t lender = 0;
+    if (!frame && g_lendMode == 1 && g_lent + size <= kLendBudget) lender = pick_lender(heap, size, align);
+    note("no cabe un bloque de %u KB en el montón %s 0x%08X (%u KB, libre %u KB en %u bloques, el mayor %u KB)%s; "
+         "lo pidió %s",
+         (size + 1023) >> 10, heap_kind(st.magic), heap, (st.end - st.start) >> 10, st.free >> 10, st.blocks,
+         st.largest >> 10,
+         lender ? "; se lo presta otro montón" : (frame ? "" : g_lendMode == 0 ? " (préstamos apagados)"
+                                                            : " y ningún otro montón tiene el espacio"),
+         who.c_str());
+    if (!g_treeShown) {
+        g_treeShown = true;
+        show_tree("la primera vez que no cupo un bloque");
+    }
+    if (lender != 0) {
+        c[3] = lender;  // MEMAllocFromExpHeapEx(lender, size, align): un bloque normal de ese montón
+        g_lent += size;
+        g_loans.push_back({0, size, heap, lender});
+    }
+}
+
+// El bloque prestado vuelve a su montón: MEMFreeToExpHeap / MEMResizeForMBlockExpHeap(heap, block, ...).
+void redirect_free(uint32_t* c) {
+    if (g_loans.empty()) return;
+    const uint32_t heap = c[3], block = c[4];
+    if (!heap_ok(heap)) return;
+    if (block >= guest_read32(heap + 0x18) && block < guest_read32(heap + 0x1C)) return;  // es de ese montón
+    const uint32_t real = heap_containing(block);
+    if (real == 0 || guest_read32(real) != kExpMagic) return;
+    c[3] = real;
+    for (auto it = g_loans.begin(); it != g_loans.end(); ++it) {
+        if (it->lender == real && it->owner == heap) {
+            g_lent -= std::min(g_lent, it->size);
+            g_loans.erase(it);
+            break;
+        }
+    }
+}
+
+void watch_egg_alloc(const uint32_t* c) {
+    if (kEggAllocatable == 0 || !guest_range(kEggAllocatable, 4)) return;
+    const uint32_t only = guest_read32(kEggAllocatable);
+    if (only == 0) return;
+    uint32_t heap = c[5];
+    if (heap == 0 && kEggCurrent != 0 && guest_range(kEggCurrent, 4)) heap = guest_read32(kEggCurrent);
+    if (heap == only) return;
+    const std::string who = guest_callers(c);
+    note("EGG no deja asignar %u bytes del montón EGG 0x%08X (solo del 0x%08X: disableAllocationAllBut); lo pidió %s",
+         c[3], heap, only, who.c_str());
+}
+
+}  // namespace choya_medida
+
+extern "C" void choya_vigila_memoria(uint32_t target, void* ctx) {
+    using namespace choya_medida;
+    if (ctx == nullptr || CHOYA_GUEST_BASE == 0 || !CHOYA_GUEST_ACTIVE()) return;
+    auto* c = static_cast<uint32_t*>(ctx);
+    if (target == kMemAllocExp) watch_alloc(c, false);
+    else if (target == kMemAllocFrm) watch_alloc(c, true);
+    else if (target == kMemFreeExp || target == kMemResizeExp) redirect_free(c);
+    else if (target == kEggHeapAlloc) watch_egg_alloc(c);
+}
+
+extern "C" void choya_informe_memoria(uint32_t target, const void* ctx) {
+    using namespace choya_medida;
+    if (CHOYA_GUEST_BASE == 0 || !CHOYA_GUEST_ACTIVE()) return;
+    if (target == 0 && ctx != nullptr) {
+        const auto* c = static_cast<const uint32_t*>(ctx);
+        std::fprintf(stderr, "[choya] el juego saltó a 0 desde %s (r3=0x%08X: un objeto nulo, casi siempre un bloque que "
+                     "no cupo)\n", guest_callers(c).c_str(), c[3]);
+    }
+    std::fprintf(stderr, "[choya] memoria del juego: %zu bloques prestados (%u KB)\n", g_loans.size(), g_lent >> 10);
+    show_tree("al cerrarse");
+}
+
+namespace choya_medida {
+
 extern "C" int choya_medir_empezar(int seconds) {
     bool expected = false;
     if (!g_busy.compare_exchange_strong(expected, true)) return 0;  // ya está midiendo
@@ -600,4 +920,6 @@ extern "C" int choya_medir_empezar(int seconds) {
 extern "C" void choya_medir_llamada(uint32_t, const void*) {}
 extern "C" int choya_medir_empezar(int) { return 0; }
 extern "C" bool choya_sin_efectos(void*) { return false; }
+extern "C" void choya_vigila_memoria(uint32_t, void*) {}
+extern "C" void choya_informe_memoria(uint32_t, const void*) {}
 #endif

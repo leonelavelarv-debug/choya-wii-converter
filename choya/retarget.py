@@ -686,6 +686,15 @@ def _sym(name: str, off: int = 0):
 
 _H = r"(?P<v>[0-9A-Fa-f]{8})"
 
+# Memoria del juego: (marca, valor provisional, qué es). PATCHES cambia cada valor por la dirección en Wii Sports.
+_VIGILA_MEMORIA = [
+    ("choya-mem-exp", 0xC0DE0001, "MEMAllocFromExpHeapEx"),
+    ("choya-mem-frm", 0xC0DE0002, "MEMAllocFromFrmHeapEx"),
+    ("choya-mem-libera", 0xC0DE0003, "MEMFreeToExpHeap"),
+    ("choya-mem-cambia", 0xC0DE0004, "MEMResizeForMBlockExpHeap"),
+    ("choya-egg-alloc", 0xC0DE0005, "alloc__Q23EGG4HeapFUliPQ23EGG4Heap"),
+]
+
 # Revisados uno por uno contra ogws. Si WiiCompiled cambia y un patrón ya no aparece, se anota
 # como "parche no aplicado" en vez de adivinar.
 PATCHES = [
@@ -736,6 +745,9 @@ PATCHES = [
     Patch("src/hle/sc.cpp", r"LookupProductRegion\(0x(?P<v>8047FAB0)u, 4, 4",
           lambda ws, g: g.find(b"\x00JP\x00\x01US\x00\x02EU\x00"), "tabla de regiones de SC",
           optional=True),   # SCGetProductGameRegion no existe en el SDK de Wii Sports
+    # Memoria del juego (choya_perfil.cpp): las funciones de los montones que avisan al llamarse.
+    *[Patch("include/abi_bridge.h", r"target == 0x(?P<v>[0-9A-Fa-f]{8})u /\*" + k + r"\*/", _sym(w),
+            "aviso de memoria: " + w) for k, _v, w in _VIGILA_MEMORIA],
     # Wii Sports no tiene btm_cb con ese nombre; con 0 la escritura cae fuera de la memoria y se ignora.
     Patch("src/hle/os/os_init.cpp", r"kBtmCbBase\s*=\s*0x" + _H, lambda ws, g: 0, "sin btm_cb: escritura omitida"),
 ]
@@ -907,8 +919,13 @@ EDITS = [
      'extern "C" void choya_medir_llamada(uint32_t target, const void* ctx);\n'
      'extern "C" uint32_t g_choyaSinEfectos;  // choya: CHOYA_SIN_REVERB (choya_perfil.cpp)\n'
      'extern "C" bool choya_sin_efectos(void* ctx);\n'
+     'extern "C" void choya_vigila_memoria(uint32_t target, void* ctx);\n'
      "inline void ApplyRuntimeCallOptions(uint32_t target, CpuContext* ctx) {\n"
-     "    if (__builtin_expect(g_choyaMidiendo, 0)) choya_medir_llamada(target, ctx);  // choya\n",
+     "    if (__builtin_expect(g_choyaMidiendo, 0)) choya_medir_llamada(target, ctx);  // choya\n"
+     # Memoria del juego (choya_perfil.cpp): las direcciones las escribe un parche (PATCHES); en las llamadas
+     # directas la comparación es con dos constantes y se resuelve al compilar.
+     + "".join(f"    if (__builtin_expect(target == 0x{v:08X}u /*{k}*/, 0)) choya_vigila_memoria(target, ctx);"
+               f"  // choya: {w}\n" for k, v, w in _VIGILA_MEMORIA),
      "medición por tramos (llamadas)"),
     # CHOYA_SIN_REVERB=1: la llamada indirecta a los efectos de audio de nw4r (AuxCallbackFunc) no se hace; los búferes
     # del bus auxiliar quedan en cero (sin reverberación). Sin la variable, la comparación nunca es cierta.
@@ -920,6 +937,13 @@ EDITS = [
      "    if (TryDispatchRawCpuTarget(TranslatedFunctionRegistry::FindRawByAddressPtr(target), cpu)) {\n"
      "        return;\n    }\n    if (TryDispatchResolvedCpuTarget(TranslatedFunctionRegistry::FindByAddressPtr(target), cpu)) {\n",
      "sin efectos de audio (CHOYA_SIN_REVERB)"),
+    ("include/abi_bridge.h", "    RuntimeCrash::FatalMissingGuestTarget(target, cpu);\n}",
+     '    choya_informe_memoria(target, cpu);  // choya: montones del juego al cerrarse (choya_perfil.cpp)\n'
+     "    RuntimeCrash::FatalMissingGuestTarget(target, cpu);\n}", "montones del juego al cerrarse"),
+    ("include/abi_bridge.h", "[[noreturn]] inline void ReportMissingCpuTarget(uint32_t target, CpuContext* cpu) {\n",
+     'extern "C" void choya_informe_memoria(uint32_t target, const void* ctx);  // choya (choya_perfil.cpp)\n'
+     "[[noreturn]] inline void ReportMissingCpuTarget(uint32_t target, CpuContext* cpu) {\n",
+     "montones del juego al cerrarse"),
     ("include/keybinds.h", "    kMinus,\n    kActionCount,",
      "    kMinus,\n    kButtonB," + _B_NOTE + "\n    kActionCount,", "tecla para el botón B"),
     ("src/keybinds.cpp", '{"minus", "- (Minus)", {SDL_SCANCODE_MINUS, SDL_SCANCODE_TAB}},',
@@ -1504,7 +1528,10 @@ def perfil_marcas(src: str, ws: Symbols) -> str:
         src = src.replace(f"0x0u /*{addr_tag}*/", f"0x{addr:08X}u /*{addr_tag}*/")
         src = src.replace(f"0x0u /*{size_tag}*/", f"0x{size:X}u /*{size_tag}*/")
     aux = ws.funcs.get(AUX_CALLBACK, 0)
-    return src.replace("0x0u /*CHOYA_DIR_AUX*/", f"0x{aux:08X}u /*CHOYA_DIR_AUX*/")
+    src = src.replace("0x0u /*CHOYA_DIR_AUX*/", f"0x{aux:08X}u /*CHOYA_DIR_AUX*/")
+    # Cualquier otro símbolo: 0x0u /*CHOYA_SYM:nombre*/ (0 si Wii Sports no lo tiene: esa parte no hace nada).
+    return re.sub(r"0x0u /\*CHOYA_SYM:([^*]+)\*/",
+                  lambda m: f"0x{ws.get(m.group(1)) or 0:08X}u /*CHOYA_SYM:{m.group(1)}*/", src)
 
 
 def choya_natives(ws: Symbols, registered: dict[int, str], changes: list[Change]) -> str:

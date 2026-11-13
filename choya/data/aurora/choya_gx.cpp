@@ -255,7 +255,8 @@ bool enabled() noexcept {
     core::set_logger(log_to_runtime);
     if (choya_gles_wake != nullptr) core::set_wake(choya_gles_wake);
     // Los volcados llevan las texturas: hay que guardarlas desde que se crean.
-    // CHOYA_GX_GUARDAR_TEXTURAS=1 (archivo "volcados" junto al juego): MENU + R1 también lleva texturas al jugar.
+    // CHOYA_GX_GUARDAR_TEXTURAS=1 (el lanzador lo pone siempre; archivo "volcados-sin-texturas" lo apaga): MENU + R1
+    // también lleva texturas al jugar.
     const char* dumps = std::getenv("CHOYA_GX_VOLCADO");
     const char* keep = std::getenv("CHOYA_GX_GUARDAR_TEXTURAS");
     core::set_keep_textures((dumps != nullptr && *dumps != '\0') || (keep != nullptr && std::strcmp(keep, "1") == 0));
