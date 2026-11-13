@@ -44,6 +44,9 @@ void capture_pass(uint32_t width, uint32_t height, bool clearColor, bool clearDe
                   float clearDepthValue, bool isDisplayCopy, const gfx::ClipRect& copyRect) noexcept;
 // Copia del EFB a una textura (GXCopyTex) al terminar el pase: rect es la zona del EFB, fmt el formato de la copia.
 void capture_copy(const gfx::TextureRef* tex, const gfx::ClipRect& rect, uint32_t fmt, bool opaque) noexcept;
+// Paleta sobre una copia del EFB (tex_palette_conv): variant 0 directo, 1 R*255 (C8), 2 R*15 (C4).
+void capture_palette_conv(int variant, const gfx::TextureRef* src, const gfx::TextureRef* dst,
+                          const gfx::TextureRef* tlut) noexcept;
 void capture_viewport(const gfx::Viewport& vp) noexcept;
 void capture_scissor(const gfx::ClipRect& rect) noexcept;
 void capture_gx_draw(const gx::DrawData& draw) noexcept;

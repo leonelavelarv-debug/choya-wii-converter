@@ -1122,6 +1122,10 @@ AURORA_EDITS = [
       choya::capture_begin(g_verts.data(), g_verts.size(), g_uniforms.data(), g_uniforms.size(), g_indices.data(),
                            g_indices.size(), g_storage.data(), g_storage.size());
       for (const auto& pass : g_renderPasses) {
+        // Paletas sobre copias del EFB (C4/C8 + TLUT): aurora las aplica antes del pase (tex_palette_conv).
+        for (const auto& conv : pass.paletteConvs) {
+          choya::capture_palette_conv(static_cast<int>(conv.variant), conv.src.get(), conv.dst.get(), conv.tlut.get());
+        }
         const float rgba[4] = {pass.clearColorValue.x(), pass.clearColorValue.y(), pass.clearColorValue.z(),
                                pass.clearColorValue.w()};
         // La copia a pantalla (GXCopyDisp) termina el pase cuyo destino es la textura de la copia de pantalla.
@@ -1279,11 +1283,19 @@ AURORA_FILES = [("choya_gx.hpp", "lib/choya/choya_gx.hpp"), ("choya_gx.cpp", "li
                 ("choya_gx_core.hpp", "lib/choya/choya_gx_core.hpp"), ("choya_gx_core.cpp", "lib/choya/choya_gx_core.cpp")]
 
 
+_CONV_CAPTURE = (
+    "        // Paletas sobre copias del EFB (C4/C8 + TLUT): aurora las aplica antes del pase (tex_palette_conv).\n"
+    "        for (const auto& conv : pass.paletteConvs) {\n"
+    "          choya::capture_palette_conv(static_cast<int>(conv.variant), conv.src.get(), conv.dst.get(), conv.tlut.get());\n"
+    "        }\n")
+
+
 def _capture_payloads() -> list[str]:
     """Bloques de copia del cuadro que han insertado las versiones de Choya en common.cpp (actual y anteriores)."""
     edit = next(e for e in AURORA_EDITS if e[3] == "motor de Choya (copia del cuadro)")
     current = edit[2][len(edit[1]):]
-    v0150 = current.replace(
+    v0204 = current.replace(_CONV_CAPTURE, "")  # antes de las paletas sobre copias del EFB (0.20.5)
+    v0150 = v0204.replace(
         "    if (true) {  // choya: también los lotes partidos (staging lleno), que se dibujan sin mostrarse\n",
         "    if (advanceFrame) {\n").replace("      choya::capture_end(advanceFrame);\n", "      choya::capture_end();\n")
     v0123 = v0150.replace(
@@ -1301,8 +1313,8 @@ def _capture_payloads() -> list[str]:
         "                            pass.clearDepthValue, displayCopy);\n",
         "        choya::capture_pass(pass.targetSize.width, pass.targetSize.height, pass.clearColor, pass.clearDepth, rgba,\n"
         "                            pass.clearDepthValue);\n")
-    assert len({v0120, v0122, v0123, v0150, current}) == 5
-    return [current, v0150, v0123, v0122, v0120]
+    assert len({v0120, v0122, v0123, v0150, v0204, current}) == 6
+    return [current, v0204, v0150, v0123, v0122, v0120]
 
 
 # Lo que versiones anteriores de Choya insertaron en aurora: se quita antes de aplicar los cambios actuales, para

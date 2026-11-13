@@ -115,6 +115,11 @@ class TestMotorGles(unittest.TestCase):
                 out = subprocess.run([exe, "borrado"], env=dict(env, **extra), capture_output=True, text=True)
                 self.assertIn("borrado 0000FF 000000", out.stdout, (extra, out.stdout + out.stderr))
 
+            # Paleta sobre una copia del EFB (C8 con R*255 y C4 con R*15): la entrada 3 es magenta y la 5 cian.
+            for variant, color in ((1, "FF00FF"), (2, "00FFFF")):
+                out = subprocess.run([exe, "paleta", str(variant)], env=env, capture_output=True, text=True)
+                self.assertIn(f"paleta {color} {color}", out.stdout, out.stdout + out.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

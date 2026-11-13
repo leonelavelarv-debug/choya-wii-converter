@@ -320,6 +320,14 @@ void capture_copy(const gfx::TextureRef* tex, const gfx::ClipRect& rect, uint32_
                      tex->size.width, tex->size.height, fmt, opaque);
 }
 
+void capture_palette_conv(int variant, const gfx::TextureRef* src, const gfx::TextureRef* dst,
+                          const gfx::TextureRef* tlut) noexcept {
+  if (src == nullptr || dst == nullptr || tlut == nullptr) return;
+  core::capture_palette_conv(reinterpret_cast<uintptr_t>(src), reinterpret_cast<uintptr_t>(dst),
+                             reinterpret_cast<uintptr_t>(tlut), static_cast<uint32_t>(variant), dst->size.width,
+                             dst->size.height);
+}
+
 void capture_viewport(const gfx::Viewport& vp) noexcept {
   core::capture_viewport(core::Viewport{vp.left, vp.top, vp.width, vp.height, vp.znear, vp.zfar});
 }

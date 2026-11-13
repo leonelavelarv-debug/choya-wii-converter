@@ -277,7 +277,7 @@ bool load_gl() {
 }
 
 // --- Cuadro capturado -----------------------------------------------------------------------------------------
-enum class Op : uint8_t { Pass, Viewport, Scissor, Draw, Clear, Copy };
+enum class Op : uint8_t { Pass, Viewport, Scissor, Draw, Clear, Copy, PaletteConv };
 struct Item {
   Op op;
   uint8_t pad[7];
@@ -310,6 +310,11 @@ struct Item {
       uint32_t texW, texH, fmt;
       uint8_t opaque, pad[3];
     } copy;
+    // Paleta sobre una copia del EFB, antes del pase (ver capture_palette_conv).
+    struct {
+      uint64_t src, dst, tlut;
+      uint32_t variant, dstW, dstH;
+    } conv;
   };
 };
 static_assert(sizeof(Item) == 56);
@@ -346,7 +351,7 @@ struct Stats {
   uint64_t frames = 0, draws = 0, clears = 0, skippedLine = 0, skippedConfig = 0, skippedAlign = 0,
            skippedProgram = 0, passes = 0;
   uint64_t bytesVerts = 0, bytesUniforms = 0, bytesIndices = 0, bytesStorage = 0;
-  uint64_t texUploads = 0, missingTextures = 0, copies = 0;
+  uint64_t texUploads = 0, missingTextures = 0, copies = 0, paletteConvs = 0, paletteMissing = 0;
   uint64_t interval = 0;  // cuadros desde el último informe
   double cpuMs = 0, gpuWaitMs = 0;
   // Como el backend de galaxy-vita: estado GL que no cambió (no se llama a GL), dibujos que no pintan nada, programas.
@@ -454,6 +459,7 @@ struct CopyTexture {
   uint32_t width = 0, height = 0;
 };
 std::unordered_map<uint64_t, CopyTexture> g_copyTextures;  // solo en el hilo del motor
+std::unordered_map<uint64_t, CopyTexture> g_convTextures;  // paletas sobre copias del EFB (también con su framebuffer)
 GLuint g_whiteTexture = 0;
 std::atomic<uint64_t> g_bindGen{1};  // sube cuando register_bind_group cambia un grupo ya visto
 uint64_t g_texGen = 1;  // sube cuando cambia un nombre GL de textura (subidas nuevas, copias, borrados)
@@ -1643,6 +1649,13 @@ void process_textures() {
       g_copyTextures.erase(c);
       ++g_texGen;
     }
+    auto v = g_convTextures.find(id);
+    if (v != g_convTextures.end()) {
+      gl.DeleteFramebuffers(1, &v->second.fbo);
+      gl.DeleteTextures(1, &v->second.tex);
+      g_convTextures.erase(v);
+      ++g_texGen;
+    }
   }
   if (pending.empty()) return;
   gl.ActiveTexture(kTexture0 + 2);
@@ -1754,6 +1767,8 @@ const ResolvedBind& resolve_bind(uint64_t bindGroup) {
         tex = it->second.id;
       } else if (auto c = g_copyTextures.find(bd.tex[i]); c != g_copyTextures.end()) {
         tex = c->second.tex;  // copia del EFB
+      } else if (auto v = g_convTextures.find(bd.tex[i]); v != g_convTextures.end()) {
+        tex = v->second.tex;  // paleta aplicada a una copia del EFB
       } else {
         ++g_stats.missingTextures;  // paleta, o una copia que todavía no se hace
         log_missing_texture(bd.tex[i]);
@@ -2139,6 +2154,128 @@ void run_copy(const Item& it) {
   ++g_stats.copies;
 }
 
+// --- Paletas sobre copias del EFB (C4/C8 + TLUT) ----------------------------------------------------------------
+// Como tex_palette_conv de aurora: el juego copia el EFB con un formato de intensidad o de un canal (I8, R8, R4...) y
+// luego carga esa memoria como C4/C8 con una paleta. Cada texel del destino toma el índice del canal R de la copia
+// (R*255 en C8, R*15 en C4) y lo busca en la paleta (textura de N x 1 que aurora ya decodificó a RGBA8).
+const char* kPaletteFs = R"(#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D u_src;
+uniform sampler2D u_tlut;
+uniform vec4 u_size;  // ancho y alto de la copia, ancho y alto del destino
+uniform vec4 u_mode;  // escala del índice (255 o 15), entradas de la paleta
+out vec4 o_color;
+void main() {
+  ivec2 c = ivec2(floor(gl_FragCoord.xy / u_size.zw * u_size.xy));
+  c = clamp(c, ivec2(0), ivec2(u_size.xy) - 1);
+  float r = texelFetch(u_src, c, 0).r;
+  int idx = clamp(int(r * u_mode.x + 0.5), 0, int(u_mode.y) - 1);
+  o_color = texelFetch(u_tlut, ivec2(idx, 0), 0);
+}
+)";
+struct PaletteProgram {
+  GLuint id = 0;
+  GLint size = -1, mode = -1;
+  bool tried = false;
+} g_paletteProgram;
+
+bool palette_program() {
+  if (g_paletteProgram.tried) return g_paletteProgram.id != 0;
+  g_paletteProgram.tried = true;
+  std::string err;
+  const GLuint v = compile(kVertexShader, kCopyVs, err);
+  const GLuint f = v ? compile(kFragmentShader, kPaletteFs, err) : 0;
+  if (v && f) {
+    const GLuint prog = gl.CreateProgram();
+    gl.AttachShader(prog, v);
+    gl.AttachShader(prog, f);
+    gl.LinkProgram(prog);
+    GLint ok = 0;
+    gl.GetProgramiv(prog, kLinkStatus, &ok);
+    if (ok) {
+      g_paletteProgram.id = prog;
+      gl.UseProgram(prog);
+      gl.Uniform1i(gl.GetUniformLocation(prog, "u_src"), 10);
+      gl.Uniform1i(gl.GetUniformLocation(prog, "u_tlut"), 11);
+      g_paletteProgram.size = gl.GetUniformLocation(prog, "u_size");
+      g_paletteProgram.mode = gl.GetUniformLocation(prog, "u_mode");
+    } else {
+      GLint len = 0;
+      gl.GetProgramiv(prog, kInfoLogLength, &len);
+      err.assign(static_cast<size_t>(len > 1 ? len : 1), '\0');
+      gl.GetProgramInfoLog(prog, len, nullptr, err.data());
+    }
+  }
+  if (v) gl.DeleteShader(v);
+  if (f) gl.DeleteShader(f);
+  if (g_paletteProgram.id == 0) log_line("motor: no compila el programa de paletas: %s", err.c_str());
+  return g_paletteProgram.id != 0;
+}
+
+// Aplica la paleta; deja enlazado el framebuffer del EFB (el que llama repone el estado, como tras una copia).
+void run_palette_conv(const Item& it) {
+  const auto& c = it.conv;
+  static bool loggedDirect = false, loggedMissing = false;
+  if (c.variant == 0) {  // índices enteros (R16Sint): aurora los usa solo con las paletas que convierte en la CPU
+    if (!loggedDirect) log_line("motor: paleta directa (índices enteros) sin hacer");
+    loggedDirect = true;
+    return;
+  }
+  const auto src = g_copyTextures.find(c.src);
+  const auto tlut = g_textures.find(c.tlut);
+  if (src == g_copyTextures.end() || tlut == g_textures.end() || src->second.tex == 0) {
+    ++g_stats.paletteMissing;
+    if (!loggedMissing) {
+      log_line("motor: paleta sin %s todavía (se reintenta cuando llegue)",
+               src == g_copyTextures.end() ? "la copia del EFB" : "la paleta (TLUT)");
+      loggedMissing = true;
+    }
+    return;
+  }
+  const uint32_t w = c.dstW ? c.dstW : src->second.width, h = c.dstH ? c.dstH : src->second.height;
+  if (w == 0 || h == 0 || w > 4096 || h > 4096 || !palette_program()) return;
+  CopyTexture& dt = g_convTextures[c.dst];
+  if (dt.tex == 0 || dt.width != w || dt.height != h) {
+    if (dt.fbo != 0) gl.DeleteFramebuffers(1, &dt.fbo);
+    if (dt.tex != 0) gl.DeleteTextures(1, &dt.tex);
+    gl.ActiveTexture(kTexture0 + 10);
+    gl.GenTextures(1, &dt.tex);
+    ++g_texGen;
+    gl.BindTexture(kTexture2D, dt.tex);
+    gl.TexStorage2D(kTexture2D, 1, kRgba8, static_cast<GLsizei>(w), static_cast<GLsizei>(h));
+    gl.GenFramebuffers(1, &dt.fbo);
+    gl.BindFramebuffer(kFramebuffer, dt.fbo);
+    gl.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, dt.tex, 0);
+    dt.width = w;
+    dt.height = h;
+  }
+  gl.BindFramebuffer(kFramebuffer, dt.fbo);
+  gl.Viewport(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h));
+  gl.Disable(kScissorTest);
+  gl.Disable(kDepthTest);
+  gl.Disable(kBlend);
+  gl.Disable(kCullFace);
+  gl.ColorMask(1, 1, 1, 1);
+  gl.UseProgram(g_paletteProgram.id);
+  gl.Uniform4f(g_paletteProgram.size, static_cast<float>(src->second.width), static_cast<float>(src->second.height),
+               static_cast<float>(w), static_cast<float>(h));
+  gl.Uniform4f(g_paletteProgram.mode, c.variant == 2 ? 15.f : 255.f, static_cast<float>(tlut->second.width), 0.f, 0.f);
+  gl.ActiveTexture(kTexture0 + 10);
+  gl.BindTexture(kTexture2D, src->second.tex);
+  gl.BindSampler(10, 0);
+  gl.ActiveTexture(kTexture0 + 11);
+  gl.BindTexture(kTexture2D, tlut->second.id);
+  gl.BindSampler(11, 0);
+  gl.DrawArrays(kTriangles, 0, 3);
+  gl.BindTexture(kTexture2D, 0);
+  gl.ActiveTexture(kTexture0 + 10);
+  gl.BindTexture(kTexture2D, 0);
+  gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+  gl.Enable(kScissorTest);
+  ++g_stats.paletteConvs;
+}
+
 bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present);
 
 } // namespace
@@ -2464,6 +2601,20 @@ void capture_copy(uint64_t texId, const Rect& rect, uint32_t texW, uint32_t texH
   g_recording.items.push_back(it);
 }
 
+void capture_palette_conv(uint64_t src, uint64_t dst, uint64_t tlut, uint32_t variant, uint32_t dstW,
+                          uint32_t dstH) noexcept {
+  if (!g_recordingActive) return;
+  Item it{};
+  it.op = Op::PaletteConv;
+  it.conv.src = src;
+  it.conv.dst = dst;
+  it.conv.tlut = tlut;
+  it.conv.variant = variant;
+  it.conv.dstW = dstW;
+  it.conv.dstH = dstH;
+  g_recording.items.push_back(it);
+}
+
 void capture_viewport(const Viewport& vp) noexcept {
   if (!g_recordingActive) return;
   Item it{};
@@ -2529,6 +2680,7 @@ void capture_end(bool present) noexcept {
   for (const Frame& f : g.frames) {
     for (const Item& it : f.items) {
       if (it.op == Op::Copy) g.copies.push_back(it.copy.tex);
+      if (it.op == Op::PaletteConv) g.copies.push_back(it.conv.dst);  // aurora no la repite si la copia no cambió
     }
   }
   std::sort(g.copies.begin(), g.copies.end());
@@ -3126,6 +3278,17 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       gl.BindVertexArray(g_vao);
       lastBindGroup = ~0ull;  // las texturas de copia pudieron rehacerse
     } break;
+    case Op::PaletteConv: {
+      mali_mark(kMaliDibujos);
+      run_palette_conv(it);
+      mali_mark(kMaliCopias);
+      shadow_invalidate();  // usó su propio programa, estado y unidades 10/11
+      set_viewport(viewportRect);
+      set_enable(kScissorTest, S.scissorOn, true);
+      set_scissor(scissorRect);
+      gl.BindVertexArray(g_vao);
+      lastBindGroup = ~0ull;  // la textura con paleta pudo rehacerse
+    } break;
     case Op::Clear: {
       ClearDesc cc;
       if (!find_clear(it.clear.pipeline, cc)) {
@@ -3266,10 +3429,11 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
                  msf(a[5]), static_cast<double>(a[7]) / c, static_cast<double>(a[8]) / c / 1024, msf(a[6]));
       }
     }
-    log_line("motor: texturas: %zu en GL, %llu subidas, %zu copias del EFB (%.1f por cuadro), %llu enlaces sin textura "
-             "(paletas u otras)",
+    log_line("motor: texturas: %zu en GL, %llu subidas, %zu copias del EFB (%.1f por cuadro), %llu enlaces sin textura; "
+             "paletas sobre copias: %zu texturas, %.1f por cuadro, %llu sin copia o sin paleta todavía",
              g_textures.size(), static_cast<unsigned long long>(g_stats.texUploads), g_copyTextures.size(),
-             g_stats.copies / n, static_cast<unsigned long long>(g_stats.missingTextures));
+             g_stats.copies / n, static_cast<unsigned long long>(g_stats.missingTextures), g_convTextures.size(),
+             g_stats.paletteConvs / n, static_cast<unsigned long long>(g_stats.paletteMissing));
     log_line("motor: %llu cuadros, por cuadro: %.1f dibujos, %.1f borrados, %.1f pases; saltados: %llu sin config, "
          "%llu líneas/puntos, %llu alineación, %llu sin programa; programas %zu; error GL 0x%04X",
          static_cast<unsigned long long>(g_stats.frames), g_stats.draws / n, g_stats.clears / n,

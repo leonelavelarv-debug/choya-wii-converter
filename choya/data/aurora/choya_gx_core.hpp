@@ -120,6 +120,10 @@ void capture_pass(uint32_t width, uint32_t height, bool clearColor, bool clearDe
 // Copia del EFB a una textura (GXCopyTex) al terminar el pase actual: la zona rect (coordenadas del pase) va a la
 // textura texId (texW x texH) convertida al formato fmt (GXTexFmt); opaque pone el alfa a 1.
 void capture_copy(uint64_t texId, const Rect& rect, uint32_t texW, uint32_t texH, uint32_t fmt, bool opaque) noexcept;
+// Paleta sobre una copia del EFB (C4/C8 + TLUT; tex_palette_conv de aurora), antes del pase que la usa: cada texel
+// de dst = tlut[índice leído del canal R de src]. variant: 0 directo (índices enteros, no se usa), 1 R*255, 2 R*15.
+void capture_palette_conv(uint64_t src, uint64_t dst, uint64_t tlut, uint32_t variant, uint32_t dstW,
+                          uint32_t dstH) noexcept;
 void capture_viewport(const Viewport& vp) noexcept;
 void capture_scissor(const Rect& rect) noexcept;
 void capture_draw(uint64_t pipeline, uint32_t idxOffset, uint32_t indexCount, uint32_t instanceCount,

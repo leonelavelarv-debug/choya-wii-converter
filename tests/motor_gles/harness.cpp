@@ -139,6 +139,55 @@ static int packed(int argc, char** argv) {
   return 0;
 }
 
+// harness paleta 1|2: el EFB se borra a un gris cuyo R es el índice (3 de 255 en C8, 5 de 15 en C4), se copia como R8
+// (GXCopyTex 0x28), se le aplica una paleta de 16 colores (tex_palette_conv de aurora) y se dibuja a pantalla
+// completa: el color tiene que ser la entrada de la paleta (3: magenta, 5: cian).
+static int palette_test(int variant) {
+  gx::PipelineDesc p4 = base_desc();
+  p4.vtxStride = 20;
+  p4.attrs[GX_VA_POS] = {GX_DIRECT, 3, GX_F32, 0, 0, 0, 0, 0};
+  p4.attrs[GX_VA_TEX0] = {GX_DIRECT, 2, GX_F32, 12, 0, 0, 0, 0};
+  p4.sampledChannels = 0; p4.offChanMat[0] = 0; p4.offChanMatA[0] = 0;
+  p4.numTexGens = 1; p4.sampledTexCoords = 1;
+  p4.texgens[0] = {GX_TG_MTX2x4, GX_TG_TEX0, 0xFF, 0};
+  p4.stages[0].cd = GX_CC_TEXC; p4.stages[0].ad = GX_CA_TEXA; p4.stages[0].texCoord = 0; p4.stages[0].texMap = 0;
+  p4.offTexScale[0] = 48; p4.offTexSize[0] = 52;
+  gx::register_pipeline(4, p4);
+  gx::BindDesc bd{};
+  bd.tex[0] = 702;  // la textura con la paleta aplicada
+  bd.samp[0] = {0, 0, 0, 0, 0, {0, 0, 0}, 0.f, 0.f};
+  gx::register_bind_group(98, bd);
+  // Paleta de 16 entradas: todas grises salvo la 3 (magenta) y la 5 (cian).
+  std::vector<uint8_t> tlut(16 * 4, 0x80);
+  for (int e = 0; e < 16; ++e) tlut[e * 4 + 3] = 255;
+  tlut[3 * 4 + 0] = 255; tlut[3 * 4 + 1] = 0; tlut[3 * 4 + 2] = 255;
+  tlut[5 * 4 + 0] = 0; tlut[5 * 4 + 1] = 255; tlut[5 * 4 + 2] = 255;
+  gx::texture_data(701, 16, 1, 1, tlut.data(), tlut.size());
+  std::vector<uint8_t> v4;
+  float q[4][5] = {{-1,1,.5f,0,0},{1,1,.5f,1,0},{-1,-1,.5f,0,1},{1,-1,.5f,1,1}};
+  for (auto& v : q) for (float x : v) put_be_f32(v4, x);
+  std::vector<uint8_t> u4(256, 0);
+  for (int r = 0; r < 4; ++r) put_f(u4, 20 + r * 4 + r, 1.f);
+  for (int r = 0; r < 3; ++r) put_f(u4, 36 + r * 4 + r, 1.f);
+  put_f(u4, 48, 1.f); put_f(u4, 49, 1.f);
+  put_f(u4, 52, 1.f); put_f(u4, 53, 1.f);
+  std::vector<uint16_t> i4 = {0, 1, 2, 2, 1, 3};
+  const float index[4] = {variant == 2 ? 5.f / 15.f : 3.f / 255.f, 0.5f, 0.5f, 1.f};
+  const float black[4] = {0, 0, 0, 1};
+  gx::capture_begin(v4.data(), v4.size(), u4.data(), u4.size(), (const uint8_t*)i4.data(), 12, nullptr, 0);
+  gx::capture_pass(640, 480, true, true, index, 0.f, false, gx::Rect{0, 0, 0, 0});
+  gx::capture_copy(700, gx::Rect{0, 0, 640, 480}, 64, 64, 0x28, true);
+  gx::capture_palette_conv(700, 702, 701, static_cast<uint32_t>(variant), 64, 64);
+  gx::capture_pass(640, 480, true, true, black, 0.f, true, gx::Rect{0, 0, 640, 480});
+  gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+  gx::capture_scissor(gx::Rect{0, 0, 640, 480});
+  gx::capture_draw(4, 0, 6, 1, 0, UINT32_MAX, 98);
+  gx::capture_end();
+  if (!gx::draw_frame(640, 480)) { std::puts("no dibujó"); return 1; }
+  std::printf("paleta %06X %06X\n", pixel(160, 240), pixel(480, 120));
+  return 0;
+}
+
 // harness borrado: pase borrado en negro y un borrado de aurora (GXCopyTex con borrado) en la mitad izquierda, azul.
 static int clear_test() {
   gx::register_clear(500, gx::ClearDesc{1, 1, 1, 0});
@@ -161,6 +210,7 @@ int main(int argc, char** argv) {
   if (!init_egl(640, 480)) { std::puts("sin contexto GLES"); return 2; }
   if (argc >= 2 && std::strcmp(argv[1], "borrado") == 0) return clear_test();
   if (argc >= 2 && std::strcmp(argv[1], "paquete") == 0) return packed(argc, argv);
+  if (argc >= 3 && std::strcmp(argv[1], "paleta") == 0) return palette_test(std::atoi(argv[2]));
   if (argc >= 3) return replay(argv[1], argv[2]);
   auto GetString = (const char*(*)(unsigned))dlsym(gles, "glGetString");
   std::printf("GL: %s / %s\n", GetString(0x1F02), GetString(0x1F01));
