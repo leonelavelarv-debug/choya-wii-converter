@@ -158,6 +158,8 @@ escribir_resumen() {
     grep -h "textura sin datos" "$DIR/choya-gles.txt" 2>/dev/null | head -40
     echo "--- cola de cuadros del motor (copias que el juego no repite, como las caras de los Miis)"
     grep -h "cola de cuadros" "$DIR/choya-gles.txt" 2>/dev/null | tail -2
+    echo "--- copias del EFB tras DCFlush/DCInvalidate (las caras del público: se conservan si la RAM no cambió)"
+    grep -h "copias del EFB tras" "$DIR/choya-gles.txt" 2>/dev/null | tail -3
     echo "--- recursos convertidos (assets.wlpk)"
     grep -hE "paquete" "$DIR/choya-gles.txt" 2>/dev/null | tail -4
     echo "--- motor: estado GL y programas"

@@ -909,6 +909,69 @@ Intent GamepadIntent() {
 }
 
 """
+_GX_COPY_ANCLA = "uint32_t g_largestEfbCopyDestination = 0;\n"
+_GX_COPY_HUELLA = """\
+// choya: copias del EFB con el motor de Choya (0.21.1). Con Dawn en Null ninguna copia baja a la RAM del juego; si el
+// juego hace DCFlushRange/DCInvalidateRange sobre el destino sin haber escrito ahí, la copia de la GPU sigue siendo
+// la textura. Huella de la RAM del destino al copiar: solo si cambia se retira la copia.
+std::map<uint32_t, uint64_t> g_choyaHuellas;  // con g_efbCopyDestinationsMutex
+uint64_t g_choyaConservadas = 0, g_choyaRetiradas = 0;
+
+bool ChoyaCopiasSoloGpu() {
+    static const bool on = choya_gx_copias_solo_gpu();
+    return on;
+}
+
+// Hasta 4096 palabras de 8 bytes repartidas por el destino, más la última: una escritura de la CPU que rellena una
+// textura cambia muchas.
+uint64_t ChoyaHuella(uint32_t addr, uint32_t size) {
+    const auto* p = static_cast<const uint8_t*>(GuestToHostPtr(addr, size));
+    if (p == nullptr || size < 8) return 0;
+    const uint32_t words = size / 8;
+    const uint32_t step = words > 4096 ? words / 4096 : 1;
+    uint64_t h = 0xcbf29ce484222325ull ^ size;
+    auto mix = [&h](uint64_t w) {
+        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    };
+    for (uint32_t i = 0; i < words; i += step) {
+        uint64_t w;
+        std::memcpy(&w, p + size_t{i} * 8, 8);
+        mix(w);
+    }
+    uint64_t last;
+    std::memcpy(&last, p + size - 8, 8);
+    mix(last);
+    return h;
+}
+
+// Con g_efbCopyDestinationsMutex tomado. Verdadero: la copia se queda (la RAM del destino no cambió desde la copia).
+bool ChoyaConserva(uint32_t addr, uint32_t size) {
+    if (!ChoyaCopiasSoloGpu()) return false;
+    const auto h = g_choyaHuellas.find(addr);
+    const bool keep = h != g_choyaHuellas.end() && h->second == ChoyaHuella(addr, size);
+    if (keep) {
+        ++g_choyaConservadas;
+    } else {
+        if (h != g_choyaHuellas.end()) g_choyaHuellas.erase(h);
+        ++g_choyaRetiradas;
+    }
+    const uint64_t total = g_choyaConservadas + g_choyaRetiradas;
+    if (total <= 6 || (total & 255) == 0) {
+        char line[224];
+        std::snprintf(line, sizeof(line),
+                      "motor: copias del EFB tras DCFlush/DCInvalidate: %llu conservadas (RAM sin cambios), "
+                      "%llu retiradas; la última en 0x%08x (%u bytes) %s",
+                      static_cast<unsigned long long>(g_choyaConservadas),
+                      static_cast<unsigned long long>(g_choyaRetiradas), addr, size,
+                      keep ? "se conservó" : "se retiró");
+        choya_gx_log(line);
+    }
+    return keep;
+}
+"""
+
+
 EDITS = [
     # Botón B en el teclado (S o B) y en el mando (gatillo derecho). Los juegos de WiiCompiled se juegan con
     # el Wii Remote de lado y no lo usan; Wii Sports pide "A y B" desde la pantalla de título.
@@ -1030,6 +1093,30 @@ EDITS = [
     ("src/save_states.cpp", "bool Available() { return !DetClock::Enabled(); }",
      "bool Available() {\n#if defined(__x86_64__)\n    return !DetClock::Enabled();\n#else\n    return false;  // choya: sin save states en ARM\n#endif\n}",
      "save states solo en x86-64 (menú)"),
+    # Copias del EFB con el motor de Choya (0.21.1): Dawn va en Null, así que una copia nunca llega a la RAM del juego.
+    # Un DCFlushRange o DCInvalidateRange sobre su destino retiraba la copia y la textura se leía de una RAM vacía (las
+    # caras del público en Tenis salían como cuadros blancos: RPSysKokeshiIcon::MakeTexture copia el icono y luego
+    # hace CpuTexture::flush). Ahora se guarda una huella de la RAM del destino al copiar, y la copia solo se retira si
+    # esa RAM cambió (el juego de verdad escribió ahí: un bloque reciclado, una lectura del disco).
+    ("src/hle/gx/gx_copy.cpp", '#include "runtime_log.h"\n',
+     '#include "runtime_log.h"\n'
+     'extern "C" bool choya_gx_copias_solo_gpu();  // choya: motor de Choya con Dawn en Null (lib/choya/choya_gx.cpp)\n'
+     'extern "C" void choya_gx_log(const char* line);  // choya: va a choya-gles.txt\n',
+     "copias del EFB con huella (motor)"),
+    ("src/hle/gx/gx_copy.cpp", _GX_COPY_ANCLA, _GX_COPY_ANCLA + _GX_COPY_HUELLA, "copias del EFB con huella (declaración)"),
+    ("src/hle/gx/gx_copy.cpp", "    g_efbCopyDestinations[CanonicalizeGxMainRamAddress(addr)] = size;\n",
+     "    g_efbCopyDestinations[CanonicalizeGxMainRamAddress(addr)] = size;\n"
+     "    if (ChoyaCopiasSoloGpu()) {  // choya: huella de la RAM del destino al copiar\n"
+     "        g_choyaHuellas[CanonicalizeGxMainRamAddress(addr)] = ChoyaHuella(CanonicalizeGxMainRamAddress(addr), size);\n"
+     "    }\n",
+     "copias del EFB con huella (al copiar)"),
+    ("src/hle/gx/gx_copy.cpp", "            retired.push_back(it->first);\n",
+     "            if (ChoyaConserva(it->first, it->second)) {  // choya: la RAM no cambió, la copia sigue siendo la textura\n"
+     "                ++it;\n"
+     "                continue;\n"
+     "            }\n"
+     "            retired.push_back(it->first);\n",
+     "copias del EFB con huella (al retirar)"),
     ("cmake/PublicProducts.cmake", "    set(MKW_BASELINE_ARCH_FLAG -mcpu=native)",
      "    set(MKW_BASELINE_ARCH_FLAG -mcpu=cortex-a53)  # choya: RG35XX H (Allwinner H700, Cortex-A53)",
      "procesador de la consola"),
@@ -1329,6 +1416,20 @@ AURORA_EDITS = [
      "      render_pass_impl(pass, renderPasses, i, interpolatedFrame, debugFrame);\n"
      "    }\n",
      "motor de Choya (Dawn sin dibujos)"),
+    # Copias del EFB con el motor de Choya (0.21.1): aurora apuntaba cada copia para bajarla a la RAM cuando el juego
+    # hiciera DCFlushRange sobre ella. Con Dawn en Null esa bajada parte el cuadro y escribe en la RAM algo que no es
+    # la copia (la cara de un Mii del público quedaba en blanco). Solo se apuntan las chicas (sondas de 256 bytes o
+    # menos, como la del destello del sol); las demás se quedan en la GPU del motor (ver gx_copy.cpp en EDITS).
+    ("lib/dolphin/gx/GXFrameBuffer.cpp", '#include "../../gfx/efb_ram_copy.hpp"\n',
+     '#include "../../gfx/efb_ram_copy.hpp"\n#include "../../choya/choya_gx.hpp"  // choya: motor GLES de Choya\n',
+     "copias del EFB solo en la GPU (cabecera)"),
+    ("lib/dolphin/gx/GXFrameBuffer.cpp",
+     "  aurora::gfx::efb_ram::schedule(dest, logicalDstWidth, logicalDstHeight, texCopyFmt, handle.handle, patchStride);\n",
+     "  // choya: con el motor de Choya (Dawn en Null) solo las copias chicas se apuntan para bajar a la RAM.\n"
+     "  if (!aurora::choya::enabled() || aurora::choya::dawn_draws() || handle.dataSize <= 256) {\n"
+     "    aurora::gfx::efb_ram::schedule(dest, logicalDstWidth, logicalDstHeight, texCopyFmt, handle.handle, patchStride);\n"
+     "  }\n",
+     "copias del EFB solo en la GPU"),
 ]
 
 # Archivos del motor de Choya que se copian dentro de aurora (siempre se reemplazan: son de Choya).

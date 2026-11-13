@@ -430,6 +430,14 @@ void capture_discard() noexcept { core::capture_discard(); }
 static std::atomic<bool> g_choyaDumpRequest{false};
 extern "C" void choya_gx_request_dump() { g_choyaDumpRequest.store(true); }
 
+// Copias del EFB (0.21.1): con el motor de Choya y Dawn en Null, una copia vive solo en la GPU del motor y nunca
+// llega a la RAM del juego. El runtime lo pregunta para no retirar una copia cuando el juego hace DCFlushRange o
+// DCInvalidateRange sobre ella sin haber escrito ahí (las caras de los Miis del público: RPSysKokeshiIcon).
+extern "C" bool choya_gx_copias_solo_gpu() {
+  return aurora::choya::enabled() && !aurora::choya::dawn_draws();
+}
+extern "C" void choya_gx_log(const char* line) { aurora::choya::log_to_runtime(line); }
+
 extern "C" bool choya_gx_draw_frame(int screenWidth, int screenHeight) {
   namespace core = ::choya::gx;
   if (choya_gl_proc == nullptr) return false;
