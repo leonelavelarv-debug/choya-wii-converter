@@ -19,9 +19,14 @@
 // Lo que lee el parche de abi_bridge.h. Fuera del #if: el enlace no debe depender de la plataforma.
 extern "C" {
 volatile bool g_choyaMidiendo = false;
+// CHOYA_SIN_REVERB=1: la dirección de AxManager::AuxCallbackFunc (efectos de audio de nw4r: la reverberación). El
+// parche de InvokeIndirectCpu (abi_bridge.h) no la llama: deja en silencio la vuelta de los efectos y se ahorra el
+// trabajo de AXFXReverbHiExpCallback, que en los menús era ~9 % del hilo del juego. 0 = normal.
+uint32_t g_choyaSinEfectos = 0;
 }
+extern "C" bool choya_sin_efectos(void* ctx);
 extern "C" void choya_medir_llamada(uint32_t target, const void* ctx);
-extern "C" void choya_medir_empezar(int seconds);
+extern "C" int choya_medir_empezar(int seconds);  // 1: empezó; 0: ya estaba midiendo
 
 #if defined(__linux__)
 #include <algorithm>
@@ -62,6 +67,7 @@ namespace choya_medida {  // con nombre: en una compilación unity no choca con 
 constexpr uint32_t kCalc = 0x0u /*CHOYA_DIR_CALC*/;
 constexpr uint32_t kDraw = 0x0u /*CHOYA_DIR_DRAW*/;
 constexpr uint32_t kCalcSize = 0x0u /*CHOYA_TAM_CALC*/;
+constexpr uint32_t kAuxCallback = 0x0u /*CHOYA_DIR_AUX*/;  // nw4r::snd::detail::AxManager::AuxCallbackFunc
 constexpr uint32_t kDrawSize = 0x0u /*CHOYA_TAM_DRAW*/;
 constexpr uint32_t kCodeLo = 0x80000000u, kCodeHi = 0x80800000u;  // texto del juego (main.dol y RELs bajos)
 
@@ -492,6 +498,11 @@ void Measure(int seconds) {
 
 struct Starter {
     Starter() {
+        if (const char* rv = std::getenv("CHOYA_SIN_REVERB"); rv && std::strcmp(rv, "1") == 0 && kAuxCallback != 0) {
+            g_choyaSinEfectos = kAuxCallback;
+            std::fprintf(stderr, "[choya] sin efectos de audio (reverberación): AuxCallbackFunc 0x%08X no se llama\n",
+                         kAuxCallback);
+        }
         if (const char* out = std::getenv("CHOYA_PERFIL_SALIDA"); out && *out) g_outPath = out;
         const char* spec = std::getenv("CHOYA_PERFIL");
         if (spec == nullptr || *spec == '\0') return;
@@ -534,13 +545,31 @@ extern "C" void choya_medir_llamada(uint32_t target, const void* ctx) {
     if (t_isGame) g_gameCtx = ctx;
 }
 
-extern "C" void choya_medir_empezar(int seconds) {
+// En vez de AuxCallbackFunc(data, context): data (r3) apunta a los punteros de los búferes del bus auxiliar
+// (izquierdo, derecho, envolvente) de 96 muestras de 32 bits; el DSP los vuelve a leer como la vuelta del efecto.
+// En cero = sin reverberación; el sonido directo no pasa por aquí y no cambia.
+extern "C" bool choya_sin_efectos(void* ctx) {
+    if (ctx == nullptr || CHOYA_GUEST_BASE == 0 || !CHOYA_GUEST_ACTIVE()) return false;
+    const uint32_t data = static_cast<const uint32_t*>(ctx)[3];
+    if (!guest_ram(data) || !guest_ram(data + 12)) return false;
+    for (int i = 0; i < 3; ++i) {
+        const uint32_t buf = guest_read32(data + 4u * static_cast<uint32_t>(i));
+        if (guest_ram(buf) && guest_ram(buf + 96u * 4u - 1u)) {
+            std::memset(reinterpret_cast<void*>(CHOYA_GUEST_BASE + buf), 0, 96u * 4u);
+        }
+    }
+    return true;
+}
+
+extern "C" int choya_medir_empezar(int seconds) {
     bool expected = false;
-    if (!g_busy.compare_exchange_strong(expected, true)) return;  // ya está midiendo
+    if (!g_busy.compare_exchange_strong(expected, true)) return 0;  // ya está midiendo
     std::thread([seconds] { Measure(seconds); }).detach();
+    return 1;
 }
 } // namespace choya_medida (las dos de arriba son extern "C": su nombre no lleva el namespace)
 #else
 extern "C" void choya_medir_llamada(uint32_t, const void*) {}
-extern "C" void choya_medir_empezar(int) {}
+extern "C" int choya_medir_empezar(int) { return 0; }
+extern "C" bool choya_sin_efectos(void*) { return false; }
 #endif

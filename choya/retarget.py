@@ -905,9 +905,21 @@ EDITS = [
     ("include/abi_bridge.h", "inline void ApplyRuntimeCallOptions(uint32_t target, CpuContext* ctx) {\n",
      'extern "C" volatile bool g_choyaMidiendo;  // choya: medición por tramos (choya_perfil.cpp)\n'
      'extern "C" void choya_medir_llamada(uint32_t target, const void* ctx);\n'
+     'extern "C" uint32_t g_choyaSinEfectos;  // choya: CHOYA_SIN_REVERB (choya_perfil.cpp)\n'
+     'extern "C" bool choya_sin_efectos(void* ctx);\n'
      "inline void ApplyRuntimeCallOptions(uint32_t target, CpuContext* ctx) {\n"
      "    if (__builtin_expect(g_choyaMidiendo, 0)) choya_medir_llamada(target, ctx);  // choya\n",
      "medición por tramos (llamadas)"),
+    # CHOYA_SIN_REVERB=1: la llamada indirecta a los efectos de audio de nw4r (AuxCallbackFunc) no se hace; los búferes
+    # del bus auxiliar quedan en cero (sin reverberación). Sin la variable, la comparación nunca es cierta.
+    ("include/abi_bridge.h", "    ApplyRuntimeCallOptions(target, cpu);\n"
+     "    if (TryDispatchRawCpuTarget(TranslatedFunctionRegistry::FindRawByAddressPtr(target), cpu)) {\n"
+     "        return;\n    }\n    if (TryDispatchResolvedCpuTarget(TranslatedFunctionRegistry::FindByAddressPtr(target), cpu)) {\n",
+     "    ApplyRuntimeCallOptions(target, cpu);\n"
+     "    if (__builtin_expect(target == g_choyaSinEfectos, 0) && choya_sin_efectos(cpu)) return;  // choya\n"
+     "    if (TryDispatchRawCpuTarget(TranslatedFunctionRegistry::FindRawByAddressPtr(target), cpu)) {\n"
+     "        return;\n    }\n    if (TryDispatchResolvedCpuTarget(TranslatedFunctionRegistry::FindByAddressPtr(target), cpu)) {\n",
+     "sin efectos de audio (CHOYA_SIN_REVERB)"),
     ("include/keybinds.h", "    kMinus,\n    kActionCount,",
      "    kMinus,\n    kButtonB," + _B_NOTE + "\n    kActionCount,", "tecla para el botón B"),
     ("src/keybinds.cpp", '{"minus", "- (Minus)", {SDL_SCANCODE_MINUS, SDL_SCANCODE_TAB}},',
@@ -1355,6 +1367,7 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
 # Las funciones de Wii Sports que separan los tramos del cuadro en la medición (choya_perfil.cpp).
 TRAMO_CALC = "calc__Q23EGG12SceneManagerFv"   # actualizar el juego (escenas, actores, físicas, animaciones)
 TRAMO_DRAW = "draw__Q23EGG12SceneManagerFv"   # preparar el dibujo (recorrer modelos y llamar a GX)
+AUX_CALLBACK = "AuxCallbackFunc__Q44nw4r3snd6detail9AxManagerFPvPv"  # efectos de audio (CHOYA_SIN_REVERB)
 
 
 def perfil_marcas(src: str, ws: Symbols) -> str:
@@ -1365,7 +1378,8 @@ def perfil_marcas(src: str, ws: Symbols) -> str:
         size = ws.size.get(addr, 0) if addr else 0
         src = src.replace(f"0x0u /*{addr_tag}*/", f"0x{addr:08X}u /*{addr_tag}*/")
         src = src.replace(f"0x0u /*{size_tag}*/", f"0x{size:X}u /*{size_tag}*/")
-    return src
+    aux = ws.funcs.get(AUX_CALLBACK, 0)
+    return src.replace("0x0u /*CHOYA_DIR_AUX*/", f"0x{aux:08X}u /*CHOYA_DIR_AUX*/")
 
 
 def choya_natives(ws: Symbols, registered: dict[int, str], changes: list[Change]) -> str:

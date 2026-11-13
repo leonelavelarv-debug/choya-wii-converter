@@ -33,7 +33,7 @@
 
 extern "C" bool choya_gx_draw_frame(int screenWidth, int screenHeight);  // motor de Choya (aurora)
 extern "C" void choya_gx_request_dump();  // volcado del siguiente cuadro (aurora)
-extern "C" void choya_medir_empezar(int seconds);  // medición por tramos (choya_perfil.cpp)
+extern "C" int choya_medir_empezar(int seconds);  // medición por tramos (choya_perfil.cpp)
 
 namespace {
 
@@ -387,8 +387,8 @@ void CheckGamepads() {
         measureSince = now;
     } else if (measureHeld == 1 && now - measureSince >= std::chrono::seconds(2)) {
         measureHeld = 2;
-        Log("MENU sola: midiendo los tramos del cuadro 20 s (perfil.txt)");
-        choya_medir_empezar(20);
+        if (choya_medir_empezar(20)) Log("MENU sola: midiendo los tramos del cuadro 20 s (perfil.txt)");
+        else Log("MENU sola: ya se está midiendo (en el modo diagnóstico se mide solo de los 20 a los 55 s)");
     }
 }
 } // namespace

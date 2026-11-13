@@ -19,7 +19,7 @@ JUEGO = r"""
 #include <unistd.h>
 extern "C" volatile bool g_choyaMidiendo;
 extern "C" void choya_medir_llamada(uint32_t, const void*);
-extern "C" void choya_medir_empezar(int);
+extern "C" int choya_medir_empezar(int);
 static uint32_t ctx[64];
 __attribute__((noinline)) static void busy(double ms) {
   const auto t = std::chrono::steady_clock::now();

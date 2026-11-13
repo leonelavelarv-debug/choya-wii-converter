@@ -30,6 +30,8 @@
 #include <malloc.h>
 #endif
 #include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <iterator>
 #include <vector>
@@ -2602,52 +2604,94 @@ namespace {
 // En Golf la memoria de la GPU (debugfs gpu_memory) pasa de 130 a 530 MB en medio minuto mientras las texturas del
 // motor son 16 MB: es memoria que el driver pide por su cuenta. Para saber qué la pide, se lee el total antes y
 // después de cada parte del cuadro y la diferencia se suma a esa parte. CHOYA_GX_MALI=0 lo apaga.
-enum MaliPart { kMaliSubidas, kMaliDibujos, kMaliCopias, kMaliPantalla, kMaliFuera, kMaliParts };
+enum MaliPart { kMaliSubidas, kMaliDibujos, kMaliCopias, kMaliPantalla, kMaliFuera, kMaliPases, kMaliBorrados,
+                kMaliParts };
+// Pase por pase (por su número dentro del cuadro): cuánto crece mientras se dibuja en él, y cómo es el pase.
+constexpr int kMaliMaxPasses = 32;
+struct MaliPass {
+  long pages = 0;
+  uint32_t frames = 0, draws = 0;
+  int w = 0, h = 0;
+  uint8_t clears = 0;  // 1 color, 2 profundidad
+  uint32_t afterDepthCopy = 0, afterColorCopy = 0;  // en cuántos cuadros vino justo después de copiar el EFB
+};
 struct MaliProf {
   int state = 0;  // 0 sin probar, 1 activo, -1 apagado
+  int fd = -1;    // gpu_memory abierto una vez (pread en cada lectura: antes eran abrir/leer/cerrar 40 veces)
   const char* path = nullptr;
   long last = -1;               // páginas en la última lectura
   long part[kMaliParts] = {};   // páginas sumadas por parte (en el intervalo)
   long reportStart = -1;        // páginas al empezar el intervalo
-  long history[3] = {-1, -1, -1};  // al final de los últimos intervalos (para la mitigación)
+  long history[3] = {-1, -1, -1};
+  MaliPass pass[kMaliMaxPasses];
+  int curPass = -1;             // pase abierto en este cuadro
 } g_mali;
 
 long mali_read() {
-  FILE* f = std::fopen(g_mali.path, "r");
-  if (f == nullptr) return -1;
+  if (g_mali.fd < 0) return -1;
+  char buf[128];
+  const ssize_t n = pread(g_mali.fd, buf, sizeof(buf) - 1, 0);
+  if (n <= 0) return -1;
+  buf[n] = 0;
   char name[64];
   long pages = -1;
-  if (std::fscanf(f, "%63s %ld", name, &pages) != 2) pages = -1;
-  std::fclose(f);
+  if (std::sscanf(buf, "%63s %ld", name, &pages) != 2) pages = -1;
   return pages;
 }
 
-void mali_mark(MaliPart part) {
+bool mali_on() {
   if (g_mali.state == 0) {
     g_mali.state = -1;
     const char* env = std::getenv("CHOYA_GX_MALI");
-    if (env != nullptr && std::strcmp(env, "0") == 0) return;
+    if (env != nullptr && std::strcmp(env, "0") == 0) return false;
     for (const char* p : {"/sys/kernel/debug/mali0/gpu_memory", "/sys/kernel/debug/mali/gpu_memory"}) {
+      g_mali.fd = ::open(p, O_RDONLY);
       g_mali.path = p;
-      if (mali_read() >= 0) {
+      if (g_mali.fd >= 0 && mali_read() >= 0) {
         g_mali.state = 1;
         break;
       }
+      if (g_mali.fd >= 0) ::close(g_mali.fd);
+      g_mali.fd = -1;
     }
-    if (g_mali.state != 1) return;
+    if (g_mali.state != 1) return false;
     g_mali.last = g_mali.reportStart = mali_read();
-    log_line("motor: midiendo la memoria de la Mali por partes del cuadro (%s)", g_mali.path);
+    log_line("motor: midiendo la memoria de la Mali por partes del cuadro y por pase (%s)", g_mali.path);
   }
-  if (g_mali.state != 1) return;
+  return g_mali.state == 1;
+}
+
+void mali_mark(MaliPart part) {
+  if (!mali_on()) return;
   const long now = mali_read();
   if (now < 0) return;
-  g_mali.part[part] += now - g_mali.last;
+  const long delta = now - g_mali.last;
+  g_mali.part[part] += delta;
+  if (part == kMaliDibujos && g_mali.curPass >= 0) g_mali.pass[g_mali.curPass].pages += delta;
   g_mali.last = now;
 }
 
-// Cuántos cuadros puede tener la GPU pendientes a la vez (1 a kRing). Si la Mali crece sin parar se baja a 1 (como un
-// glFinish por cuadro): un recurso que la GPU todavía usa y se vuelve a escribir (EFB, copias) hace que el driver le
-// dé otra memoria en vez de esperar. CHOYA_GX_EN_VUELO fija el valor y apaga el cambio automático.
+// Al empezar un pase: se cierra lo dibujado en el anterior y se anota cómo es el nuevo.
+bool g_maliCopiedDepth = false, g_maliCopiedColor = false;  // copias del EFB desde el último pase
+void mali_pass_begin(int index, int w, int h, bool clearColor, bool clearDepth) {
+  if (!mali_on()) return;
+  if (index < 0 || index >= kMaliMaxPasses) {
+    g_mali.curPass = -1;
+    return;
+  }
+  MaliPass& p = g_mali.pass[index];
+  ++p.frames;
+  p.w = w;
+  p.h = h;
+  p.clears = static_cast<uint8_t>((clearColor ? 1 : 0) | (clearDepth ? 2 : 0));
+  if (g_maliCopiedDepth) ++p.afterDepthCopy;
+  if (g_maliCopiedColor) ++p.afterColorCopy;
+  g_maliCopiedDepth = g_maliCopiedColor = false;
+  g_mali.curPass = index;
+}
+
+// Cuántos cuadros puede tener la GPU pendientes a la vez (1 a kRing). CHOYA_GX_EN_VUELO=1 obliga a terminar cada cuadro
+// antes de empezar el siguiente. Ya no se baja solo: en Golf no frenó el crecimiento (0.17.1) y no sirvió de nada.
 int g_inFlight = 3;
 bool g_inFlightFixed = false;
 
@@ -2655,20 +2699,32 @@ void mali_report(double frames) {
   if (g_mali.state != 1) return;
   const long now = g_mali.last;
   const auto mb = [](long pages) { return static_cast<double>(pages) * 4.0 / 1024.0; };
-  log_line("motor: Mali %.0f MB (%+.1f MB en %.0f cuadros): subidas %+.1f, dibujos %+.1f, copias del EFB %+.1f, "
-           "pantalla %+.1f, entre cuadros %+.1f; cuadros en vuelo %d",
-           mb(now), mb(now - g_mali.reportStart), frames, mb(g_mali.part[kMaliSubidas]), mb(g_mali.part[kMaliDibujos]),
-           mb(g_mali.part[kMaliCopias]), mb(g_mali.part[kMaliPantalla]), mb(g_mali.part[kMaliFuera]), g_inFlight);
+  log_line("motor: Mali %.0f MB (%+.1f MB en %.0f cuadros): subidas %+.1f, empezar pases %+.1f, dibujos %+.1f, "
+           "borrados %+.1f, copias del EFB %+.1f, pantalla %+.1f, entre cuadros %+.1f; cuadros en vuelo %d",
+           mb(now), mb(now - g_mali.reportStart), frames, mb(g_mali.part[kMaliSubidas]), mb(g_mali.part[kMaliPases]),
+           mb(g_mali.part[kMaliDibujos]), mb(g_mali.part[kMaliBorrados]), mb(g_mali.part[kMaliCopias]),
+           mb(g_mali.part[kMaliPantalla]), mb(g_mali.part[kMaliFuera]), g_inFlight);
+  // Los 4 pases en los que más crece al dibujar (solo si el intervalo creció o algún pase pidió más de 4 MB).
+  int order[kMaliMaxPasses];
+  for (int i = 0; i < kMaliMaxPasses; ++i) order[i] = i;
+  std::sort(order, order + kMaliMaxPasses, [](int a, int b) { return g_mali.pass[a].pages > g_mali.pass[b].pages; });
+  for (int k = 0; k < 4; ++k) {
+    const MaliPass& p = g_mali.pass[order[k]];
+    if (p.frames == 0 || mb(p.pages) < 4.0) break;
+    log_line("motor: Mali pase %d (%dx%d, borra %s, %.0f dibujos por cuadro%s%s): %+.1f MB al dibujar (%+.2f MB por "
+             "cuadro)", order[k], p.w, p.h,
+             p.clears == 3 ? "color y profundidad" : p.clears == 1 ? "color" : p.clears == 2 ? "profundidad" : "nada",
+             static_cast<double>(p.draws) / p.frames,
+             p.afterDepthCopy * 2 > p.frames ? ", después de copiar la profundidad" : "",
+             p.afterColorCopy * 2 > p.frames ? ", después de copiar el color" : "", mb(p.pages),
+             mb(p.pages) / p.frames);
+  }
+  for (MaliPass& p : g_mali.pass) p = MaliPass{};
   for (long& p : g_mali.part) p = 0;
   g_mali.reportStart = now;
   g_mali.history[0] = g_mali.history[1];
   g_mali.history[1] = g_mali.history[2];
   g_mali.history[2] = now;
-  // Creció más de 64 MB en los últimos dos intervalos: menos cuadros en vuelo.
-  if (!g_inFlightFixed && g_inFlight > 1 && g_mali.history[0] >= 0 && mb(now - g_mali.history[0]) > 64.0) {
-    g_inFlight = 1;
-    log_line("motor: la Mali creció %.0f MB en dos informes: ahora 1 cuadro en vuelo", mb(now - g_mali.history[0]));
-  }
 }
 
 void low_memory_relief() {
@@ -2726,6 +2782,9 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   uint64_t lastBindGroup = ~0ull;
   uint64_t lastPipeRef = ~0ull;
   const ResolvedPipe* lastPipe = nullptr;
+  int passIndex = -1;
+  g_mali.curPass = -1;
+  g_maliCopiedDepth = g_maliCopiedColor = false;
   g_stats.bytesVerts += f.verts.size();
   g_stats.bytesUniforms += f.uniforms.size();
   g_stats.bytesIndices += f.indices.size();
@@ -2850,6 +2909,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   for (const Item& it : f.items) {
     switch (it.op) {
     case Op::Pass: {
+      mali_mark(kMaliDibujos);  // lo dibujado en el pase anterior
       end_pass();
       ++g_stats.passes;
       passOpen = true;
@@ -2875,6 +2935,8 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
         bits |= kDepthBufferBit;
       }
       if (bits) gl.Clear(bits);
+      mali_mark(kMaliPases);
+      mali_pass_begin(++passIndex, passW, passH, it.pass.clearColor != 0, it.pass.clearDepth != 0);
       set_enable(kScissorTest, S.scissorOn, true);
       scissorRect[0] = 0;
       scissorRect[1] = g_efb.height - passH;
@@ -2900,6 +2962,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       mali_mark(kMaliDibujos);
       if (copies_enabled()) run_copy(it);
       mali_mark(kMaliCopias);
+      ((it.copy.fmt & 0x10) != 0 ? g_maliCopiedDepth : g_maliCopiedColor) = true;
       shadow_invalidate();  // la copia usó su propio programa, estado y unidades 10/11
       set_viewport(viewportRect);
       set_enable(kScissorTest, S.scissorOn, true);
@@ -2926,7 +2989,9 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       GLbitfield bits = 0;
       if (cc.color || cc.alpha) bits |= kColorBufferBit;
       if (cc.depth) bits |= kDepthBufferBit;
+      mali_mark(kMaliDibujos);
       if (bits) gl.Clear(bits);
+      mali_mark(kMaliBorrados);
       set_scissor(scissorRect);
       ++g_stats.clears;
     } break;
@@ -2979,6 +3044,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
         set_color_mask(true, true);
       }
       ++drawIndex;
+      if (g_mali.curPass >= 0) ++g_mali.pass[g_mali.curPass].draws;
       gl.DrawElements(kTriangles, static_cast<GLsizei>(it.draw.indexCount), kUnsignedShort,
                       reinterpret_cast<const void*>(static_cast<uintptr_t>(it.draw.idxOffset)));
       ++g_stats.draws;

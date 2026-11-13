@@ -88,6 +88,9 @@ export CHOYA_GLES=1
 export CHOYA_GX_COLORES=0
 # Caché de programas en disco (como los shaders listos de galaxy-vita): la primera vez se compilan, después se cargan.
 export CHOYA_GX_CACHE="${CHOYA_GX_CACHE:-$DIR/cache-shaders}"
+# Prueba de rendimiento: un archivo vacío llamado "sin-reverb" junto al juego apaga los efectos de audio (reverberación)
+# para ver cuánto pesan. Se borra el archivo para volver a oírlos.
+if [ -f "$DIR/sin-reverb" ]; then export CHOYA_SIN_REVERB=1; fi
 # Recursos convertidos por el conversor de Choya (assets.wlpk junto al juego): texturas en ETC2/EAC ya reducidas.
 # CHOYA_PAQUETE=0 usa solo las del disco.
 if [ "${CHOYA_PAQUETE:-}" != "0" ] && [ -f "$DIR/assets.wlpk" ]; then
@@ -105,6 +108,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "juego: $GAME"
   echo "PortMaster: ${controlfolder:-no encontrado}  dispositivo: ${DEVICE_NAME:-?}  CFW: ${CFW_NAME:-?}"
   echo "mapeo del mando: ${SDL_GAMECONTROLLERCONFIG:-ninguno}" | cut -c1-200
+  echo "efectos de audio: $([ "${CHOYA_SIN_REVERB:-0}" = 1 ] && echo "APAGADOS (archivo sin-reverb)" || echo "normales")"
   echo "recursos convertidos: $([ "$CHOYA_PAQUETE" = 0 ] && echo "no (texturas del disco)" || echo "$CHOYA_PAQUETE ($(du -h "$CHOYA_PAQUETE" 2>/dev/null | cut -f1))")"
   echo "gptokeyb: ${GPTOKEYB:-no}  salir: $CHOYA_QUIT_COMBO + START  botones: $CHOYA_FACE_LAYOUT"
   echo "dispositivos de entrada: $(grep -h "^N: Name=" /proc/bus/input/devices 2>/dev/null | cut -d= -f2- | tr "\n" " ")"
@@ -129,7 +133,7 @@ escribir_resumen() {
     echo "--- memoria del motor"
     grep -h "motor: memoria del proceso" "$DIR/choya-gles.txt" 2>/dev/null | tail -8
     echo "--- memoria de la Mali por partes del cuadro"
-    grep -hE "motor: (Mali|la Mali|midiendo)" "$DIR/choya-gles.txt" 2>/dev/null | head -30
+    grep -hE "motor: (Mali|la Mali|midiendo)" "$DIR/choya-gles.txt" 2>/dev/null | head -60
     echo "--- tramos del cuadro (MENU sola 2 s mide 20 s; detalle en la PC: choya perfil perfil.txt)"
     grep -hE "\[choya\] (midiendo|tramos|esperas|perfil escrito)|MENU sola" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | tail -6
     echo "--- recursos convertidos (assets.wlpk)"
