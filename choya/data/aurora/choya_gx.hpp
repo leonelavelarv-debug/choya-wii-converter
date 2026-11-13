@@ -21,6 +21,8 @@ struct TextureRef;
 namespace aurora::choya {
 
 bool enabled() noexcept;
+// Con el motor encendido, Dawn (backend Null) no codifica los dibujos salvo con CHOYA_DAWN_DIBUJA=1 (0.20.3).
+bool dawn_draws() noexcept;
 
 // Texturas: datos ya decodificados (RGBA8) al crearse o escribirse, y aviso cuando se liberan.
 void texture_uploaded(const gfx::TextureRef& ref, const uint8_t* data, size_t size) noexcept;

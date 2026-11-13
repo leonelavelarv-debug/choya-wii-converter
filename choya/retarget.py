@@ -1016,6 +1016,43 @@ EDITS = [
 # Sin X11 ni Wayland en KNULLI, SDL abre la ventana "offscreen", que Dawn no sabe usar. Para el backend Null basta una
 # superficie Wayland ficticia: Dawn solo revisa que los punteros no sean nulos y el backend Null nunca los toca.
 # En la PC (x11/wayland) este camino no se usa.
+# Cronómetro de las listas de dibujo (GXDispList.cpp): el de 0.20.2 medía todas; el actual una de cada 16.
+_CHOYA_LIST_TIMER_0202 = (
+    "  struct ChoyaListTimer {  // choya: tiempo y tamaño de las listas para el informe\n"
+    "    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();\n"
+    "    u32 bytes;\n"
+    "    ~ChoyaListTimer() {\n"
+    "      choya::gx::note_aurora(6, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(\n"
+    "                                    std::chrono::steady_clock::now() - start).count()));\n"
+    "      choya::gx::note_aurora(7, 1);\n"
+    "      choya::gx::note_aurora(8, bytes);\n"
+    "    }\n"
+    "  } choyaListTimer{std::chrono::steady_clock::now(), nbytes};\n")
+_CHOYA_LIST_TIMER = (
+    "  static uint64_t choyaListNs = 0, choyaListCount = 0, choyaListBytes = 0;  // choya: solo el hilo del juego\n"
+    "  struct ChoyaListTimer {  // choya: tiempo (1 de cada 16) y tamaño de las listas para el informe\n"
+    "    bool timed;\n"
+    "    std::chrono::steady_clock::time_point start;\n"
+    "    u32 size;\n"
+    "    ~ChoyaListTimer() {\n"
+    "      if (timed) {\n"
+    "        choyaListNs += 16 * static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(\n"
+    "                                                     std::chrono::steady_clock::now() - start).count());\n"
+    "      }\n"
+    "      choyaListBytes += size;\n"
+    "      if ((++choyaListCount & 63) == 0) {\n"
+    "        choya::gx::note_aurora(6, choyaListNs);\n"
+    "        choya::gx::note_aurora(7, 64);\n"
+    "        choya::gx::note_aurora(8, choyaListBytes);\n"
+    "        choyaListNs = choyaListBytes = 0;\n"
+    "      }\n"
+    "    }\n"
+    "  };\n"
+    "  const bool choyaTimed = (choyaListCount & 15) == 0;\n"
+    "  ChoyaListTimer choyaListTimer{choyaTimed,\n"
+    "                                choyaTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{},\n"
+    "                                nbytes};\n")
+
 AURORA_EDITS = [
     ("lib/dawn/BackendBinding.cpp",
      "    desc->window = SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);\n"
@@ -1218,21 +1255,23 @@ AURORA_EDITS = [
     ("lib/dolphin/gx/GXDispList.cpp", '#include "../../gfx/common.hpp"\n',
      '#include "../../gfx/common.hpp"\n#include "../../choya/choya_gx_core.hpp"  // choya\n\n#include <chrono>\n',
      "motor de Choya (tiempos de las listas: cabecera)"),
+    # Una de cada 16 listas se cronometra (clock_gettime cuesta en el A53: medirlas todas le quitaba ~1.3 ms por
+    # cuadro al juego en 0.20.2) y los totales se juntan sin atómicos hasta mandarlos cada 64 listas.
     ("lib/dolphin/gx/GXDispList.cpp",
      "  } replayScope;\n  u32 consumed = 0;\n",
-     "  } replayScope;\n"
-     "  struct ChoyaListTimer {  // choya: tiempo y tamaño de las listas para el informe\n"
-     "    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();\n"
-     "    u32 bytes;\n"
-     "    ~ChoyaListTimer() {\n"
-     "      choya::gx::note_aurora(6, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(\n"
-     "                                    std::chrono::steady_clock::now() - start).count()));\n"
-     "      choya::gx::note_aurora(7, 1);\n"
-     "      choya::gx::note_aurora(8, bytes);\n"
-     "    }\n"
-     "  } choyaListTimer{std::chrono::steady_clock::now(), nbytes};\n"
-     "  u32 consumed = 0;\n",
+     "  } replayScope;\n" + _CHOYA_LIST_TIMER + "  u32 consumed = 0;\n",
      "motor de Choya (tiempos de las listas)"),
+    # Con el motor de Choya, Dawn va en el backend Null: codificar los dibujos de cada pase (3-4 ms por cuadro, con el
+    # juego esperando a que el hilo de aurora termine) no pinta nada. Se dejan los pases vacíos (sus borrados, copias y
+    # resoluciones siguen igual para aurora). CHOYA_DAWN_DIBUJA=1 lo vuelve a hacer como antes.
+    ("lib/gfx/common.cpp",
+     "    auto pass = cmd.BeginRenderPass(&renderPassDescriptor);\n"
+     "    render_pass_impl(pass, renderPasses, i, interpolatedFrame, debugFrame);\n",
+     "    auto pass = cmd.BeginRenderPass(&renderPassDescriptor);\n"
+     "    if (!choya::enabled() || choya::dawn_draws()) {  // choya: el motor GLES dibuja; Dawn (Null) no hace falta\n"
+     "      render_pass_impl(pass, renderPasses, i, interpolatedFrame, debugFrame);\n"
+     "    }\n",
+     "motor de Choya (Dawn sin dibujos)"),
 ]
 
 # Archivos del motor de Choya que se copian dentro de aurora (siempre se reemplazan: son de Choya).
@@ -1269,6 +1308,7 @@ def _capture_payloads() -> list[str]:
 # Lo que versiones anteriores de Choya insertaron en aurora: se quita antes de aplicar los cambios actuales, para
 # que actualizar Choya no deje bloques repetidos o viejos (0.12.2 dejaba el bloque de la 0.12.0 junto al nuevo).
 AURORA_STRIPS = [("lib/gfx/common.cpp", s) for s in _capture_payloads()] + [
+    ("lib/dolphin/gx/GXDispList.cpp", _CHOYA_LIST_TIMER_0202),
     ("cmake/aurora_gx.cmake", "        lib/choya/choya_gx_core.cpp\n"),
     ("cmake/aurora_gx.cmake", "        lib/choya/choya_gx.cpp\n"),
 ]

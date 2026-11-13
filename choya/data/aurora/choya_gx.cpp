@@ -212,6 +212,17 @@ bool enabled() noexcept {
   return on;
 }
 
+bool dawn_draws() noexcept {
+  static const bool on = [] {
+    const char* v = std::getenv("CHOYA_DAWN_DIBUJA");
+    const bool draws = v != nullptr && std::strcmp(v, "1") == 0;
+    log_to_runtime(draws ? "aurora: Dawn sigue codificando los dibujos (CHOYA_DAWN_DIBUJA=1)"
+                         : "aurora: Dawn (Null) ya no codifica los dibujos; los dibuja solo el motor de Choya");
+    return draws;
+  }();
+  return on;
+}
+
 gfx::TextureHandle packed_static_texture(uint32_t width, uint32_t height, uint32_t mips, uint32_t format,
                                          const uint8_t* data, size_t size, const char* label) noexcept {
   if (!enabled() || !core::pack_is_open() || data == nullptr) return {};
