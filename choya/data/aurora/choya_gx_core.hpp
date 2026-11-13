@@ -100,6 +100,8 @@ void texture_packed_data(uint64_t id, uint32_t width, uint32_t height, uint32_t 
                          const uint8_t* data, size_t size) noexcept;
 size_t gx_level_size(uint32_t gxFormat, uint32_t width, uint32_t height) noexcept;
 uint64_t texture_key(const uint8_t* level0, size_t size, uint32_t width, uint32_t height, uint32_t gxFormat) noexcept;
+// Fija el hilo que la llama (el del juego) al último núcleo y el resto del proceso a los demás (CHOYA_NUCLEOS=0 no).
+void pin_game_thread() noexcept;
 // Guardar copia de las texturas en memoria (solo para volcar cuadros).
 void set_keep_textures(bool keep) noexcept;
 

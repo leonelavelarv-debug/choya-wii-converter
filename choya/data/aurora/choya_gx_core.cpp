@@ -34,6 +34,10 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <iterator>
+#if defined(__linux__)
+#include <sched.h>
+#include <sys/syscall.h>
+#endif
 #include <vector>
 
 namespace choya::gx {
@@ -2303,6 +2307,41 @@ void texture_packed_data(uint64_t id, uint32_t width, uint32_t height, uint32_t 
   std::lock_guard lock(s.mutex);
   if (s.keep) s.kept[id] = up;
   s.pending.push_back(std::move(up));
+}
+
+// Núcleos: el hilo del juego (el que procesa el GX) se queda solo en el último núcleo y los demás hilos del proceso
+// (motor de Choya, hilos de la Mali, audio, aurora) en los otros tres, para que nada le quite tiempo ni lo mueva de
+// núcleo (cachés frías). Se llama desde el hilo del juego; dos veces, para alcanzar a los hilos que nacen después.
+// CHOYA_NUCLEOS=0 lo apaga.
+void pin_game_thread() noexcept {
+#if defined(__linux__)
+  const char* env = std::getenv("CHOYA_NUCLEOS");
+  if (env != nullptr && std::strcmp(env, "0") == 0) return;
+  const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+  if (ncpu < 3 || ncpu > CPU_SETSIZE) return;
+  const int gameCpu = static_cast<int>(ncpu) - 1;
+  cpu_set_t game, others;
+  CPU_ZERO(&game);
+  CPU_ZERO(&others);
+  CPU_SET(gameCpu, &game);
+  for (int i = 0; i < gameCpu; ++i) CPU_SET(i, &others);
+  const pid_t self = static_cast<pid_t>(syscall(SYS_gettid));
+  if (sched_setaffinity(self, sizeof(game), &game) != 0) {
+    log_line("motor: no pude fijar el hilo del juego a un núcleo");
+    return;
+  }
+  int moved = 0;
+  if (DIR* d = ::opendir("/proc/self/task")) {
+    while (const dirent* e = ::readdir(d)) {
+      const pid_t tid = static_cast<pid_t>(std::atoi(e->d_name));
+      if (tid <= 0 || tid == self) continue;
+      if (sched_setaffinity(tid, sizeof(others), &others) == 0) ++moved;
+    }
+    ::closedir(d);
+  }
+  log_line("motor: hilo del juego %d solo en el núcleo %d; %d hilos más en los núcleos 0-%d", static_cast<int>(self),
+           gameCpu, moved, gameCpu - 1);
+#endif
 }
 
 void set_keep_textures(bool keep) noexcept {

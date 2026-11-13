@@ -240,6 +240,10 @@ void texture_released(const void* ref) noexcept {
 
 void register_texture_bind_group(gfx::BindGroupRef ref, const gx::ShaderInfo& info) noexcept {
   if (!enabled()) return;
+  // Se llama en cada dibujo desde el hilo del juego: a los ~100 000 (unos segundos) y a los ~3 000 000 (un par de
+  // minutos, para los hilos que nacieron después) se reparten los núcleos.
+  static uint32_t calls = 0;
+  if (++calls == 100000u || calls == 3000000u) core::pin_game_thread();
   core::BindDesc d{};
   for (u32 i = 0; i < gx::MaxTextures && i < 8; ++i) {
     const auto& tex = gx::g_gxState.textures[i];
