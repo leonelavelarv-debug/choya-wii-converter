@@ -14,7 +14,8 @@ def cmd_convert(a):
     prof = profiles.get(a.profile)
     if not os.path.isdir(a.src):
         sys.exit(f"no existe la carpeta {a.src}")
-    engine.run(a.src, a.out, prof, jobs=a.jobs, preview=a.preview, measure=not a.no_psnr)
+    engine.run(a.src, a.out, prof, jobs=a.jobs, preview=a.preview, measure=not a.no_psnr,
+               anims=not a.sin_animaciones)
     print(f"Reporte: {os.path.join(a.out, 'report.md')}")
 
 
@@ -216,6 +217,8 @@ def main(argv=None):
     c.add_argument("-j", "--jobs", type=int, default=0, help="procesos en paralelo (0 = todos los núcleos)")
     c.add_argument("--preview", action="store_true", help="guarda PNG y WAV de los resultados para revisarlos")
     c.add_argument("--no-psnr", action="store_true", help="no mide la calidad (más rápido)")
+    c.add_argument("--sin-animaciones", action="store_true",
+                   help="no hornea las animaciones CHR0 (el port del juego no las usa: paquete más chico)")
     c.set_defaults(fn=cmd_convert)
 
     s = sub.add_parser("scan", help="solo analiza el disco extraído")

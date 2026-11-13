@@ -6,13 +6,14 @@ namespace wl {
 
 bool is_block_format(OutFormat f) {
     return f == OutFormat::ETC2_RGB8 || f == OutFormat::ETC2_RGBA8 || f == OutFormat::R11_EAC ||
-           f == OutFormat::RG11_EAC;
+           f == OutFormat::RG11_EAC || f == OutFormat::ETC2_RGB8A1;
 }
 
 size_t out_level_size(OutFormat f, uint32_t w, uint32_t h) {
     const size_t blocks = size_t((w + 3) / 4) * ((h + 3) / 4);
     switch (f) {
         case OutFormat::ETC2_RGB8:
+        case OutFormat::ETC2_RGB8A1:
         case OutFormat::R11_EAC: return blocks * 8;
         case OutFormat::ETC2_RGBA8:
         case OutFormat::RG11_EAC: return blocks * 16;
@@ -38,6 +39,7 @@ const char* out_format_name(OutFormat f) {
         case OutFormat::L8: return "L8";
         case OutFormat::LA8: return "LA8";
         case OutFormat::RGBA8: return "RGBA8";
+        case OutFormat::ETC2_RGB8A1: return "ETC2_RGB8A1";
     }
     return "?";
 }
@@ -63,6 +65,14 @@ uint64_t texture_key_from_crc(uint32_t crc, uint32_t w, uint32_t h, uint8_t gx_f
 uint64_t texture_key(const uint8_t* level0, size_t size, uint32_t w, uint32_t h, uint8_t gx_fmt) {
     uint32_t crc = uint32_t(crc32(0L, level0, uInt(size)));
     return texture_key_from_crc(crc, w, h, gx_fmt);
+}
+
+uint64_t texture_key(const uint8_t* level0, size_t size, uint32_t w, uint32_t h, uint8_t gx_fmt, const uint8_t* palette,
+                     size_t palette_size, uint8_t palette_fmt) {
+    uLong crc = crc32(0L, level0, uInt(size));
+    crc = crc32(crc, palette, uInt(palette_size));
+    crc = crc32(crc, &palette_fmt, 1);
+    return texture_key_from_crc(uint32_t(crc), w, h, gx_fmt);
 }
 
 uint64_t path_key(const char* path) {

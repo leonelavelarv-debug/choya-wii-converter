@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image
 
 from . import etc
-from .gxtex import INTENSITY_FORMATS, FORMAT_NAMES, GXTexture, decode_mips, I4, I8, IA4, IA8
+from .gxtex import INTENSITY_FORMATS, FORMAT_NAMES, GXTexture, decode_mips, CMPR, I4, I8, IA4, IA8
 from .profiles import Profile
 
 # Formatos de salida (deben coincidir con runtime/include/wl/format.h)
@@ -21,19 +21,20 @@ OUT_RG11_EAC = 7     # intensidad + alfa (IA4/IA8): swizzle RRRG
 OUT_L8 = 8           # GLES 2: luminancia
 OUT_LA8 = 9          # GLES 2: luminancia + alfa
 OUT_RGBA8 = 10
+OUT_ETC2_RGB8A1 = 11  # ETC2 con alfa de 1 bit: CMPR con transparencia (4 bpp en vez de 8)
 
 OUT_NAMES = {
     OUT_ETC2_RGB8: "ETC2_RGB8", OUT_ETC2_RGBA8: "ETC2_RGBA8_EAC", OUT_RGB565: "RGB565",
     OUT_RGBA4444: "RGBA4444", OUT_RGBA5551: "RGBA5551", OUT_R11_EAC: "R11_EAC",
-    OUT_RG11_EAC: "RG11_EAC", OUT_L8: "L8", OUT_LA8: "LA8", OUT_RGBA8: "RGBA8",
+    OUT_RG11_EAC: "RG11_EAC", OUT_L8: "L8", OUT_LA8: "LA8", OUT_RGBA8: "RGBA8", OUT_ETC2_RGB8A1: "ETC2_RGB8A1",
 }
 
 # bits por píxel (los formatos de bloque usan bloques de 4x4)
 OUT_BPP = {
     OUT_ETC2_RGB8: 4, OUT_ETC2_RGBA8: 8, OUT_R11_EAC: 4, OUT_RG11_EAC: 8,
-    OUT_RGB565: 16, OUT_RGBA4444: 16, OUT_RGBA5551: 16, OUT_L8: 8, OUT_LA8: 16, OUT_RGBA8: 32,
+    OUT_RGB565: 16, OUT_RGBA4444: 16, OUT_RGBA5551: 16, OUT_L8: 8, OUT_LA8: 16, OUT_RGBA8: 32, OUT_ETC2_RGB8A1: 4,
 }
-BLOCK_FORMATS = {OUT_ETC2_RGB8, OUT_ETC2_RGBA8, OUT_R11_EAC, OUT_RG11_EAC}
+BLOCK_FORMATS = {OUT_ETC2_RGB8, OUT_ETC2_RGBA8, OUT_R11_EAC, OUT_RG11_EAC, OUT_ETC2_RGB8A1}
 
 
 def out_level_size(fmt: int, w: int, h: int) -> int:
@@ -107,6 +108,8 @@ def choose_format(src_fmt: int, alpha: str, profile: Profile) -> int:
     if profile.gles3:
         if intensity:
             return OUT_R11_EAC if src_fmt in (I4, I8) else OUT_RG11_EAC
+        if alpha == "binary" and src_fmt == CMPR:
+            return OUT_ETC2_RGB8A1   # CMPR solo tiene alfa de 1 bit (y sus huecos son negros, como en ETC2)
         return OUT_ETC2_RGB8 if alpha == "none" else OUT_ETC2_RGBA8
     if intensity:
         # GLES 2 no tiene swizzle: LA8 conserva el alfa = intensidad de I4/I8 y el alfa real de IA4/IA8.
@@ -130,6 +133,8 @@ def encode_level(img: np.ndarray, fmt: int) -> bytes:
         return etc.encode_etc2_rgb(img)
     if fmt == OUT_ETC2_RGBA8:
         return etc.encode_etc2_rgba(img)
+    if fmt == OUT_ETC2_RGB8A1:
+        return etc.encode_etc2_rgba1(img)
     if fmt == OUT_R11_EAC:
         return etc.encode_eac(img[..., 0])
     if fmt == OUT_RG11_EAC:
@@ -152,6 +157,8 @@ def decode_out(fmt: int, data: bytes, w: int, h: int) -> np.ndarray:
         return np.concatenate([rgb, np.full((h, w, 1), 255, np.uint8)], 2)
     if fmt == OUT_ETC2_RGBA8:
         return etc.decode_etc2_rgba(data, w, h)
+    if fmt == OUT_ETC2_RGB8A1:
+        return etc.decode_etc2_rgba1(data, w, h)
     if fmt in (OUT_R11_EAC, OUT_RG11_EAC):
         if fmt == OUT_R11_EAC:
             i = etc.decode_eac(data, w, h)
@@ -185,6 +192,12 @@ def _measure(img: np.ndarray, fmt: int, data: bytes, alpha: str) -> float:
     h, w = img.shape[:2]
     dec = decode_out(fmt, data, w, h)
     ch = 4 if alpha != "none" else 3
+    if alpha == "binary":
+        # El color de un píxel transparente no se ve (ETC2 RGB8A1 y CMPR lo dejan en negro): se compara premultiplicado.
+        img = img.copy()
+        img[img[..., 3] < 128, :3] = 0
+        dec = dec.copy()
+        dec[dec[..., 3] < 128, :3] = 0
     return etc.psnr(dec[..., :ch], img[..., :ch])
 
 
@@ -228,6 +241,8 @@ def convert(tex: GXTexture, profile: Profile, measure: bool = True) -> Converted
                 # I4/I8 llevan la intensidad también en el alfa: RGB565 la perdería.
                 lossy_ok = alpha == "none" and tex.fmt not in INTENSITY_FORMATS and profile.gles3
                 options = [OUT_RGB565, OUT_RGBA8] if lossy_ok else [OUT_RGBA8]
+                if fmt == OUT_ETC2_RGB8A1:
+                    options = [OUT_ETC2_RGBA8, OUT_RGBA8]   # antes de 32 bpp, el de 8 bpp con alfa EAC
                 for alt in options:
                     q2 = _measure(img, alt, encode_level(img, alt), alpha)
                     if q2 >= threshold or alt == OUT_RGBA8:

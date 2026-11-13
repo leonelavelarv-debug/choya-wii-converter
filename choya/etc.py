@@ -4,6 +4,10 @@
   Solo usa los modos individual y diferencial, y nunca desborda el diferencial,
   así que un decodificador ETC2 no entra por error a los modos T/H/planar.
 - encode_eac: bloques de 8 bytes de un canal (alfa de RGBA8_EAC, o R11/RG11).
+- encode_etc2_rgba1: ETC2 con alfa de 1 bit (GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2), 8 bytes por bloque:
+  para CMPR con transparencia (4 bpp en vez de los 8 de RGBA8_EAC). Solo el modo diferencial: el bit que en ETC1
+  elige individual/diferencial dice si el bloque es opaco; si no lo es, el índice 2 es un píxel transparente
+  (RGBA 0) y los índices 0, 1, 3 dan +0, +b, -b de la tabla.
 También incluye decodificadores para medir la calidad (PSNR) en las pruebas.
 """
 from __future__ import annotations
@@ -136,6 +140,77 @@ def encode_etc2_rgb(rgb: np.ndarray) -> bytes:
     return out.astype(">u8").tobytes()
 
 
+# Punchthrough: modificadores por índice (msb lsb) cuando el bloque no es opaco; el índice 2 es transparente.
+PT_MODS = np.stack([np.zeros(8, np.int32), ETC1_TABLES[:, 1], np.zeros(8, np.int32), -ETC1_TABLES[:, 1]], 1)
+
+
+def _best_table_masked(px: np.ndarray, base: np.ndarray, opaque_px: np.ndarray, mods: np.ndarray, allowed):
+    """Como _best_table, solo con los píxeles opacos (los transparentes van al índice 2). allowed: índices válidos."""
+    cand = np.clip(base[:, None, None, :] + mods[None, :, :, None], 0, 255)
+    diff = px[:, None, None, :, :] - cand[:, :, :, None, :]       # (n, 8, 4, 8px, 3)
+    err = (diff * diff).sum(-1).astype(np.int64)
+    big = np.int64(1) << np.int64(40)
+    for k in range(4):
+        if k not in allowed:
+            err[:, :, k, :] = big
+    best_idx = err.argmin(2)
+    best_err = (err.min(2) * opaque_px[:, None, :]).sum(-1)       # (n, 8)
+    table = best_err.argmin(1)
+    n = np.arange(px.shape[0])
+    idx = np.where(opaque_px == 1, best_idx[n, table], 2)
+    return best_err[n, table], table, idx
+
+
+def _encode_rgba1_chunk(blk: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    n = blk.shape[0]
+    blk = blk.astype(np.int32)
+    opaque = (alpha >= 128).astype(np.int64)                      # (n, 16)
+    all_opaque = opaque.all(1)
+    best_err = np.full(n, np.iinfo(np.int64).max, np.int64)
+    best_words = np.zeros(n, np.uint64)
+    for flip, sub in ((0, _SUB_NOFLIP), (1, _SUB_FLIP)):
+        order = np.argsort(sub, kind="stable")
+        pix, op = blk[:, order], opaque[:, order]
+        p0, p1, o0, o1 = pix[:, :8], pix[:, 8:], op[:, :8], op[:, 8:]
+        # Promedio de los píxeles opacos de cada mitad (si no hay, el de todos: no importa).
+        avg0 = np.where(o0.sum(1, keepdims=True) > 0, (p0 * o0[..., None]).sum(1) / np.maximum(o0.sum(1), 1)[:, None],
+                        p0.mean(1))
+        avg1 = np.where(o1.sum(1, keepdims=True) > 0, (p1 * o1[..., None]).sum(1) / np.maximum(o1.sum(1), 1)[:, None],
+                        p1.mean(1))
+        d0 = np.clip(np.rint(avg0 * 31 / 255), 0, 31).astype(np.int32)
+        d1t = np.clip(np.rint(avg1 * 31 / 255), 0, 31).astype(np.int32)
+        d1 = np.clip(d0 + np.clip(d1t - d0, -4, 3), 0, 31)
+        b0 = (d0 << 3) | (d0 >> 2)
+        b1 = (d1 << 3) | (d1 >> 2)
+        # Bloque opaco: la tabla de ETC1 completa. Con transparentes: +0, +b, -b y el índice 2 para el hueco.
+        fo0, uo0, jo0 = _best_table_masked(p0, b0, np.ones_like(o0), ETC1_MODS, (0, 1, 2, 3))
+        fo1, uo1, jo1 = _best_table_masked(p1, b1, np.ones_like(o1), ETC1_MODS, (0, 1, 2, 3))
+        ft0, ut0, jt0 = _best_table_masked(p0, b0, o0, PT_MODS, (0, 1, 3))
+        ft1, ut1, jt1 = _best_table_masked(p1, b1, o1, PT_MODS, (0, 1, 3))
+        ao = all_opaque
+        err = np.where(ao, fo0 + fo1, ft0 + ft1)
+        t0 = np.where(ao, uo0, ut0)
+        t1 = np.where(ao, uo1, ut1)
+        i0 = np.where(ao[:, None], jo0, jt0)
+        i1 = np.where(ao[:, None], jo1, jt1)
+        words = _pack_rgb(flip, 1, (d0, d1, t0, t1, i0, i1), order)
+        # El bit "diferencial" (bit 33) es el de opaco: 1 si no hay transparentes.
+        words = np.where(ao, words, words & ~np.uint64(1 << 33))
+        better = err < best_err
+        best_err = np.where(better, err, best_err)
+        best_words = np.where(better, words, best_words)
+    return best_words
+
+
+def encode_etc2_rgba1(rgba: np.ndarray) -> bytes:
+    """rgba: (h, w, 4) uint8 -> bloques ETC2 RGB8A1 (alfa < 128 = transparente)."""
+    blk, _, _ = _blocks(np.ascontiguousarray(rgba))
+    out = np.empty(blk.shape[0], np.uint64)
+    for s in range(0, blk.shape[0], CHUNK):
+        out[s:s + CHUNK] = _encode_rgba1_chunk(blk[s:s + CHUNK, :, :3], blk[s:s + CHUNK, :, 3])
+    return out.astype(">u8").tobytes()
+
+
 def _encode_eac_chunk(a: np.ndarray) -> np.ndarray:
     """a: (n, 16) int32 en orden ETC -> palabras de 64 bits."""
     n = a.shape[0]
@@ -237,6 +312,40 @@ def decode_etc2_rgb(data: bytes, w: int, h: int) -> np.ndarray:
     mod = ETC1_MODS[table, idx]
     base = np.where(sub[..., None] == 1, base1[:, None, :], base0[:, None, :])
     px = np.clip(base + mod[..., None], 0, 255).astype(np.uint8)
+    return _deblock(px, w, h)
+
+
+def decode_etc2_rgba1(data: bytes, w: int, h: int) -> np.ndarray:
+    """ETC2 RGB8A1 en el subconjunto que produce encode_etc2_rgba1 (solo modo diferencial, sin desbordes)."""
+    words = np.frombuffer(data, ">u8").astype(np.uint64)
+    hi = (words >> np.uint64(32)).astype(np.int64)
+    lo = (words & np.uint64(0xFFFFFFFF)).astype(np.int64)
+    opaque = (hi >> 1) & 1
+    flip = hi & 1
+    t0, t1 = (hi >> 5) & 7, (hi >> 2) & 7
+    n = words.size
+    base0 = np.empty((n, 3), np.int64)
+    base1 = np.empty((n, 3), np.int64)
+    for c, s5 in enumerate((27, 19, 11)):
+        r5 = (hi >> s5) & 31
+        dd = (hi >> (s5 - 3)) & 7
+        dd = np.where(dd >= 4, dd - 8, dd)
+        r5b = r5 + dd
+        if ((r5b < 0) | (r5b > 31)).any():
+            raise ValueError("bloque desbordado (modo T/H/planar no soportado)")
+        base0[:, c] = (r5 << 3) | (r5 >> 2)
+        base1[:, c] = (r5b << 3) | (r5b >> 2)
+    j = np.arange(16)
+    idx = (((lo[:, None] >> (j + 16)) & 1) << 1) | ((lo[:, None] >> j) & 1)
+    sub = np.where(flip[:, None] == 1, _SUB_FLIP[None, :], _SUB_NOFLIP[None, :])
+    table = np.where(sub == 1, t1[:, None], t0[:, None])
+    mod = np.where(opaque[:, None] == 1, ETC1_MODS[table, idx], PT_MODS[table, idx])
+    base = np.where(sub[..., None] == 1, base1[:, None, :], base0[:, None, :])
+    rgb = np.clip(base + mod[..., None], 0, 255)
+    transparent = (opaque[:, None] == 0) & (idx == 2)
+    rgb = np.where(transparent[..., None], 0, rgb)
+    a = np.where(transparent, 0, 255)
+    px = np.concatenate([rgb, a[..., None]], -1).astype(np.uint8)
     return _deblock(px, w, h)
 
 

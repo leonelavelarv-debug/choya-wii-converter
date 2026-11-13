@@ -1,5 +1,7 @@
 // choya_render: dibuja modelos del paquete a PNG sin pantalla (EGL + OpenGL ES 3, p. ej. Mesa en WSL2).
-//   choya_render assets.wlpk carpeta [texto] [--max N] [--size PIXELES] [--simple]
+//   choya_render assets.wlpk carpeta [texto] [--max N] [--size PIXELES] [--simple] [--cuadro F]
+// Con --verificar, compara cada textura ETC2/EAC tal como la lee la GPU con el decodificador de la CPU y termina.
+// Con --cuadro F, cada modelo con animaciones sale también en el cuadro F de cada una (modelo@animación.png).
 // Usa el mismo render que choya_model, así que lo que salga aquí es lo que verás en la consola.
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -13,6 +15,7 @@
 #include <vector>
 
 #include "wl/camera.h"
+#include "wl/gpu_check.h"
 #include "wl/model_render.h"
 #include "wl/pack.h"
 
@@ -73,10 +76,16 @@ int main(int argc, char** argv) {
     const char* filter = nullptr;
     int max_models = 20, size = 512;
     bool simple = false;
+    int anim_frame = -1;
+    bool both_faces = false;  // --doble: sin descartar caras traseras
+    bool verify = false;
     for (int i = 3; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--max") && i + 1 < argc) max_models = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--cuadro") && i + 1 < argc) anim_frame = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--size") && i + 1 < argc) size = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--simple")) simple = true;
+        else if (!std::strcmp(argv[i], "--doble")) both_faces = true;
+        else if (!std::strcmp(argv[i], "--verificar")) verify = true;
         else filter = argv[i];
     }
     wl::Pack pack;
@@ -107,6 +116,17 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("GL_RENDERER: %s\n", glGetString(GL_RENDERER));
+    if (verify) {
+        std::string rep;
+        const wl::GpuCheckResult r = wl::gpu_check_textures(pack, 0, &rep);
+        std::printf("texturas comprimidas: %d revisadas, %d idénticas, %d a 1 de diferencia (11 bits), %d con "
+                    "diferencias, %d sin revisar\n%s", r.checked, r.exact, r.close, r.failed, r.skipped, rep.c_str());
+        if (!r.first_problem.empty()) std::printf("primera diferencia: %s\n", r.first_problem.c_str());
+        eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        eglDestroyContext(dpy, ctx);
+        eglTerminate(dpy);
+        return r.failed == 0 && r.checked > 0 ? 0 : 1;
+    }
     GLuint fb, rb[2];
     glGenFramebuffers(1, &fb);
     glBindFramebuffer(GL_FRAMEBUFFER, fb);
@@ -124,6 +144,7 @@ int main(int argc, char** argv) {
         if (!renderer.init()) return 1;
         wl::RenderOptions opt;
         opt.tev = !simple;
+        opt.cull = !both_faces;
         std::vector<uint8_t> px(size_t(size) * size * 4);
         for (uint32_t i = 0; i < pack.size() && done < max_models; ++i) {
             const wl::PackEntry& e = pack.entry(i);
@@ -133,18 +154,36 @@ int main(int argc, char** argv) {
                 std::printf("DAÑADO %s\n", li.name.c_str());
                 continue;
             }
-            glViewport(0, 0, size, size);
-            glClearColor(0.18f, 0.22f, 0.28f, 1);
-            glDepthMask(GL_TRUE);
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             float view[16], proj[16];
-            wl::orbit_matrices(renderer.view(), wl::Orbit{}, 1.0f, view, proj);
-            renderer.draw(view, proj, opt);
-            glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+            wl::orbit_matrices(renderer.view(), wl::Orbit{}, 1.0f, view, proj);  // la cámara de la pose de reposo
+            auto shot = [&](const std::string& out) {
+                glViewport(0, 0, size, size);
+                glClearColor(0.18f, 0.22f, 0.28f, 1);
+                glDepthMask(GL_TRUE);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                renderer.draw(view, proj, opt);
+                glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                write_png(out, size, size, px);
+            };
             const std::string out = std::string(argv[2]) + "/" + safe(li.name.c_str()) + ".png";
-            write_png(out, size, size, px);
+            shot(out);
             std::printf("%s  %u tri, %u materiales%s\n", out.c_str(), li.triangles, li.materials,
                         li.missing_textures ? "  (texturas faltantes)" : "");
+            if (anim_frame >= 0) {
+                for (uint32_t ai : wl::anims_for(pack, e.key)) {
+                    wl::AnimView a;
+                    if (!wl::anim_view(pack, pack.entry(ai), a)) continue;
+                    renderer.set_pose(a.frame(uint32_t(anim_frame) < a.frames ? uint32_t(anim_frame) : a.frames - 1),
+                                      a.bones);
+                    std::string an = pack.name(pack.entry(ai));
+                    an = an.substr(0, an.find('@'));
+                    const std::string o2 = std::string(argv[2]) + "/" + safe(li.name.c_str()) + "@" +
+                                           safe(an.c_str()) + ".png";
+                    shot(o2);
+                    std::printf("%s  cuadro %d de %u\n", o2.c_str(), anim_frame, a.frames);
+                }
+                renderer.set_pose(nullptr, 0);
+            }
             ++done;
         }
         if (renderer.tev_failures()) std::printf("[tev] %d shaders con error\n", renderer.tev_failures());

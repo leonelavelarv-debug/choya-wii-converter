@@ -30,8 +30,11 @@ class MDL0Error(ValueError):
 class Bone:
     name: str
     index: int
-    node_id: int
-    world: np.ndarray          # 4x4
+    node_id: int               # id de matriz (ResNodeData.mtxID): la que usan las listas de dibujo
+    world: np.ndarray          # 4x4, pose de reposo en espacio del modelo
+    parent: int = -1           # índice en Model.bones (-1 = raíz)
+    flags: int = 0             # ResNodeData.flags (SSC en el bit 5)
+    srt: tuple = ((1.0, 1.0, 1.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))  # escala, giro (grados XYZ), traslación
 
 
 @dataclass
@@ -43,6 +46,23 @@ class Layer:
 
 
 @dataclass
+class TexMatrix:
+    """Matriz de textura del material (ResTexSrtData, la que NW4R carga como matriz posterior GX_PTTEXMTX0 + 3*i)."""
+    rows: tuple                # 2x4 (fila s y fila t) sobre (s, t, 1, 1) de la coordenada que genera el texgen
+    map_mode: int = 0          # 0 coordenadas normales; 1, 3 entorno; 2 proyección; 4 entorno especular
+
+
+@dataclass
+class Channel:
+    """Canal de luz del material (ResChanData): colores de material y ambiente y el control GX (XF 0x100E)."""
+    flags: int = 0             # 1 color de material, 2 alfa de material, 4 color ambiente, 8 alfa ambiente, 16/32 control
+    mat: tuple = (255, 255, 255, 255)
+    amb: tuple = (0, 0, 0, 255)
+    ctrl_color: int = 0
+    ctrl_alpha: int = 0
+
+
+@dataclass
 class Material:
     name: str
     index: int
@@ -51,6 +71,9 @@ class Material:
     xlu: bool = False
     layers: list[Layer] = field(default_factory=list)
     tev: object = None         # tev.TevRaw
+    tex_mtx: list = field(default_factory=lambda: [None] * 8)   # TexMatrix o None por coordenada
+    num_chans: int = 1
+    chans: list = field(default_factory=lambda: [Channel(), Channel()])
 
 
 @dataclass
@@ -76,6 +99,13 @@ class Model:
     has_colors: bool
     stats: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    bones: list[Bone] = field(default_factory=list)
+    skin_idx: np.ndarray | None = None    # (n, 4) uint8: huesos que mueven cada vértice
+    skin_w: np.ndarray | None = None      # (n, 4) uint8: pesos (suman 255; 0 = vértice fijo)
+
+    @property
+    def skinned(self) -> bool:
+        return self.skin_w is not None and bool(self.skin_w.any())
 
 
 # ------------------------------------------------------------------------- utilidades
@@ -314,6 +344,77 @@ def _check_dl(d: bytes, start: int, size: int) -> bool:
 
 # ------------------------------------------------------------------------- lector principal
 
+# ------------------------------------------------------------------------- matrices de textura y canales de luz
+
+MAT_TEXSRT = 0x1A4             # ResMatData.texSrtData (ogws g3d_resmat.h)
+MAT_CHAN = 0x3EC               # ResMatData.chan
+MAT_HEADER = 0x414             # fin de ResMatData
+
+
+def tex_srt_matrix(su: float, sv: float, r_deg: float, tu: float, tv: float, mode: int) -> np.ndarray:
+    """MakeTexSrtMtx_SRT de NW4R (g3d_maya.cpp, g3d_xsi.cpp, g3d_3dsmax.cpp) como 4x4 afín."""
+    sr, cr = math.sin(math.radians(r_deg)), math.cos(math.radians(r_deg))
+    m = np.eye(4)
+    if mode == 1:      # XSI
+        m[0] = (su * cr, -su * sr, 0, (su * sr - su * cr * tu) - su * sr * tv)
+        m[1] = (sv * sr, sv * cr, 0, (-sv * cr - sv * sr * tu) + sv * cr * tv + 1.0)
+    elif mode == 2:    # 3ds Max
+        m[0] = (su * cr, su * sr, 0, -su * cr * (0.5 + tu) + su * sr * (tv - 0.5) + 0.5)
+        m[1] = (-sv * sr, sv * cr, 0, sv * sr * (0.5 + tu) + sv * cr * (tv - 0.5) + 0.5)
+    else:              # Maya (el que usan casi todos)
+        sin_part, cos_part = 0.5 * sr - 0.5, -0.5 * cr
+        m[0] = (su * cr, su * sr, 0, su * (cos_part - sin_part - tu))
+        m[1] = (-sv * sr, sv * cr, 0, sv * (cos_part + sin_part + tv) + 1.0)
+    return m
+
+
+def _read_tex_mtx(d: bytes, m: int, size: int) -> list:
+    """Como LoadResTexSrt (g3d_state.cpp): por coordenada, la SRT del material por la matriz de efecto."""
+    out: list = [None] * 8
+    base = m + MAT_TEXSRT
+    if size < MAT_HEADER or base + 0x248 > len(d):
+        return out
+    flag, mode = struct.unpack_from(">II", d, base)
+    if mode > 2:
+        return out
+    for i in range(8):
+        f = (flag >> (4 * i)) & 0xF
+        if not f & 1:
+            continue
+        su, sv, r, tu, tv = struct.unpack_from(">5f", d, base + 8 + 0x14 * i)
+        eff = base + 0xA8 + 0x34 * i
+        map_mode, misc = d[eff + 2], d[eff + 3]
+        effect = np.eye(4)
+        effect[:3, :] = np.array(struct.unpack_from(">12f", d, eff + 4)).reshape(3, 4)
+        identity = (f & 0xF) == 0xF and (misc & 1)
+        mtx = np.eye(4)
+        if not identity:
+            if not misc & 1:
+                mtx = effect @ mtx
+            srt = tex_srt_matrix(su, sv, r, tu, tv, mode)
+            if map_mode:
+                srt[:2, [2, 3]] = srt[:2, [3, 2]]   # la SRT va sobre la coordenada de entorno (s, t, 1)
+            if (f >> 1) & 7 != 7:                   # escala 1, sin giro ni traslación: CalcTexMtx no la aplica
+                mtx = srt @ mtx
+        if not np.all(np.isfinite(mtx)):
+            continue
+        out[i] = TexMatrix(tuple(float(v) for v in mtx[:2, :].reshape(-1)), map_mode if map_mode <= 4 else 0)
+    return out
+
+
+def _read_chans(d: bytes, m: int, size: int) -> list:
+    chans = [Channel(), Channel()]
+    base = m + MAT_CHAN
+    if size < MAT_HEADER or base + 0x28 > len(d):
+        return chans
+    for c in range(2):
+        o = base + 0x14 * c
+        flags = _u32(d, o)
+        chans[c] = Channel(flags & 0x3F, tuple(d[o + 4:o + 8]), tuple(d[o + 8:o + 12]), _u32(d, o + 0xC),
+                           _u32(d, o + 0x10))
+    return chans
+
+
 def read_mdl0(d: bytes, mdl0: int, name: str) -> Model:
     if d[mdl0:mdl0 + 4] != b"MDL0":
         raise MDL0Error("no es MDL0")
@@ -340,6 +441,8 @@ def read_mdl0(d: bytes, mdl0: int, name: str) -> Model:
     by_node: dict[int, Bone] = {}
     mismatch = 0
     composed: dict[int, np.ndarray] = {}
+    bone_off: list[int] = []
+    bone_parent_off: list[int | None] = []
     for bname, b in sec["bones"]:
         if not _back_ok(d, b, mdl0):
             warnings.append(f"hueso {bname}: estructura inesperada")
@@ -363,11 +466,43 @@ def read_mdl0(d: bytes, mdl0: int, name: str) -> Model:
             mismatch += 1
             world = comp
         composed[b] = world
-        bone = Bone(bname, idx, node, world)
+        bone = Bone(bname, idx, node, world, -1, _u32(d, b + 0x14), (s, r, t))
+        bone_parent_off.append(b + parent_rel if parent_rel else None)
+        bone_off.append(b)
         bones.append(bone)
         by_node[node] = bone
     if mismatch:
         warnings.append(f"{mismatch} huesos con matriz guardada distinta a la calculada; se usó la calculada")
+    index_of_off = {o: i for i, o in enumerate(bone_off)}
+    for bone, po in zip(bones, bone_parent_off):
+        bone.parent = index_of_off.get(po, -1) if po is not None else -1
+    bone_index = {b.node_id: i for i, b in enumerate(bones)}
+    # Matrices con varios huesos (lista NodeMix, código WEIGHT de g3d_calcworld.cpp): id -> [(hueso, peso)].
+    weights: dict[int, list[tuple[int, float]]] = {}
+    for dname, doff in sec["defs"]:
+        if dname != "NodeMix":
+            continue
+        p = doff
+        for _ in range(100000):
+            if p >= len(d) or d[p] == 0x01:
+                break
+            op = d[p]
+            if op == 0x00:
+                p += 1
+            elif op == 0x03:
+                target, n = _u16(d, p + 1), d[p + 3]
+                lst = []
+                for k in range(n):
+                    mid, w = struct.unpack_from(">Hf", d, p + 4 + 6 * k)
+                    if mid in bone_index and w > 0:
+                        lst.append((bone_index[mid], w))
+                weights[target] = lst
+                p += 4 + 6 * n
+            elif op == 0x05:
+                p += 5
+            else:
+                warnings.append(f"NodeMix: código {op:#x} desconocido")
+                break
 
     def arrays(key, reader):
         out = {}
@@ -396,6 +531,10 @@ def read_mdl0(d: bytes, mdl0: int, name: str) -> Model:
         flags = _u32(d, m + 0x10)
         cull = _u32(d, m + 0x18)
         mat = Material(mname, _s32(d, m + 0x0C), m, cull if cull <= 3 else 2, bool(flags & 0x80000000))
+        msize = _u32(d, m)
+        mat.tex_mtx = _read_tex_mtx(d, m, msize)
+        mat.num_chans = min(d[m + 0x15], 2)
+        mat.chans = _read_chans(d, m, msize)
         materials.append(mat)
         mat_by_off[m] = mat
     layer_refs: dict[int, list[tuple[int, str]]] = {}
@@ -446,7 +585,7 @@ def read_mdl0(d: bytes, mdl0: int, name: str) -> Model:
     mat_index = {m.index: i for i, m in enumerate(materials)}
 
     # Objetos
-    pos_l, nrm_l, col_l, uv_l, idx_l = [], [], [], [], []
+    pos_l, nrm_l, col_l, uv_l, idx_l, ski_l, skw_l = [], [], [], [], [], [], []
     obj_meshes: dict[int, tuple[int, int]] = {}
     total = 0
     stats = {"objetos": 0, "triangulos": 0, "omitidos": 0}
@@ -485,14 +624,21 @@ def read_mdl0(d: bytes, mdl0: int, name: str) -> Model:
             nrm = np.zeros((n_tri * 3, 3), np.float32)
             col = np.full((n_tri * 3, 4), 255, np.uint8)
             uv = np.zeros((n_tri * 3, 2), np.float32)
+            sk_i = np.zeros((n_tri * 3, 4), np.uint8)
+            sk_w = np.zeros((n_tri * 3, 4), np.uint8)
             k = 0
             for tri in tris:
                 for v, snap_i in tri:
                     m = single
+                    mid = node if node >= 0 else None
                     if "pnmtx" in v:
                         mid = snaps[snap_i].get(v["pnmtx"] // 3)
                         b = by_node.get(mid) if mid is not None else None
                         m = b.world if b is not None else None
+                    if mid is not None:
+                        infl = [(bone_index[mid], 1.0)] if mid in bone_index else weights.get(mid, [])
+                        if infl:
+                            sk_i[k], sk_w[k] = _pack_influences(infl)
                     p3 = P[v["pos"]] if v["pos"] < len(P) else np.zeros(3, np.float32)
                     if m is not None:
                         p3 = m[:3, :3] @ p3 + m[:3, 3]
@@ -514,6 +660,8 @@ def read_mdl0(d: bytes, mdl0: int, name: str) -> Model:
             nrm_l.append(nrm)
             col_l.append(col)
             uv_l.append(uv)
+            ski_l.append(sk_i)
+            skw_l.append(sk_w)
             idx_l.append(np.arange(total, total + n_tri * 3, dtype=np.uint32))
             obj_meshes[oidx] = (total, n_tri * 3)
             total += n_tri * 3
@@ -542,21 +690,42 @@ def read_mdl0(d: bytes, mdl0: int, name: str) -> Model:
         positions=cat(pos_l, (0, 3), np.float32), normals=cat(nrm_l, (0, 3), np.float32),
         colors=cat(col_l, (0, 4), np.uint8), uvs=cat(uv_l, (0, 2), np.float32),
         indices=cat(idx_l, (0,), np.uint32), submeshes=submeshes, materials=materials,
-        has_normals=has_n, has_colors=has_c, stats=stats, warnings=warnings)
+        has_normals=has_n, has_colors=has_c, stats=stats, warnings=warnings, bones=bones,
+        skin_idx=cat(ski_l, (0, 4), np.uint8), skin_w=cat(skw_l, (0, 4), np.uint8))
+    if len(bones) > 255:
+        model.skin_w[:] = 0                 # el formato guarda el hueso en un byte
+        warnings.append("más de 255 huesos: se queda en la pose de reposo")
     model.stats.update(huesos=len(bones), materiales=len(materials), version=version)
     _weld(model)
     return model
+
+
+def _pack_influences(infl: list[tuple[int, float]]) -> tuple[list[int], list[int]]:
+    """Hasta 4 huesos con más peso; pesos en bytes que suman 255."""
+    infl = sorted(infl, key=lambda x: -x[1])[:4]
+    total = sum(w for _, w in infl) or 1.0
+    ws = [int(round(255 * w / total)) for _, w in infl]
+    ws[0] += 255 - sum(ws)
+    idx = [b for b, _ in infl]
+    return idx + [0] * (4 - len(idx)), ws + [0] * (4 - len(ws))
 
 
 def _weld(m: Model):
     """Une vértices idénticos para reducir el búfer (los triángulos se generan sin compartir)."""
     if m.positions.shape[0] == 0:
         return
-    key = np.concatenate([m.positions.view(np.uint32), m.normals.view(np.uint32),
-                          m.colors.view(np.uint8).reshape(-1, 4).astype(np.uint32), m.uvs.view(np.uint32)], 1)
+    n0 = len(m.positions)
+    skin = m.skin_idx is not None and len(m.skin_idx) == n0
+    parts = [m.positions.view(np.uint32), m.normals.view(np.uint32),
+             m.colors.view(np.uint8).reshape(-1, 4).astype(np.uint32), m.uvs.view(np.uint32)]
+    if skin:
+        parts += [m.skin_idx.astype(np.uint32), m.skin_w.astype(np.uint32)]
+    key = np.concatenate(parts, 1)
     _uniq, first, inverse = np.unique(key, axis=0, return_index=True, return_inverse=True)
     inverse = inverse.reshape(-1)
     m.positions, m.normals, m.colors, m.uvs = m.positions[first], m.normals[first], m.colors[first], m.uvs[first]
+    if skin:
+        m.skin_idx, m.skin_w = m.skin_idx[first], m.skin_w[first]
     m.indices = inverse[m.indices].astype(np.uint32)
 
 

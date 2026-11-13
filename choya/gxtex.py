@@ -36,6 +36,7 @@ class GXTexture:
     palette: np.ndarray | None = None   # (N, 4) uint8 RGBA para C4/C8/C14X2
     palette_fmt: int | None = None
     source: str = ""
+    palette_raw: bytes | None = None    # la paleta tal como está en el disco (para la clave del paquete)
     notes: list[str] = field(default_factory=list)
 
     @property

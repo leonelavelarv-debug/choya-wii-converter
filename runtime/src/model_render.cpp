@@ -4,6 +4,8 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 #include "wl/texcache.h"
 
@@ -16,12 +18,38 @@ layout(location = 0) in vec3 pos;
 layout(location = 1) in vec3 nrm;
 layout(location = 2) in vec4 col;
 layout(location = 3) in vec2 uv;
+layout(location = 4) in uvec4 bone;
+layout(location = 5) in vec4 weight;
 uniform mat4 mvp;
+layout(std140) uniform Skin { vec4 skin[765]; };
+uniform bool skinned;
 out vec3 v_nrm;
 out vec4 v_col;
 out vec2 v_uv;
-void main() { v_nrm = nrm; v_col = col; v_uv = uv; gl_Position = mvp * vec4(pos, 1.0); }
+vec3 skin_point(uint b, vec4 p) { return vec3(dot(skin[3u*b], p), dot(skin[3u*b+1u], p), dot(skin[3u*b+2u], p)); }
+void main() {
+  vec3 p = pos, n = nrm;
+  float ws = weight.x + weight.y + weight.z + weight.w;
+  if (skinned && ws > 0.0) {
+    p = vec3(0.0); n = vec3(0.0);
+    for (int k = 0; k < 4; ++k) {
+      if (weight[k] <= 0.0) continue;
+      p += weight[k] * skin_point(bone[k], vec4(pos, 1.0));
+      n += weight[k] * skin_point(bone[k], vec4(nrm, 0.0));
+    }
+    p /= ws;
+  }
+  v_nrm = n; v_col = col; v_uv = uv; gl_Position = mvp * vec4(p, 1.0);
+}
 )";
+
+constexpr GLuint kSkinBinding = 0;
+constexpr uint32_t kMaxBones = 255;
+
+void bind_skin_block(GLuint prog) {
+    const GLuint idx = glGetUniformBlockIndex(prog, "Skin");
+    if (idx != GL_INVALID_INDEX) glUniformBlockBinding(prog, idx, kSkinBinding);
+}
 
 const char* kSimpleFS = R"(#version 300 es
 precision mediump float;
@@ -70,6 +98,15 @@ GLuint link(GLuint v, GLuint f) {
     glLinkProgram(p);
     glDeleteShader(v);
     glDeleteShader(f);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char buf[2048];
+        glGetProgramInfoLog(p, sizeof buf, nullptr, buf);
+        std::fprintf(stderr, "programa sin enlazar: %s\n", buf);
+        glDeleteProgram(p);
+        return 0;
+    }
     return p;
 }
 
@@ -94,6 +131,23 @@ ModelRenderer::~ModelRenderer() {
         if (kv.second.id) glDeleteProgram(kv.second.id);
     if (simple_) glDeleteProgram(simple_);
     if (white_) glDeleteTextures(1, &white_);
+    if (skin_ubo_) glDeleteBuffers(1, &skin_ubo_);
+}
+
+void ModelRenderer::set_pose(const float* skin, uint32_t bones) {
+    // 3 filas vec4 por hueso (std140); sin animación, la identidad (la pose de reposo).
+    std::vector<float> data(size_t(kMaxBones) * 12, 0.0f);
+    for (uint32_t b = 0; b < kMaxBones; ++b) {
+        float* r = &data[size_t(b) * 12];
+        if (skin && b < bones) {
+            std::memcpy(r, skin + size_t(b) * 12, 12 * sizeof(float));
+        } else {
+            r[0] = r[5] = r[10] = 1.0f;
+        }
+    }
+    glBindBuffer(GL_UNIFORM_BUFFER, skin_ubo_);
+    glBufferSubData(GL_UNIFORM_BUFFER, 0, GLsizeiptr(data.size() * sizeof(float)), data.data());
+    glBindBuffer(GL_UNIFORM_BUFFER, 0);
 }
 
 bool ModelRenderer::init() {
@@ -105,6 +159,12 @@ bool ModelRenderer::init() {
         return false;
     }
     simple_ = link(v, f);
+    bind_skin_block(simple_);
+    glGenBuffers(1, &skin_ubo_);
+    glBindBuffer(GL_UNIFORM_BUFFER, skin_ubo_);
+    glBufferData(GL_UNIFORM_BUFFER, GLsizeiptr(kMaxBones * 12 * sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_UNIFORM_BUFFER, 0);
+    set_pose(nullptr, 0);
     u_mvp_ = glGetUniformLocation(simple_, "mvp");
     u_tex_ = glGetUniformLocation(simple_, "tex");
     u_use_tex_ = glGetUniformLocation(simple_, "use_tex");
@@ -112,6 +172,7 @@ bool ModelRenderer::init() {
     u_lit_ = glGetUniformLocation(simple_, "lit");
     u_atest_ = glGetUniformLocation(simple_, "alpha_test");
     u_light_ = glGetUniformLocation(simple_, "light");
+    u_skinned_ = glGetUniformLocation(simple_, "skinned");
     const uint8_t px[4] = {255, 255, 255, 255};
     glGenTextures(1, &white_);
     glBindTexture(GL_TEXTURE_2D, white_);
@@ -142,7 +203,9 @@ ModelRenderer::Program ModelRenderer::build(const TevMaterialRec& m, const TevGe
         return p;
     }
     p.id = link(v, f);
+    bind_skin_block(p.id);
     p.mvp = glGetUniformLocation(p.id, "mvp");
+    p.skinned = glGetUniformLocation(p.id, "skinned");
     p.mv = glGetUniformLocation(p.id, "mv");
     p.light = glGetUniformLocation(p.id, "light");
     for (int i = 0; i < 8; ++i) p.tex[i] = glGetUniformLocation(p.id, ("tex" + std::to_string(i)).c_str());
@@ -166,6 +229,7 @@ LoadInfo ModelRenderer::load(uint32_t index) {
     const PackEntry& e = pack_.entry(index);
     info.name = pack_.name(e);
     if (!model_view(pack_, e, view_)) return info;
+    set_pose(nullptr, 0);
     glGenVertexArrays(1, &vao_);
     glBindVertexArray(vao_);
     glGenBuffers(1, &vbo_);
@@ -179,7 +243,9 @@ LoadInfo ModelRenderer::load(uint32_t index) {
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, st, reinterpret_cast<void*>(12));
     glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, st, reinterpret_cast<void*>(24));
     glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, st, reinterpret_cast<void*>(28));
-    for (GLuint a = 0; a < 4; ++a) glEnableVertexAttribArray(a);
+    glVertexAttribIPointer(4, 4, GL_UNSIGNED_BYTE, st, reinterpret_cast<void*>(36));
+    glVertexAttribPointer(5, 4, GL_UNSIGNED_BYTE, GL_TRUE, st, reinterpret_cast<void*>(40));
+    for (GLuint a = 0; a < 6; ++a) glEnableVertexAttribArray(a);
     glBindVertexArray(0);
 
     gen_.has_normals = view_.flags & MODEL_HAS_NORMALS;
@@ -209,6 +275,7 @@ void ModelRenderer::draw(const float view[16], const float proj[16], const Rende
     if (!vao_) return;
     float pv[16];
     mul4(proj, view, pv);
+    glBindBufferBase(GL_UNIFORM_BUFFER, kSkinBinding, skin_ubo_);
     glBindVertexArray(vao_);
     glFrontFace(GL_CW);  // GX usa sentido horario como cara frontal
     for (int pass = 0; pass < 2; ++pass) {  // 0: opacos, 1: translúcidos
@@ -249,6 +316,7 @@ void ModelRenderer::draw(const float view[16], const float proj[16], const Rende
                 glDepthMask(bs.depth_write ? GL_TRUE : GL_FALSE);
                 glUseProgram(tp->id);
                 glUniformMatrix4fv(tp->mvp, 1, GL_FALSE, pv);
+                glUniform1i(tp->skinned, (view_.flags & MODEL_SKINNED) ? 1 : 0);
                 glUniformMatrix4fv(tp->mv, 1, GL_FALSE, view);
                 glUniform3f(tp->light, 0.30f, 0.55f, 0.78f);
                 for (int k = 0; k < 8; ++k) {
@@ -277,6 +345,7 @@ void ModelRenderer::draw(const float view[16], const float proj[16], const Rende
                 }
                 glUseProgram(simple_);
                 glUniformMatrix4fv(u_mvp_, 1, GL_FALSE, pv);
+                glUniform1i(u_skinned_, (view_.flags & MODEL_SKINNED) ? 1 : 0);
                 glUniform3f(u_light_, 0.40f, 0.80f, 0.45f);
                 glUniform1i(u_vcol_, gen_.has_vertex_color ? 1 : 0);
                 glUniform1i(u_lit_, (opt.lighting && gen_.has_normals) ? 1 : 0);

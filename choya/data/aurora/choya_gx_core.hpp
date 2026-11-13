@@ -130,6 +130,9 @@ void texture_released(uint64_t id) noexcept;
 bool pack_open(const char* path) noexcept;
 bool pack_is_open() noexcept;
 int64_t pack_lookup(uint32_t gxFormat, uint32_t width, uint32_t height, const uint8_t* level0, size_t size) noexcept;
+// Con paleta (C4/C8/C14X2, 0.21.0): la clave sigue con los bytes de la paleta y su formato (como el conversor).
+int64_t pack_lookup_palette(uint32_t gxFormat, uint32_t width, uint32_t height, const uint8_t* level0, size_t size,
+                            const uint8_t* tlut, size_t tlutBytes, uint32_t tlutFormat) noexcept;
 bool texture_from_pack(uint64_t id, int64_t index) noexcept;
 // Una textura en un formato del paquete (volcados y pruebas): format = formato de salida del conversor (1..10).
 void texture_packed_data(uint64_t id, uint32_t width, uint32_t height, uint32_t mips, uint8_t format, uint8_t flags,

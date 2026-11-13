@@ -78,8 +78,33 @@ int main(int argc, char** argv) {
         if (!renderer.init()) return 1;
         wl::Orbit orbit;
         wl::RenderOptions opt;
+        // Animaciones del modelo (CHR0 horneadas): R2 la siguiente, L2 la anterior; la última vuelve a la pose de
+        // reposo. En el teclado, N.
+        std::vector<uint32_t> anims;
+        int anim_cur = -1;
+        wl::AnimView anim;
+        float anim_t = 0;
+        bool r2_down = false, l2_down = false;
+        auto pick_anim = [&](int step) {
+            if (anims.empty()) return;
+            const int n = int(anims.size()) + 1;  // + reposo
+            anim_cur = ((anim_cur + 1 + step) % n + n) % n - 1;
+            anim_t = 0;
+            if (anim_cur < 0 || !wl::anim_view(pack, pack.entry(anims[size_t(anim_cur)]), anim)) {
+                anim_cur = -1;
+                renderer.set_pose(nullptr, 0);
+                std::printf("  pose de reposo\n");
+            } else {
+                std::printf("  animación %d/%zu: %s (%u cuadros)\n", anim_cur + 1, anims.size(),
+                            pack.name(pack.entry(anims[size_t(anim_cur)])), anim.frames);
+            }
+            std::fflush(stdout);
+        };
         auto load = [&](size_t i) {
             const wl::LoadInfo li = renderer.load(models[i]);
+            anims = wl::anims_for(pack, pack.entry(models[i]).key);
+            anim_cur = -1;
+            if (!anims.empty()) std::printf("  %zu animaciones (R2/L2 o N)\n", anims.size());
             if (!li.ok) {
                 std::printf("[%zu/%zu] %s  DAÑADO\n", i + 1, models.size(), li.name.c_str());
             } else {
@@ -107,6 +132,7 @@ int main(int argc, char** argv) {
                         case SDLK_PAGEDOWN: step = 1; break;
                         case SDLK_PAGEUP: step = -1; break;
                         case SDLK_c: opt.cull = !opt.cull; break;
+                        case SDLK_n: pick_anim(1); break;
                         case SDLK_t: opt.textures = !opt.textures; break;
                         case SDLK_l: opt.lighting = !opt.lighting; break;
                         case SDLK_y: opt.tev = !opt.tev; break;
@@ -158,6 +184,28 @@ int main(int argc, char** argv) {
                 const float ay = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY) / 32767.0f;
                 if (std::fabs(ax) > 0.25f) rx += ax;
                 if (std::fabs(ay) > 0.25f) ry -= ay;
+            }
+            for (SDL_GameController* c : pads) {
+                const bool r2 = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000;
+                const bool l2 = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 16000;
+                if (r2 && !r2_down) pick_anim(1);
+                if (l2 && !l2_down) pick_anim(-1);
+                r2_down = r2;
+                l2_down = l2;
+            }
+            if (anim_cur >= 0 && anim.frames) {
+                anim_t += dt * anim.fps;
+                uint32_t f = uint32_t(anim_t);
+                if (f >= anim.frames) {
+                    if (anim.loop) {
+                        anim_t = std::fmod(anim_t, float(anim.frames));
+                        f = uint32_t(anim_t) % anim.frames;
+                    } else {
+                        f = anim.frames - 1;
+                        if (anim_t > anim.frames + 30) anim_t = 0;  // al terminar, pausa y otra vez
+                    }
+                }
+                renderer.set_pose(anim.frame(f), anim.bones);
             }
             orbit.yaw += rx * 1.8f * dt;
             orbit.pitch = std::clamp(orbit.pitch + ry * 1.2f * dt, -1.45f, 1.45f);

@@ -39,9 +39,14 @@ export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
 export WL_PACK="$GAMEDIR/gamedata/assets.wlpk"
 export WL_FILES="$GAMEDIR/gamedata/files"
 
+# Un archivo vacío llamado "verificar" junto al port: wl_view compara cada textura ETC2/EAC como la lee la GPU con
+# el decodificador de la CPU, lo escribe en log.txt y sale (sin abrir el visor).
+WL_ARGS=""
+[ -f "$GAMEDIR/verificar" ] && WL_ARGS="--verificar"
+
 $GPTOKEYB "__BIN__" -c "$GAMEDIR/__BIN__.gptk" &
 pm_platform_helper "$GAMEDIR/__BIN__"
-./__BIN__ "$WL_PACK"
+./__BIN__ "$WL_PACK" $WL_ARGS
 
 pm_finish
 """

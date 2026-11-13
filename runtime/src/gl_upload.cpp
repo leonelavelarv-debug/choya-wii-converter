@@ -18,6 +18,7 @@ GLFmt gl_format(OutFormat f) {
     switch (f) {
         case OutFormat::ETC2_RGB8: return {true, 0x9274 /*GL_COMPRESSED_RGB8_ETC2*/, 0, 0};
         case OutFormat::ETC2_RGBA8: return {true, 0x9278 /*GL_COMPRESSED_RGBA8_ETC2_EAC*/, 0, 0};
+        case OutFormat::ETC2_RGB8A1: return {true, 0x9276 /*GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2*/, 0, 0};
         case OutFormat::R11_EAC: return {true, 0x9270 /*GL_COMPRESSED_R11_EAC*/, 0, 0};
         case OutFormat::RG11_EAC: return {true, 0x9272 /*GL_COMPRESSED_RG11_EAC*/, 0, 0};
         case OutFormat::RGB565: return {false, GL_RGB, GL_RGB, GL_UNSIGNED_SHORT_5_6_5};

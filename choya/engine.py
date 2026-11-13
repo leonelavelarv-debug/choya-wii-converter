@@ -9,7 +9,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 from PIL import Image
 
-from . import __version__, audio as au, mdl0 as md, model_pack as mp, optimize as opt, pack, scan as sc
+from . import __version__, anim as an, audio as au, mdl0 as md, model_pack as mp, optimize as opt, pack, scan as sc
 from .gxtex import FORMAT_NAMES, GXTexture, level_size
 from .profiles import Profile
 
@@ -25,7 +25,10 @@ def _convert_one(args):
 def _convert_audio(args):
     item, profile = args
     try:
-        dec = au.read_brstm(item.data) if item.kind == "brstm" else au.read_dsp(item.data)
+        if item.kind == "brsar":
+            dec = item.decoded
+        else:
+            dec = au.read_brstm(item.data) if item.kind == "brstm" else au.read_dsp(item.data)
         before = dec.samples.shape[0] * dec.samples.shape[1] * 2
         if profile.keep_adpcm and au.can_keep_adpcm(dec, profile.audio_mono_sfx, profile.music_min_seconds):
             return item, dec, None, before, None
@@ -50,9 +53,11 @@ def _find_texture(model_path: str, tname: str, key_by_name: dict[str, int]) -> i
     return best
 
 
-def _convert_models(res, writer, key_by_name, preview_by_key, obj_dir, errors) -> dict:
+def _convert_models(res, writer, key_by_name, preview_by_key, obj_dir, errors, anims: bool = True) -> dict:
     rows = []
-    totals = dict(modelos=0, fallidos=0, objetos=0, triangulos=0, omitidos=0, sin_textura=0, avisos=0)
+    totals = dict(modelos=0, fallidos=0, objetos=0, triangulos=0, omitidos=0, sin_textura=0, avisos=0,
+                  con_huesos=0, animaciones=0, animaciones_fallidas=0, animaciones_sin_modelo=0)
+    loaded: list = []    # (BRRES, modelo, clave, nombre) de los modelos con huesos
     if obj_dir:
         os.makedirs(obj_dir, exist_ok=True)
     for item in res.models:
@@ -76,9 +81,12 @@ def _convert_models(res, writer, key_by_name, preview_by_key, obj_dir, errors) -
             keys.append(key)
             maps.append(mat_maps)
             files.append(f"../texturas/{preview_by_key[key]}" if key in preview_by_key else None)
-        writer.add(pack.Entry(kind=pack.KIND_MODEL, fmt=2, count=len(m.submeshes), flags=0,
+        writer.add(pack.Entry(kind=pack.KIND_MODEL, fmt=mp.VERSION, count=len(m.submeshes), flags=0,
                               key=pack.path_key(full), name=full, data=mp.pack_model(m, keys, maps),
                               extra0=len(m.positions), extra1=len(m.indices), extra2=m.stats["triangulos"]))
+        if m.skinned:
+            totals["con_huesos"] += 1
+            loaded.append((item.path, m, pack.path_key(full), full))
         if obj_dir and len(m.indices):
             mp.write_obj(m, os.path.join(obj_dir, _safe(full) + ".obj"), files)
         totals["modelos"] += 1
@@ -89,7 +97,45 @@ def _convert_models(res, writer, key_by_name, preview_by_key, obj_dir, errors) -
         rows.append(dict(name=full, version=m.version, vertices=len(m.positions), triangles=m.stats["triangulos"],
                          objects=m.stats["objetos"], skipped=m.stats["omitidos"], materials=len(m.materials),
                          missing_textures=missing, warnings=m.warnings[:10]))
-    return dict(summary=totals, models=rows)
+    anim_rows = _convert_anims(res, writer, loaded, totals, errors) if anims else []
+    return dict(summary=totals, models=rows, anims=anim_rows)
+
+
+MAX_MODELS_PER_ANIM = 8
+
+
+def _convert_anims(res, writer, loaded, totals, errors) -> list:
+    """Cada CHR0 se hornea para los modelos con huesos que tienen todos sus nodos (primero los del mismo BRRES)."""
+    rows = []
+    bone_sets = [(path, m, key, full, {b.name for b in m.bones}) for path, m, key, full in loaded]
+    for item in getattr(res, "anims", []):
+        full_anim = f"{item.path}/{item.name}"
+        try:
+            c = an.read_chr0(item.brres, item.offset, item.name)
+        except Exception as e:  # noqa: BLE001
+            totals["animaciones_fallidas"] += 1
+            errors.append(f"animación {full_anim}: {type(e).__name__}: {e}")
+            continue
+        nodes = set(c.nodes)
+        targets = [t for t in bone_sets if nodes and nodes <= t[4]]
+        targets.sort(key=lambda t: (t[0] != item.path, len(t[4])))
+        if not targets:
+            totals["animaciones_sin_modelo"] += 1
+            continue
+        for path, m, key, full, _names in targets[:MAX_MODELS_PER_ANIM]:
+            try:
+                baked = an.bake(m, c)
+            except Exception as e:  # noqa: BLE001
+                totals["animaciones_fallidas"] += 1
+                errors.append(f"animación {full_anim} en {full}: {type(e).__name__}: {e}")
+                continue
+            name = f"{full_anim}@{full}"
+            writer.add(pack.Entry(kind=pack.KIND_ANIM, fmt=1, count=0, flags=1 if c.loop else 0,
+                                  key=pack.path_key(name), name=name, data=an.pack_anim(key, baked, c.loop),
+                                  extra0=c.frames, extra1=len(m.bones), extra2=0))
+            totals["animaciones"] += 1
+            rows.append(dict(name=name, frames=c.frames, bones=len(m.bones), loop=c.loop))
+    return rows
 
 
 def preview_png(conv: opt.ConvertedTexture) -> Image.Image:
@@ -103,7 +149,7 @@ def _safe(name: str) -> str:
 
 
 def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool = False,
-        measure: bool = True, log=print) -> dict:
+        measure: bool = True, log=print, anims: bool = True) -> dict:
     t0 = time.time()
     os.makedirs(out_dir, exist_ok=True)
     disc = sc.disc_info(src)
@@ -118,7 +164,7 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
     key_by_name: dict[str, int] = {}
     for tex in res.textures:
         lvl0 = tex.data[:level_size(tex.fmt, tex.width, tex.height)]
-        key = pack.texture_key(lvl0, tex.width, tex.height, tex.fmt)
+        key = pack.texture_key(lvl0, tex.width, tex.height, tex.fmt, tex.palette_raw, tex.palette_fmt or 0)
         refs[key] = refs.get(key, 0) + 1
         unique.setdefault(key, tex)
         key_by_name[tex.name] = key
@@ -147,7 +193,7 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
             errors.append(err)
             continue
         lvl0 = tex.data[:level_size(tex.fmt, tex.width, tex.height)]
-        key = pack.texture_key(lvl0, tex.width, tex.height, tex.fmt)
+        key = pack.texture_key(lvl0, tex.width, tex.height, tex.fmt, tex.palette_raw, tex.palette_fmt or 0)
         flags = {opt.OUT_R11_EAC: pack.TEXFLAG_SWIZZLE_I, opt.OUT_RG11_EAC: pack.TEXFLAG_SWIZZLE_IA}.get(conv.fmt, 0)
         writer.add(pack.Entry(kind=pack.KIND_TEXTURE, fmt=conv.fmt, count=conv.mips, flags=flags, key=key,
                               name=tex.name, data=conv.data, width=conv.width, height=conv.height,
@@ -191,7 +237,7 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
                 f.write(au.wav_bytes(conv or dec))
 
     model_report = _convert_models(res, writer, key_by_name, preview_by_key,
-                                   os.path.join(prev_dir, "modelos") if preview else None, errors)
+                                   os.path.join(prev_dir, "modelos") if preview else None, errors, anims=anims)
 
     tex_report.sort(key=lambda r: -r["naive_vram"])
     summary = dict(
@@ -218,7 +264,8 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
     pack_path = os.path.join(out_dir, "assets.wlpk")
     size = writer.write(pack_path, manifest)
     summary["models"] = model_report["summary"]
-    report = dict(manifest=manifest, summary=summary, models=model_report["models"], counts=res.counts, pending=res.pending,
+    report = dict(manifest=manifest, summary=summary, models=model_report["models"],
+                  anims=model_report.get("anims", []), counts=res.counts, pending=res.pending,
                   errors=errors, textures=tex_report, audio=audio_report, pack_bytes=size,
                   disc_files=res.files, disc_bytes=res.disc_bytes, seconds=round(time.time() - t0, 1))
     with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
@@ -286,7 +333,11 @@ def render_markdown(r: dict) -> str:
         lines += ["", "## Modelos 3D", "",
                   f"{mo['modelos']} modelos leídos, {mo['fallidos']} fallidos. {mo['objetos']} objetos y "
                   f"{mo['triangulos']} triángulos; {mo['omitidos']} objetos omitidos, "
-                  f"{mo['sin_textura']} materiales sin su textura, {mo['avisos']} avisos."]
+                  f"{mo['sin_textura']} materiales sin su textura, {mo['avisos']} avisos.",
+                  "",
+                  f"{mo.get('con_huesos', 0)} modelos con huesos; {mo.get('animaciones', 0)} animaciones CHR0 "
+                  f"horneadas, {mo.get('animaciones_sin_modelo', 0)} sin un modelo con todos sus huesos, "
+                  f"{mo.get('animaciones_fallidas', 0)} fallidas."]
         problem = [x for x in r.get("models", []) if x["warnings"] or x["skipped"] or x["missing_textures"]]
         if problem:
             lines += ["", "| Modelo | Triángulos | Omitidos | Sin textura | Primer aviso |", "| --- | --- | --- | --- | --- |"]

@@ -1225,6 +1225,35 @@ AURORA_EDITS = [
      "                                          {static_cast<const uint8_t*>(obj.data), dataSize}, false, nameStr);\n"
      "    }\n",
      "motor de Choya (recursos convertidos)"),
+    # Texturas con paleta (0.21.0): si el paquete tiene esa imagen con esa paleta (la clave del conversor incluye la
+    # paleta), el motor usa la versión convertida y aurora no la combina en la CPU.
+    ("lib/gx/gx.cpp",
+     "    auto converted = gfx::convert_texture_palette(\n"
+     "        obj.format(), obj.width(), obj.height(), obj.mip_count(), {static_cast<const u8*>(obj.data), dataSize},\n"
+     "        tlut.format, tlut.numEntries, {static_cast<const u8*>(tlut.data), static_cast<size_t>(tlut.numEntries) * 2});\n"
+     "    if (converted.data.empty()) {\n"
+     "      return {};\n"
+     "    }\n"
+     "    handle =\n"
+     "        gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), GX_TF_RGBA8_PC,\n"
+     "                                   {converted.data.data(), converted.data.size()}, false, \"GX Static Palette Texture\");\n"
+     "    handle->hasArbitraryMips = converted.hasArbitraryMips;\n",
+     "    handle = choya::packed_palette_texture(obj.width(), obj.height(), obj.mip_count(), obj.format(),  // choya\n"
+     "                                           static_cast<const uint8_t*>(obj.data), dataSize, tlut.format,\n"
+     "                                           tlut.numEntries, static_cast<const uint8_t*>(tlut.data));\n"
+     "    if (!handle) {\n"
+     "      auto converted = gfx::convert_texture_palette(\n"
+     "          obj.format(), obj.width(), obj.height(), obj.mip_count(), {static_cast<const u8*>(obj.data), dataSize},\n"
+     "          tlut.format, tlut.numEntries, {static_cast<const u8*>(tlut.data), static_cast<size_t>(tlut.numEntries) * 2});\n"
+     "      if (converted.data.empty()) {\n"
+     "        return {};\n"
+     "      }\n"
+     "      handle =\n"
+     "          gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), GX_TF_RGBA8_PC,\n"
+     "                                     {converted.data.data(), converted.data.size()}, false, \"GX Static Palette Texture\");\n"
+     "      handle->hasArbitraryMips = converted.hasArbitraryMips;\n"
+     "    }\n",
+     "motor de Choya (texturas con paleta del paquete)"),
     # El plano de "zfreeze" (GX coplanar) se calcula en cada dibujo transformando 3 vértices en la CPU (8.7 ms por
     # cuadro en Golf, en el hilo del juego); el motor de Choya no lo usa, así que con el motor encendido no se calcula.
     ("lib/gx/command_processor.cpp", '#include "shader_info.hpp"\n#include "../internal.hpp"\n',

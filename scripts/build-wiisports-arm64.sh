@@ -68,7 +68,7 @@ if [ "${CHOYA_SIN_PAQUETE:-0}" = 1 ]; then
 elif [ -n "${CHOYA_PAQUETE:-}" ]; then
   [ -f "$CHOYA_PAQUETE" ] && PAQ="$CHOYA_PAQUETE" || echo "AVISO: no existe CHOYA_PAQUETE=$CHOYA_PAQUETE" | tee -a "$LOG"
 else
-  SELLO="$(cd "$CHOYA/choya" && cat audio.py compress.py containers.py engine.py etc.py gxtex.py mdl0.py model_pack.py \
+  SELLO="$(cd "$CHOYA/choya" && cat anim.py audio.py brsar.py compress.py containers.py engine.py etc.py gxtex.py mdl0.py model_pack.py \
            optimize.py pack.py profiles.py scan.py tev.py u8.py 2>/dev/null | sha1sum | cut -c1-12) $PERFIL_TEX"
   if [ -f "$PAQ_DIR/assets.wlpk" ] && [ "$(cat "$PAQ_DIR/sello.txt" 2>/dev/null)" = "$SELLO" ]; then
     PAQ="$PAQ_DIR/assets.wlpk"
@@ -80,7 +80,7 @@ else
   else
     echo "Convirtiendo $DISCO con el perfil $PERFIL_TEX (la primera vez tarda unos minutos)..." | tee -a "$LOG"
     rm -rf "$PAQ_DIR.tmp"
-    if (cd "$CHOYA" && python3 -m choya convert "$DISCO" "$PAQ_DIR.tmp" -p "$PERFIL_TEX") >>"$LOG" 2>&1 \
+    if (cd "$CHOYA" && python3 -m choya convert "$DISCO" "$PAQ_DIR.tmp" -p "$PERFIL_TEX" --sin-animaciones) >>"$LOG" 2>&1 \
        && [ -f "$PAQ_DIR.tmp/assets.wlpk" ]; then
       rm -rf "$PAQ_DIR" && mv "$PAQ_DIR.tmp" "$PAQ_DIR" && echo "$SELLO" > "$PAQ_DIR/sello.txt"
       PAQ="$PAQ_DIR/assets.wlpk"

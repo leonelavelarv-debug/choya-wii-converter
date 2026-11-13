@@ -210,6 +210,126 @@ def build_dsp(pcm: np.ndarray, rate: int) -> tuple[bytes, np.ndarray]:
     return hdr + data, sim
 
 
+def dsp_address(sample: int) -> int:
+    """Muestra → dirección en nibbles de DSP-ADPCM (2 nibbles de cabecera por trama de 14 muestras)."""
+    return (sample // 14) * 16 + sample % 14 + 2
+
+
+def build_brsar(sounds: list, seq_names=()) -> tuple[bytes, list[np.ndarray]]:
+    """BRSAR 1.3 con un grupo y un RWSD: sounds = [(nombre, pcm mono o estéreo (n, c), frecuencia, bucle)].
+    Los sonidos de onda llevan una nota cada uno; seq_names agrega sonidos de secuencia (solo se cuentan).
+    Devuelve el archivo y lo que debe salir al decodificar (la simulación del codificador)."""
+    ref = lambda off: struct.pack(">BBHI", 1, 0, 0, off)
+    # --- RWSD: DATA (sonido → nota → onda) y WAVE (información de cada onda); las muestras van aparte ---
+    wave_data = bytearray()
+    infos, expected = [], []
+    for name, pcm, rate, loop in sounds:
+        pcm = pcm if pcm.ndim == 2 else pcm[:, None]
+        chans, sims = [], []
+        for c in range(pcm.shape[1]):
+            data, sim = dsp_encode(pcm[:, c])
+            wave_data.extend(b"\x00" * ((-len(wave_data)) % 32))
+            chans.append((len(wave_data), data))
+            wave_data.extend(data)
+            sims.append(sim)
+        expected.append(np.stack(sims, 1))
+        n = len(pcm)
+        info = bytearray(struct.pack(">BBBBHHII", 2, 1 if loop else 0, pcm.shape[1], 0, rate, 0,
+                                     dsp_address(0), dsp_address(n - 1)))
+        info += struct.pack(">III", 0x1C, 0, 0)               # tabla de canales en +0x1C, datos desde 0
+        table = 0x1C
+        ch_info = table + 4 * len(chans)
+        adpcm = ch_info + 0x1C * len(chans)
+        body = bytearray()
+        for k, (off, data) in enumerate(chans):
+            body += struct.pack(">I", ch_info + 0x1C * k)
+        for k, (off, data) in enumerate(chans):
+            body += struct.pack(">II5I", off, adpcm + 0x30 * k, 0, 0, 0, 0, 0)
+        for k, (off, data) in enumerate(chans):
+            body += struct.pack(">16h", *COEFS) + struct.pack(">HHhhHhhH", 0, data[0], 0, 0, data[0], 0, 0, 0)
+        infos.append(bytes(info) + bytes(body))
+    count = len(sounds)
+    # DATA: wsdCount, refWsd[]; cada Wsd {info, pistas, notas}; notas: tabla con una NoteInfo (onda i).
+    data_body = bytearray(struct.pack(">I", count) + b"\x00" * (8 * count))
+    for i in range(count):
+        wsd = len(data_body)
+        data_body += b"\x00" * 0x18
+        notes = len(data_body)
+        data_body += struct.pack(">I", 1) + b"\x00" * 8
+        note = len(data_body)
+        data_body += struct.pack(">i", i) + b"\x00" * 0x2C
+        data_body[4 + 8 * i:12 + 8 * i] = ref(wsd)
+        data_body[wsd + 0x10:wsd + 0x18] = ref(notes)
+        data_body[notes + 4:notes + 12] = ref(note)
+    data_blk = b"DATA" + struct.pack(">I", 8 + len(data_body)) + bytes(data_body)
+    data_blk += b"\x00" * ((-len(data_blk)) % 32)
+    wave_body = bytearray(struct.pack(">I", count) + b"\x00" * (4 * count))
+    for i, info in enumerate(infos):
+        wave_body.extend(b"\x00" * ((-(len(wave_body) + 8)) % 4))
+        struct.pack_into(">I", wave_body, 4 + 4 * i, 8 + len(wave_body))
+        wave_body += info
+    wave_blk = b"WAVE" + struct.pack(">I", 8 + len(wave_body)) + bytes(wave_body)
+    rwsd = bytearray(b"RWSD" + struct.pack(">HHIHH", 0xFEFF, 0x0102, 0, 0x20, 2))
+    rwsd += struct.pack(">IIII", 0x20, len(data_blk), 0x20 + len(data_blk), len(wave_blk))
+    rwsd += bytes(data_blk) + wave_blk
+    rwsd += b"\x00" * ((-len(rwsd)) % 32)
+    struct.pack_into(">I", rwsd, 8, len(rwsd))
+    # --- RSAR ---
+    names = [n for n, *_ in sounds] + list(seq_names)
+    symb_body = bytearray(struct.pack(">5I", 0x14, 0, 0, 0, 0))
+    table = len(symb_body)
+    symb_body += struct.pack(">I", len(names)) + b"\x00" * (4 * len(names))
+    for i, n in enumerate(names):
+        struct.pack_into(">I", symb_body, table + 4 + 4 * i, len(symb_body))
+        symb_body += n.encode() + b"\x00"
+    symb = b"SYMB" + struct.pack(">I", 8 + len(symb_body)) + bytes(symb_body)
+    symb += b"\x00" * ((-len(symb)) % 32)
+    info = bytearray(b"\x00" * 0x30)
+    def put(blob):
+        info.extend(b"\x00" * ((-len(info)) % 4))
+        off = len(info)
+        info.extend(blob)
+        return off
+    sound_offs = []
+    for i, n in enumerate(names):
+        wave = i < count
+        sub = put(struct.pack(">iIBB2x", i, 1, 64, 0))
+        common = bytearray(struct.pack(">III", i, 0, 0) + b"\x00" * 8 + struct.pack(">BBBB", 127, 64,
+                                                                                    3 if wave else 1, 0))
+        common += ref(sub) + b"\x00" * 10
+        sound_offs.append(put(bytes(common)))
+    sound_tbl = put(struct.pack(">I", len(names)) + b"".join(ref(o) for o in sound_offs))
+    pos = put(struct.pack(">II", 0, 0))
+    pos_tbl = put(struct.pack(">I", 1) + ref(pos))
+    finfo = put(struct.pack(">III", len(rwsd), len(wave_data), 1) + b"\x00" * 8 + ref(pos_tbl))
+    file_tbl = put(struct.pack(">I", 1) + ref(finfo))
+    header_size = 0x40
+    file_blk_off = header_size + len(symb) + ((8 + 0x200 + 31) // 32) * 32  # se corrige abajo
+    item = put(struct.pack(">IIIII", 0, 0, len(rwsd), 0, len(wave_data)))
+    item_tbl = put(struct.pack(">I", 1) + ref(item))
+    group = put(struct.pack(">Ii", 0, 1) + b"\x00" * 8 + struct.pack(">IIII", 0, 0, 0, 0) + ref(item_tbl))
+    group_tbl = put(struct.pack(">I", 1) + ref(group))
+    info[0:8] = ref(sound_tbl)
+    info[0x18:0x20] = ref(file_tbl)
+    info[0x20:0x28] = ref(group_tbl)
+    info_blk = bytearray(b"INFO" + struct.pack(">I", 8 + len(info)) + bytes(info))
+    info_blk += b"\x00" * ((-len(info_blk)) % 32)
+    file_blk_off = header_size + len(symb) + len(info_blk)
+    rwsd_off = file_blk_off + 0x20
+    wave_off = rwsd_off + len(rwsd)
+    # posiciones del grupo (absolutas en el archivo)
+    struct.pack_into(">IIII", info_blk, 8 + group + 0x10, rwsd_off, len(rwsd), wave_off, len(wave_data))
+    file_blk = b"FILE" + struct.pack(">I", 0x20 + len(rwsd) + len(wave_data)) + b"\x00" * 0x18 + bytes(rwsd) + \
+        bytes(wave_data)
+    out = bytearray(b"RSAR" + struct.pack(">HHIHH", 0xFEFF, 0x0103, 0, header_size, 3))
+    out += struct.pack(">IIIIII", header_size, len(symb), header_size + len(symb), len(info_blk), file_blk_off,
+                       len(file_blk))
+    out += b"\x00" * (header_size - len(out))
+    out += symb + bytes(info_blk) + file_blk
+    struct.pack_into(">I", out, 8, len(out))
+    return bytes(out), expected
+
+
 def build_brstm(channels: list[np.ndarray], rate: int, block_size: int = 0x2000, loop: bool = False) -> tuple[bytes, list[np.ndarray]]:
     """BRSTM DSP-ADPCM con varios canales y bloques entrelazados."""
     enc = [dsp_encode(c) for c in channels]
@@ -435,8 +555,12 @@ def sphere(rings=12, segs=16, radius=1.0):
 
 
 def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0, 0.0), tev=None,
-               extra_textures=(), mesh=None) -> bytes:
-    """MDL0 v9 con un hueso, 4 vértices (tira de 2 triángulos), UV y un material con textura."""
+               extra_textures=(), mesh=None, tex_srt=None, srt_mode=0, chans=None, num_chans=1,
+               skeleton=None, obj_node=0, nodemix=None) -> bytes:
+    """MDL0 v9 con un hueso, 4 vértices (tira de 2 triángulos), UV y un material con textura.
+    tex_srt = {coordenada: (su, sv, giro, tu, tv)} (ResTexSrtData, modo srt_mode); chans = [(banderas, mat, amb,
+    control del color, control del alfa)] (ResChanData); skeleton = [(nombre, padre, traslación)] reemplaza al hueso
+    único (id de matriz = índice); obj_node = matriz del objeto; nodemix = {id: [(id de hueso, peso)]}."""
     m = _Blob()
     m.alloc(0x40)
     m.b[0:4] = b"MDL0"
@@ -459,13 +583,23 @@ def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0,
             m.put(">HHHHii", g + 8 + i * 16, 0, 0, 0, 0, string(n) - g, off - g)
         return g
 
-    # hueso
-    bone = m.alloc(0xD0)
-    m.put(">i", bone + 4, -bone)
-    m.put(">ii", bone + 0x0C, 0, 0)
-    m.put(">3f", bone + 0x20, 1, 1, 1)
-    m.put(">3f", bone + 0x38, *translate)
-    m.put(">12f", bone + 0x70, 1, 0, 0, translate[0], 0, 1, 0, translate[1], 0, 0, 1, translate[2])
+    # huesos (ResNodeData: id, id de matriz, SRT, padre relativo y matriz del modelo)
+    skeleton = skeleton or [("root", -1, translate)]
+    bone_offs, worlds = [], []
+    for bi, (bname, parent, tr) in enumerate(skeleton):
+        bone = m.alloc(0xD0)
+        bone_offs.append(bone)
+        w = list(tr) if parent < 0 else [a + b for a, b in zip(worlds[parent], tr)]
+        worlds.append(w)
+        m.put(">i", bone + 4, -bone)
+        m.put(">ii", bone + 0x0C, bi, bi)
+        m.put(">3f", bone + 0x20, 1, 1, 1)
+        m.put(">3f", bone + 0x38, *tr)
+        if parent >= 0:
+            m.put(">i", bone + 0x5C, bone_offs[parent] - bone)
+        m.put(">12f", bone + 0x70, 1, 0, 0, w[0], 0, 1, 0, w[1], 0, 0, 1, w[2])
+        m.put(">12f", bone + 0xA0, 1, 0, 0, -w[0], 0, 1, 0, -w[1], 0, 0, 1, -w[2])
+    bone = bone_offs[0]
     # posiciones (s16, 8 bits de fracción), normales (float) y UV (float)
     if mesh:
         pos, nrms, uvs, tris = mesh
@@ -496,7 +630,8 @@ def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0,
                            alpha_env("ZERO", "TEXA", "RASA", "ZERO"), 0x0C, 0x1C)])
     sh_dl, mt_dl, nst, ntg = tev
     textures = [texture] + list(extra_textures)
-    mat_size = (0x40 + 0x34 * len(textures) + 0x1F) & ~0x1F
+    mat_head = 0x418                                     # ResMatData completo (ogws g3d_resmat.h)
+    mat_size = (mat_head + 0x34 * len(textures) + 0x1F) & ~0x1F
     dl_rel = mat_size
     mat_size += (len(mt_dl) + 0x1F) & ~0x1F
     mat = m.alloc(mat_size, 32)
@@ -504,7 +639,22 @@ def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0,
     m.put(">I", mat, mat_size)
     m.put(">i", mat + 4, -mat)
     m.put(">ii", mat + 0x0C, 0, 0)
-    m.b[mat + 0x14:mat + 0x18] = bytes([ntg, 1, nst, 0])
+    m.b[mat + 0x14:mat + 0x18] = bytes([ntg, num_chans, nst, 0])
+    if tex_srt:
+        flag = 0
+        for i, (su, sv, r, tu, tv) in tex_srt.items():
+            flag |= 1 << (4 * i)
+            m.put(">5f", mat + 0x1A4 + 8 + 0x14 * i, su, sv, r, tu, tv)
+            eff = mat + 0x1A4 + 0xA8 + 0x34 * i
+            m.b[eff:eff + 4] = bytes([0xFF, 0xFF, 0, 1])           # sin cámara ni luz, mapeo normal, efecto identidad
+            m.put(">12f", eff + 4, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0)
+        m.put(">II", mat + 0x1A4, flag, srt_mode)
+    for c, (flags, matc, ambc, ctrl_c, ctrl_a) in enumerate(chans or []):
+        o = mat + 0x3EC + 0x14 * c
+        m.put(">I", o, flags)
+        m.b[o + 4:o + 8] = bytes(matc)
+        m.b[o + 8:o + 12] = bytes(ambc)
+        m.put(">II", o + 0xC, ctrl_c, ctrl_a)
     m.put(">I", mat + 0x18, 2)
     m.put(">i", mat + 0x28, shader - mat)
     m.put(">i", mat + 0x38, dl_rel)
@@ -515,7 +665,7 @@ def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0,
     m.b[shader + 0x20:shader + 0x20 + len(sh_dl)] = sh_dl
     layers = []
     for i, tname in enumerate(textures):
-        layer = mat + 0x40 + 0x34 * i
+        layer = mat + mat_head + 0x34 * i
         m.put(">i", layer, string(tname) - layer)
         m.put(">I", layer + 0x10, i)
         m.put(">II", layer + 0x18, 1, 1)
@@ -537,7 +687,7 @@ def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0,
     prim = m.alloc(len(dl), 32)
     m.b[prim:prim + len(dl)] = dl
     m.put(">i", obj + 4, -obj)
-    m.put(">i", obj + 0x08, 0)
+    m.put(">i", obj + 0x08, obj_node)
     m.put(">II", obj + 0x0C, vcd_lo, vcd_hi)
     m.put(">IIi", obj + 0x24, len(dl), len(dl), prim - (obj + 0x24))
     m.put(">i", obj + 0x3C, 0)
@@ -551,8 +701,19 @@ def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0,
     # definiciones
     draw = m.alloc(16)
     m.b[draw:draw + 9] = bytes([0x04, 0, 0, 0, 0, 0, 0, 0, 0x01])
+    defs = [("DrawOpa", draw)]
+    if nodemix:
+        body = bytearray()
+        for target, lst in nodemix.items():
+            body += bytes([0x03]) + struct.pack(">HB", target, len(lst))
+            for mid, w in lst:
+                body += struct.pack(">Hf", mid, w)
+        body += b"\x01"
+        nm = m.alloc(len(body))
+        m.b[nm:nm + len(body)] = body
+        defs.insert(0, ("NodeMix", nm))
     groups = {
-        "defs": group([("DrawOpa", draw)]), "bones": group([("root", bone)]),
+        "defs": group(defs), "bones": group([(sk[0], bo) for sk, bo in zip(skeleton, bone_offs)]),
         "verts": group([("pos", vb)]), "uvs": group([("uv", ub)]),
         **({"norms": group([("nrm", nb)])} if nb else {}), "mats": group([("mat", mat)]),
         "shaders": group([("mat", shader)]),
@@ -562,6 +723,61 @@ def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0,
     for i, sname in enumerate(order):
         m.put(">i", 0x10 + 4 * i, groups.get(sname, 0))
     m.put(">i", 0x10 + 44, string(name))
+    m.b.extend(b"\x00" * ((-len(m.b)) % 32))
+    m.put(">I", 4, len(m.b))
+    return bytes(m.b)
+
+
+def build_chr0(nodes: dict, frames: int, loop: bool = True) -> bytes:
+    """CHR0 versión 4 (Wii Sports). nodes = {hueso: {"r": [pista x, y, z], "t": [...], "s": [...]}} donde cada pista
+    es un número (constante) o [(cuadro, valor, pendiente)] (FVS96)."""
+    m = _Blob()
+    m.alloc(0x2C)
+    m.b[0:4] = b"CHR0"
+    m.put(">I", 8, 4)
+    m.put(">HHII", 0x1C, frames, len(nodes), 1 if loop else 0, 0)
+    names = list(nodes)
+    str_offs = {}
+    for n in names:
+        off = m.alloc(4 + len(n) + 1)
+        m.put(">I", off, len(n))
+        m.b[off + 4:off + 4 + len(n)] = n.encode()
+        str_offs[n] = off + 4
+    dic = m.alloc(8 + 16 * (len(names) + 1))
+    m.put(">II", dic, 8 + 16 * (len(names) + 1), len(names))
+    m.put(">HHHHii", dic + 8, 0xFFFF, 0, 1, 0, 0, 0)
+    m.put(">i", 0x10, dic)
+    for i, n in enumerate(names, 1):
+        spec = nodes[n]
+        flags = 1          # ANM_EXISTS
+        comps = []         # (valor constante | lista de claves) en orden S, R, T
+        fmt_bits = {"s": 25, "r": 27, "t": 30}
+        has = {"s": 1 << 22, "r": 1 << 23, "t": 1 << 24}
+        const_bits = {"s": (13, 14, 15), "r": (16, 17, 18), "t": (19, 20, 21)}
+        for kind in ("s", "r", "t"):
+            if kind not in spec:
+                continue
+            flags |= has[kind]
+            tracks = spec[kind]
+            if any(isinstance(t, list) for t in tracks):
+                flags |= 3 << fmt_bits[kind]                         # FVS96
+            for axis, t in enumerate(tracks):
+                if not isinstance(t, list):
+                    if any(isinstance(x, list) for x in tracks):
+                        flags |= 1 << const_bits[kind][axis]
+                comps.append(t)
+        nd = m.alloc(8 + 4 * len(comps))
+        m.put(">iI", nd, str_offs[n] - nd, flags)
+        for k, t in enumerate(comps):
+            if isinstance(t, list):
+                fv = m.alloc(8 + 12 * len(t))
+                m.put(">HHf", fv, len(t), 0, 1.0 / max(1.0, t[-1][0] - t[0][0]))
+                for j, (fr, val, sl) in enumerate(t):
+                    m.put(">fff", fv + 8 + 12 * j, fr, val, sl)
+                m.put(">i", nd + 8 + 4 * k, fv - nd)
+            else:
+                m.put(">f", nd + 8 + 4 * k, t)
+        m.put(">HHHHii", dic + 8 + 16 * i, 0, 0, 0, 0, str_offs[n] - dic, nd - dic)
     m.b.extend(b"\x00" * ((-len(m.b)) % 32))
     m.put(">I", 4, len(m.b))
     return bytes(m.b)

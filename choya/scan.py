@@ -4,15 +4,16 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from . import audio, compress, containers, mdl0, u8
+from . import anim, audio, brsar, compress, containers, mdl0, u8
 from .gxtex import GXTexture
 
 
 @dataclass
 class AudioItem:
-    path: str          # ruta dentro del disco (clave para el runtime)
-    kind: str          # "brstm" | "dsp"
+    path: str          # ruta dentro del disco (clave para el runtime); en un BRSAR, "archivo.brsar/NOMBRE"
+    kind: str          # "brstm" | "dsp" | "brsar" (ya decodificado)
     data: bytes
+    decoded: object = None   # audio.DecodedAudio de un sonido de onda de BRSAR
 
 
 @dataclass
@@ -24,11 +25,20 @@ class ModelItem:
 
 
 @dataclass
+class AnimItem:
+    path: str          # ruta del BRRES dentro del disco
+    name: str          # nombre de la animación CHR0
+    offset: int
+    brres: bytes
+
+
+@dataclass
 class ScanResult:
     root: str
     textures: list[GXTexture] = field(default_factory=list)
     audio: list[AudioItem] = field(default_factory=list)
     models: list[ModelItem] = field(default_factory=list)
+    anims: list[AnimItem] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
     pending: list[str] = field(default_factory=list)     # tipos conocidos aún no convertidos
     errors: list[str] = field(default_factory=list)
@@ -111,8 +121,11 @@ def _visit(res: ScanResult, path: str, data: bytes, depth: int):
             res.bump("BRRES")
             texs, counts = containers.read_brres(raw, source=path)
             res.textures.extend(texs)
-            for mname, moff in mdl0.find_models(raw, containers.brres_sections(raw)):
+            secs = containers.brres_sections(raw)
+            for mname, moff in mdl0.find_models(raw, secs):
                 res.models.append(ModelItem(path, mname, moff, raw))
+            for aname, aoff in anim.find_chr0(raw, secs):
+                res.anims.append(AnimItem(path, aname, aoff, raw))
             for folder, n in counts.items():
                 res.bump(folder, n)
         elif containers.is_tpl(raw):
@@ -126,7 +139,15 @@ def _visit(res: ScanResult, path: str, data: bytes, depth: int):
             res.audio.append(AudioItem(path, "dsp", raw))
         elif raw[:4] == b"RSAR":
             res.bump("BRSAR")
-            res.pending.append(f"{path}: archivo de sonido BRSAR (efectos); se lee tal cual desde el disco")
+            br = brsar.read_brsar(raw)
+            for name, dec in br.sounds:
+                res.audio.append(AudioItem(f"{path}/{name}", "brsar", b"", dec))
+            for kind, n in br.counts.items():
+                res.bump(f"BRSAR:{kind}", n)
+            res.errors.extend(f"{path}: {w}" for w in br.warnings)
+            if br.counts.get("secuencias"):
+                res.pending.append(f"{path}: {br.counts['secuencias']} sonidos de secuencia (RSEQ, como MIDI con "
+                                   "instrumentos) siguen en el disco; los de onda van al paquete")
         elif raw[:4] in (b"RLYT", b"RLAN"):
             res.bump("layout")
         else:

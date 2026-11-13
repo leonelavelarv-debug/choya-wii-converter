@@ -32,7 +32,10 @@ uint64_t TextureCache::probe(const uint8_t* p, size_t n) {
 uint32_t TextureCache::get(const GXTexDesc& d) {
     const size_t size = gx_level_size(d.format, d.width, d.height);
     if (!d.data || size == 0) return 0;
-    const uint64_t pr = probe(d.data, size);
+    const bool paletted = d.format == GX_C4 || d.format == GX_C8 || d.format == GX_C14X2;
+    if (paletted && !d.palette) return 0;  // sin paleta no hay clave: lo decodifica la capa GX
+    uint64_t pr = probe(d.data, size);
+    if (paletted) pr ^= probe(d.palette, size_t(d.palette_entries) * 2) * 0x9E3779B97F4A7C15ull;
     auto it = by_ptr_.find(d.data);
     if (it != by_ptr_.end()) {
         if (it->second.probe == pr) {
@@ -41,7 +44,9 @@ uint32_t TextureCache::get(const GXTexDesc& d) {
         }
         ++stats_.rehashes;  // misma dirección, otra textura
     }
-    const uint64_t key = texture_key(d.data, size, d.width, d.height, d.format);
+    const uint64_t key = paletted ? texture_key(d.data, size, d.width, d.height, d.format, d.palette,
+                                                size_t(d.palette_entries) * 2, d.palette_format)
+                                  : texture_key(d.data, size, d.width, d.height, d.format);
     uint32_t gl = 0;
     auto kt = by_key_.find(key);
     if (kt != by_key_.end()) {

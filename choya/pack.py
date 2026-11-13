@@ -27,6 +27,7 @@ assert HEADER.size == 64 and ENTRY.size == 48
 KIND_TEXTURE = 1
 KIND_AUDIO = 2
 KIND_MODEL = 3     # ver choya/model_pack.py
+KIND_ANIM = 4      # animación de huesos horneada para un modelo; ver choya/anim.py
 
 AUDIO_PCM16 = 1
 AUDIO_DSPADPCM = 2   # ver audio.adpcm_payload; el runtime lo decodifica al vuelo
@@ -38,9 +39,15 @@ AUDIOFLAG_LOOP = 1
 FLAG_GLES3 = 1
 
 
-def texture_key(level0: bytes, width: int, height: int, gx_fmt: int) -> int:
-    """Clave que el runtime recalcula en GXInitTexObj: crc32 del nivel 0 + dimensiones + formato."""
-    crc = zlib.crc32(level0) & 0xFFFFFFFF
+def texture_key(level0: bytes, width: int, height: int, gx_fmt: int, palette: bytes | None = None,
+                palette_fmt: int = 0) -> int:
+    """Clave que el runtime recalcula en GXInitTexObj: crc32 del nivel 0 + dimensiones + formato.
+    Con paleta (C4/C8/C14X2), el crc sigue con los bytes de la paleta (big-endian, como en el disco y en la memoria
+    del juego) y con su formato: la misma imagen con otra paleta es otra textura."""
+    crc = zlib.crc32(level0)
+    if palette is not None:
+        crc = zlib.crc32(bytes([palette_fmt & 0xFF]), zlib.crc32(palette, crc))
+    crc &= 0xFFFFFFFF
     return (crc << 32) | (((width - 1) & 0x3FF) << 22) | (((height - 1) & 0x3FF) << 12) | ((gx_fmt & 0xF) << 8)
 
 

@@ -297,6 +297,23 @@ gfx::TextureHandle packed_static_texture(uint32_t width, uint32_t height, uint32
   return handle;
 }
 
+gfx::TextureHandle packed_palette_texture(uint32_t width, uint32_t height, uint32_t mips, uint32_t format,
+                                          const uint8_t* data, size_t size, uint32_t tlutFormat, uint32_t tlutEntries,
+                                          const uint8_t* tlut) noexcept {
+  if (!enabled() || !core::pack_is_open() || data == nullptr || tlut == nullptr || tlutEntries == 0) return {};
+  if (format != GX_TF_C4 && format != GX_TF_C8 && format != GX_TF_C14X2) return {};
+  const int64_t entry =
+      core::pack_lookup_palette(format, width, height, data, size, tlut, size_t{tlutEntries} * 2, tlutFormat);
+  if (entry < 0) return {};
+  uint32_t maxMips = 1;
+  for (uint32_t d = std::max(width, height); d > 1; d >>= 1) ++maxMips;
+  // Como la de aurora para las texturas con paleta: RGBA8 ya combinada (Dawn no dibuja en la consola).
+  auto handle = gfx::new_dynamic_texture_2d(width, height, std::clamp<uint32_t>(mips, 1, maxMips), GX_TF_RGBA8_PC,
+                                            "GX Static Palette Texture (paquete)");
+  if (!handle || !core::texture_from_pack(reinterpret_cast<uintptr_t>(handle.get()), entry)) return {};
+  return handle;
+}
+
 void texture_uploaded(const gfx::TextureRef& ref, const uint8_t* data, size_t size) noexcept {
   if (!enabled() || ref.format != wgpu::TextureFormat::RGBA8Unorm) return;  // índices de paleta: todavía no
   core::texture_data(reinterpret_cast<uintptr_t>(&ref), ref.size.width, ref.size.height, ref.mipCount, data, size);

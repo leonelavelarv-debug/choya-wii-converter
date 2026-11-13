@@ -407,7 +407,9 @@ struct WlpkEntry {
 #pragma pack(pop)
 static_assert(sizeof(WlpkHeader) == 64 && sizeof(WlpkEntry) == 48);
 enum PackFormat : uint8_t {
-  kPkEtc2Rgb8 = 1, kPkEtc2Rgba8, kPkRgb565, kPkRgba4444, kPkRgba5551, kPkR11Eac, kPkRg11Eac, kPkL8, kPkLa8, kPkRgba8
+  kPkEtc2Rgb8 = 1, kPkEtc2Rgba8, kPkRgb565, kPkRgba4444, kPkRgba5551, kPkR11Eac, kPkRg11Eac, kPkL8, kPkLa8, kPkRgba8,
+  kPkEtc2Rgb8A1,  // 0.21.0: ETC2 con alfa de 1 bit (CMPR con transparencia)
+  kPkLast = kPkEtc2Rgb8A1
 };
 constexpr uint8_t kPkSwizzleI = 1, kPkSwizzleIA = 2;
 
@@ -422,7 +424,7 @@ PackState& pack() {
   return *p;
 }
 
-uint32_t crc32_ieee(const uint8_t* data, size_t size) {
+uint32_t crc32_ieee(const uint8_t* data, size_t size, uint32_t prev = 0) {  // prev: crc anterior (como zlib)
   static const auto table = [] {
     std::array<uint32_t, 256> t{};
     for (uint32_t i = 0; i < 256; ++i) {
@@ -432,7 +434,7 @@ uint32_t crc32_ieee(const uint8_t* data, size_t size) {
     }
     return t;
   }();
-  uint32_t c = 0xFFFFFFFFu;
+  uint32_t c = prev ^ 0xFFFFFFFFu;
   for (size_t i = 0; i < size; ++i) c = table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
   return c ^ 0xFFFFFFFFu;
 }
@@ -440,7 +442,7 @@ uint32_t crc32_ieee(const uint8_t* data, size_t size) {
 size_t pack_level_size(uint8_t fmt, uint32_t w, uint32_t h) {
   const size_t blocks = static_cast<size_t>((w + 3) / 4) * ((h + 3) / 4);
   switch (fmt) {
-  case kPkEtc2Rgb8: case kPkR11Eac: return blocks * 8;
+  case kPkEtc2Rgb8: case kPkR11Eac: case kPkEtc2Rgb8A1: return blocks * 8;
   case kPkEtc2Rgba8: case kPkRg11Eac: return blocks * 16;
   case kPkRgb565: case kPkRgba4444: case kPkRgba5551: case kPkLa8: return static_cast<size_t>(w) * h * 2;
   case kPkL8: return static_cast<size_t>(w) * h;
@@ -2046,6 +2048,7 @@ bool upload_packed(GlTexture& tex, const TexUpload& up) {
   switch (up.packFormat) {
   case kPkEtc2Rgb8: internal = 0x9274; compressed = true; break;   // GL_COMPRESSED_RGB8_ETC2
   case kPkEtc2Rgba8: internal = 0x9278; compressed = true; break;  // GL_COMPRESSED_RGBA8_ETC2_EAC
+  case kPkEtc2Rgb8A1: internal = 0x9276; compressed = true; break; // GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2
   case kPkR11Eac: internal = 0x9270; compressed = true; break;     // GL_COMPRESSED_R11_EAC
   case kPkRg11Eac: internal = 0x9272; compressed = true; break;    // GL_COMPRESSED_RG11_EAC
   case kPkRgb565: internal = kRgb565; format = kRgb; type = kUnsignedShort565; break;
@@ -2880,10 +2883,11 @@ bool pack_open(const char* path) noexcept {
   size_t audio = 0, compressed = 0;
   uint64_t bytes = 0;
   for (const WlpkEntry& e : toc) {
-    if (e.kind == 1 && e.format >= kPkEtc2Rgb8 && e.format <= kPkRgba8 && e.width > 0 && e.height > 0) {
+    if (e.kind == 1 && e.format >= kPkEtc2Rgb8 && e.format <= kPkLast && e.width > 0 && e.height > 0) {
       pk.textures.push_back(e);
       bytes += e.dataSize;
-      if (e.format == kPkEtc2Rgb8 || e.format == kPkEtc2Rgba8 || e.format == kPkR11Eac || e.format == kPkRg11Eac) {
+      if (e.format == kPkEtc2Rgb8 || e.format == kPkEtc2Rgba8 || e.format == kPkR11Eac || e.format == kPkRg11Eac ||
+          e.format == kPkEtc2Rgb8A1) {
         ++compressed;
       }
     } else if (e.kind == 2) {
@@ -2905,6 +2909,28 @@ int64_t pack_lookup(uint32_t fmt, uint32_t width, uint32_t height, const uint8_t
   const size_t need = gx_level_size(fmt, width, height);
   if (need == 0 || size < need) return -1;
   const uint64_t key = texture_key(level0, need, width, height, fmt);
+  auto it = std::lower_bound(pk.textures.begin(), pk.textures.end(), key,
+                             [](const WlpkEntry& e, uint64_t k) { return e.key < k; });
+  if (it == pk.textures.end() || it->key != key) {
+    ++pk.misses;
+    return -1;
+  }
+  return it - pk.textures.begin();
+}
+
+int64_t pack_lookup_palette(uint32_t fmt, uint32_t width, uint32_t height, const uint8_t* level0, size_t size,
+                            const uint8_t* tlut, size_t tlutBytes, uint32_t tlutFormat) noexcept {
+  auto& pk = pack();
+  if (pk.file == nullptr || level0 == nullptr || tlut == nullptr || tlutBytes == 0 || width == 0 || height == 0 ||
+      width > 1024 || height > 1024) {
+    return -1;
+  }
+  const size_t need = gx_level_size(fmt, width, height);
+  if (need == 0 || size < need) return -1;
+  const uint8_t pf = static_cast<uint8_t>(tlutFormat);
+  const uint32_t crc = crc32_ieee(&pf, 1, crc32_ieee(tlut, tlutBytes, crc32_ieee(level0, need)));
+  const uint64_t key = (uint64_t{crc} << 32) | (static_cast<uint64_t>((width - 1) & 0x3FF) << 22) |
+                       (static_cast<uint64_t>((height - 1) & 0x3FF) << 12) | (static_cast<uint64_t>(fmt & 0xF) << 8);
   auto it = std::lower_bound(pk.textures.begin(), pk.textures.end(), key,
                              [](const WlpkEntry& e, uint64_t k) { return e.key < k; });
   if (it == pk.textures.end() || it->key != key) {
@@ -2942,7 +2968,7 @@ bool texture_from_pack(uint64_t id, int64_t index) noexcept {
 
 void texture_packed_data(uint64_t id, uint32_t width, uint32_t height, uint32_t mips, uint8_t format, uint8_t flags,
                          const uint8_t* data, size_t size) noexcept {
-  if (width == 0 || height == 0 || mips == 0 || data == nullptr || format < kPkEtc2Rgb8 || format > kPkRgba8) return;
+  if (width == 0 || height == 0 || mips == 0 || data == nullptr || format < kPkEtc2Rgb8 || format > kPkLast) return;
   TexUpload up{id, width, height, mips, std::vector<uint8_t>(data, data + size)};
   up.packFormat = format;
   up.packFlags = flags;

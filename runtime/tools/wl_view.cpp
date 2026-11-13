@@ -7,11 +7,13 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <string>
 #include <vector>
 
 #include "wl/audio.h"
+#include "wl/gpu_check.h"
 #include "wl/pack.h"
 #include "wl/texcache.h"
 
@@ -64,9 +66,16 @@ GLuint compile(GLenum type, const char* src) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const char* path = argc > 1 ? argv[1] : std::getenv("WL_PACK");
+    // wl_view assets.wlpk [--verificar]: con --verificar compara cada textura ETC2/EAC como la lee la GPU (la Mali
+    // en la consola) con el decodificador de la CPU, escribe el resultado y termina.
+    bool verify = false;
+    const char* path = std::getenv("WL_PACK");
+    for (int i = 1; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--verificar")) verify = true;
+        else path = argv[i];
+    }
     if (!path) {
-        std::fprintf(stderr, "uso: wl_view assets.wlpk\n");
+        std::fprintf(stderr, "uso: wl_view assets.wlpk [--verificar]\n");
         return 2;
     }
     wl::Pack pack;
@@ -102,6 +111,20 @@ int main(int argc, char** argv) {
         return 1;
     }
     SDL_GL_SetSwapInterval(1);
+    if (verify) {
+        std::string rep;
+        const wl::GpuCheckResult r = wl::gpu_check_textures(pack, 0, &rep);
+        std::printf("GL_RENDERER: %s\ntexturas comprimidas: %d revisadas, %d idénticas, %d a 1 de diferencia "
+                    "(11 bits), %d con diferencias, %d sin revisar\n%s",
+                    glGetString(GL_RENDERER), r.checked, r.exact, r.close, r.failed, r.skipped, rep.c_str());
+        if (!r.first_problem.empty()) std::printf("primera diferencia: %s\n", r.first_problem.c_str());
+        std::printf("%s\n", r.failed == 0 && r.checked > 0 ? "VERIFICACION OK" : "VERIFICACION CON PROBLEMAS");
+        std::fflush(stdout);
+        SDL_GL_DeleteContext(ctx);
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+        return r.failed == 0 && r.checked > 0 ? 0 : 1;
+    }
     // En PortMaster, gptokeyb también convierte la cruceta en flechas del teclado. Si hay mando,
     // se ignoran las teclas (salvo Escape) para que cada pulsación avance una sola textura.
     int pads = 0;

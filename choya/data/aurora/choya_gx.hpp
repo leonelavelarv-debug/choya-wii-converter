@@ -31,6 +31,11 @@ void texture_released(const void* ref) noexcept;
 // aurora vacía que el motor de Choya dibuja con la versión convertida (aurora ya no la decodifica). Si no, vacío.
 gfx::TextureHandle packed_static_texture(uint32_t width, uint32_t height, uint32_t mips, uint32_t format,
                                          const uint8_t* data, size_t size, const char* label) noexcept;
+// Con paleta (0.21.0): la imagen y la paleta que aurora iba a combinar; si el paquete tiene esa pareja (misma clave
+// que el conversor), el motor usa la versión convertida. Si no, {} y aurora sigue como siempre.
+gfx::TextureHandle packed_palette_texture(uint32_t width, uint32_t height, uint32_t mips, uint32_t format,
+                                          const uint8_t* data, size_t size, uint32_t tlutFormat, uint32_t tlutEntries,
+                                          const uint8_t* tlut) noexcept;
 // Grupo de texturas recién creado por gx (ranuras que muestrea el shader y su muestreo).
 void register_texture_bind_group(gfx::BindGroupRef ref, const gx::ShaderInfo& info) noexcept;
 

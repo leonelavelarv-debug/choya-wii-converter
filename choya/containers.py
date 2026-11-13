@@ -49,6 +49,7 @@ def read_tpl(data: bytes, source: str = "") -> list[GXTexture]:
             n, _unpacked, _pad, pfmt, pdata = struct.unpack_from(">HBBII", data, pal_off)
             tex.palette = decode_palette(data[pdata:pdata + n * 2], n, pfmt)
             tex.palette_fmt = pfmt
+            tex.palette_raw = bytes(data[pdata:pdata + n * 2])
         out.append(tex)
     return out
 
@@ -101,7 +102,8 @@ def read_brres(data: bytes, source: str = "") -> tuple[list[GXTexture], dict[str
         data_off, = struct.unpack_from(">I", data, off + 0x10)
         pfmt, = struct.unpack_from(">I", data, off + 0x18)
         n, = struct.unpack_from(">H", data, off + 0x1C)
-        palettes[name] = (decode_palette(data[off + data_off: off + data_off + n * 2], n, pfmt), pfmt)
+        raw = bytes(data[off + data_off: off + data_off + n * 2])
+        palettes[name] = (decode_palette(raw, n, pfmt), pfmt, raw)
 
     textures = []
     for name, off in sections.get("Textures(NW4R)", []):
@@ -122,7 +124,7 @@ def read_brres(data: bytes, source: str = "") -> tuple[list[GXTexture], dict[str
                         data=bytes(data[start:start + size]), source=source)
         if fmt in PALETTE_FORMATS:
             if name in palettes:
-                tex.palette, tex.palette_fmt = palettes[name]
+                tex.palette, tex.palette_fmt, tex.palette_raw = palettes[name]
             else:
                 tex.notes.append("paleta no encontrada")
         textures.append(tex)

@@ -18,6 +18,9 @@ struct GXTexDesc {
     uint16_t width;
     uint16_t height;
     uint8_t format;       // GXFormat
+    const uint8_t* palette = nullptr;  // C4/C8/C14X2: la paleta cargada (GXInitTlutObj), big-endian
+    uint16_t palette_entries = 0;
+    uint8_t palette_format = 0;
 };
 
 // Sube una entrada del paquete a la GPU y devuelve el id de textura (0 = error).
