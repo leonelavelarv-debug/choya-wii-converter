@@ -110,6 +110,11 @@ class TestMotorGles(unittest.TestCase):
                                  capture_output=True, text=True)
             self.assertEqual(out.returncode, 3, out.stdout)
 
+            # Borrado de aurora dentro del pase (GXCopyTex con borrado): como dibujo (por omisión) y con glClear, igual.
+            for extra in ({}, {"CHOYA_GX_BORRAR_CON_GL": "1"}):
+                out = subprocess.run([exe, "borrado"], env=dict(env, **extra), capture_output=True, text=True)
+                self.assertIn("borrado 0000FF 000000", out.stdout, (extra, out.stdout + out.stderr))
+
 
 if __name__ == "__main__":
     unittest.main()

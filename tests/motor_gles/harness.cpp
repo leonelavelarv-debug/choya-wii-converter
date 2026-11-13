@@ -139,8 +139,27 @@ static int packed(int argc, char** argv) {
   return 0;
 }
 
+// harness borrado: pase borrado en negro y un borrado de aurora (GXCopyTex con borrado) en la mitad izquierda, azul.
+static int clear_test() {
+  gx::register_clear(500, gx::ClearDesc{1, 1, 1, 0});
+  std::vector<uint8_t> v(64, 0), u(16384 + 256, 0);
+  std::vector<uint16_t> i = {0, 0, 0};
+  const float black[4] = {0, 0, 0, 1};
+  const float blue[4] = {0, 0, 1, 1};
+  gx::capture_begin(v.data(), v.size(), u.data(), u.size(), (const uint8_t*)i.data(), 6, nullptr, 0);
+  gx::capture_pass(640, 480, true, true, black, 1.f, true, gx::Rect{0, 0, 640, 480});
+  gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+  gx::capture_scissor(gx::Rect{0, 0, 640, 480});
+  gx::capture_clear(500, blue, 0.25f, true, gx::Rect{0, 0, 320, 480});
+  gx::capture_end();
+  if (!gx::draw_frame(640, 480)) { std::puts("no dibujó"); return 1; }
+  std::printf("borrado %06X %06X\n", pixel(160, 240), pixel(480, 240));
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (!init_egl(640, 480)) { std::puts("sin contexto GLES"); return 2; }
+  if (argc >= 2 && std::strcmp(argv[1], "borrado") == 0) return clear_test();
   if (argc >= 2 && std::strcmp(argv[1], "paquete") == 0) return packed(argc, argv);
   if (argc >= 3) return replay(argv[1], argv[2]);
   auto GetString = (const char*(*)(unsigned))dlsym(gles, "glGetString");

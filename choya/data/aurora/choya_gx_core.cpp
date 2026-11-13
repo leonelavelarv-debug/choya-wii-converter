@@ -2017,6 +2017,63 @@ bool copy_program() {
   return g_copyProgram.id != 0;
 }
 
+// --- Borrados dentro del pase como un dibujo -------------------------------------------------------------------
+// En Golf, glClear sobre el EFB justo después de copiarlo (GXCopyTex con borrado) hacía que el driver de la Mali le
+// diera memoria nueva al EFB (~1.5 MB, el tamaño del EFB) en cada cuadro y no la devolvía: 0.19.1 lo midió en
+// "borrados" (+150 a +200 MB por informe). Un triángulo que cubre el recorte con el color y la profundidad del
+// borrado deja lo mismo en el EFB sin que el driver lo trate como un borrado. CHOYA_GX_BORRAR_CON_GL=1: el glClear.
+constexpr const char* kClearVs = R"(#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID & 1) << 2) - 1.0, float((gl_VertexID & 2) << 1) - 1.0);
+  gl_Position = vec4(p, 0.0, 1.0);
+}
+)";
+constexpr const char* kClearFs = R"(#version 300 es
+precision highp float;
+uniform vec4 u_color;
+uniform vec4 u_depth;
+out vec4 frag;
+void main() {
+  frag = u_color;
+  gl_FragDepth = u_depth.x;
+}
+)";
+struct ClearProgram {
+  GLuint id = 0;
+  GLint color = -1, depth = -1;
+  bool tried = false;
+} g_clearProgram;
+
+bool clear_by_draw() {
+  static const bool on = [] {
+    const char* e = std::getenv("CHOYA_GX_BORRAR_CON_GL");
+    return e == nullptr || std::strcmp(e, "1") != 0;
+  }();
+  if (!on) return false;
+  if (g_clearProgram.tried) return g_clearProgram.id != 0;
+  g_clearProgram.tried = true;
+  std::string err;
+  const GLuint v = compile(kVertexShader, kClearVs, err);
+  const GLuint f = v ? compile(kFragmentShader, kClearFs, err) : 0;
+  if (v && f) {
+    const GLuint prog = gl.CreateProgram();
+    gl.AttachShader(prog, v);
+    gl.AttachShader(prog, f);
+    gl.LinkProgram(prog);
+    GLint ok = 0;
+    gl.GetProgramiv(prog, kLinkStatus, &ok);
+    if (ok) {
+      g_clearProgram.id = prog;
+      g_clearProgram.color = gl.GetUniformLocation(prog, "u_color");
+      g_clearProgram.depth = gl.GetUniformLocation(prog, "u_depth");
+    }
+  }
+  if (v) gl.DeleteShader(v);
+  if (f) gl.DeleteShader(f);
+  if (g_clearProgram.id == 0) log_line("motor: no compila el programa de borrados; se usa glClear (%s)", err.c_str());
+  return g_clearProgram.id != 0;
+}
+
 // CHOYA_GX_COPIAS=0 (solo para diagnosticar): no hace las copias del EFB a textura.
 bool copies_enabled() {
   static const bool on = [] {
@@ -2984,13 +3041,31 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       set_scissor(r);
       set_color_mask(cc.color != 0, cc.alpha != 0);
       set_depth_mask(cc.depth != 0);
-      gl.ClearColor(it.clear.rgba[0], it.clear.rgba[1], it.clear.rgba[2], it.clear.rgba[3]);
-      gl.ClearDepthf(it.clear.depth);
-      GLbitfield bits = 0;
-      if (cc.color || cc.alpha) bits |= kColorBufferBit;
-      if (cc.depth) bits |= kDepthBufferBit;
       mali_mark(kMaliDibujos);
-      if (bits) gl.Clear(bits);
+      if ((cc.color || cc.alpha || cc.depth) && clear_by_draw()) {
+        const GLint full[4] = {0, 0, g_efb.width, g_efb.height};
+        set_viewport(full);  // gl_FragDepth no depende del rango de profundidad: no se toca
+        set_program(g_clearProgram.id);
+        gl.Uniform4f(g_clearProgram.color, it.clear.rgba[0], it.clear.rgba[1], it.clear.rgba[2], it.clear.rgba[3]);
+        gl.Uniform4f(g_clearProgram.depth, std::clamp(it.clear.depth, 0.f, 1.f), 0.f, 0.f, 0.f);
+        set_enable(kBlend, S.blendOn, false);
+        set_enable(kCullFace, S.cullOn, false);
+        set_enable(kDepthTest, S.depthTest, true);
+        if (S.depthFunc != kAlways) {
+          S.depthFunc = kAlways;
+          gl.DepthFunc(kAlways);
+        }
+        S.lastValid = false;  // el siguiente dibujo vuelve a poner su estado
+        gl.DrawArrays(kTriangles, 0, 3);
+        set_viewport(viewportRect);
+      } else {
+        gl.ClearColor(it.clear.rgba[0], it.clear.rgba[1], it.clear.rgba[2], it.clear.rgba[3]);
+        gl.ClearDepthf(it.clear.depth);
+        GLbitfield bits = 0;
+        if (cc.color || cc.alpha) bits |= kColorBufferBit;
+        if (cc.depth) bits |= kDepthBufferBit;
+        if (bits) gl.Clear(bits);
+      }
       mali_mark(kMaliBorrados);
       set_scissor(scissorRect);
       ++g_stats.clears;

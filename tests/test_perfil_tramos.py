@@ -71,7 +71,7 @@ class TestPerfilTramos(unittest.TestCase):
             self.assertIn("perfil escrito", out.stderr)
             p = perfil.leer(os.path.join(d, "perfil.txt"))
             self.assertGreater(p.cuadros, 60)
-            self.assertGreater(p.pared, 1500)
+            self.assertGreater(p.pared, 700)  # 2 s cada 2 ms
             names = perfil.nombrar(exe, perfil.desplazamientos(p))
             text = perfil.informe(p, names, top=8)
             ms = {k: float(re.search(r"([\d.]+) ms\s+[\d.]+%\s+" + k, text).group(1))

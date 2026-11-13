@@ -165,7 +165,9 @@ void guest_stack(Wall& w) {
     const auto* ctx = static_cast<const uint32_t*>(g_gameCtx);
     if (ctx == nullptr || !g_guestOk) return;
     uint32_t gsp = ctx[1];
-    while (w.nGuest < kGuestDepth && guest_ram(gsp) && (gsp & 7) == 0) {
+    // Tope de vueltas: si r1 apunta a algo que no es la pila, la cadena puede subir de 8 en 8 bytes muchísimo rato
+    // (en 0.19.0 la señal llegó a costar ~15 % del hilo del juego).
+    for (int steps = 0; steps < 48 && w.nGuest < kGuestDepth && guest_ram(gsp) && (gsp & 7) == 0; ++steps) {
         const uint32_t prev = guest_read32(gsp);
         if (!guest_ram(prev) || prev <= gsp || prev - gsp > 0x20000u) break;
         const uint32_t lr = guest_read32(prev + 4);
@@ -397,7 +399,7 @@ void Measure(int seconds) {
     on.it_value.tv_usec = 1000;
     g_sampling = true;
     setitimer(ITIMER_PROF, &on, nullptr);
-    // Pared del hilo del juego, cada 1 ms desde este hilo. Si el juego está corriendo se le pide la muestra con una
+    // Pared del hilo del juego, cada 2 ms (CHOYA_PERFIL_MS) desde este hilo. Si el juego está corriendo se le pide la muestra con una
     // señal (contador de programa y pilas exactas); si está dormido o bloqueado no se le despierta: se lee de
     // /proc en qué llamada al sistema está y dónde (así un sleep o un poll no se acortan por medir).
     std::fprintf(stderr, "[choya] midiendo %d s (hilo del juego %d)\n", seconds, gameTid);
@@ -418,8 +420,13 @@ void Measure(int seconds) {
         g_wallOn = true;
         auto next = std::chrono::steady_clock::now();
         char buf[512];
+        static const int periodMs = [] {
+            const char* e = std::getenv("CHOYA_PERFIL_MS");
+            const int v = e ? std::atoi(e) : 2;
+            return v >= 1 && v <= 50 ? v : 2;
+        }();
         while (std::chrono::steady_clock::now() < end) {
-            next += std::chrono::milliseconds(1);
+            next += std::chrono::milliseconds(periodMs);
             std::this_thread::sleep_until(next);
             const size_t i = g_wallCount.load();
             if (i >= kMaxWall || statFd < 0) continue;

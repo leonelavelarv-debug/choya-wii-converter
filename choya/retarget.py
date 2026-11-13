@@ -1160,6 +1160,21 @@ AURORA_EDITS = [
      "                                          {static_cast<const uint8_t*>(obj.data), dataSize}, false, nameStr);\n"
      "    }\n",
      "motor de Choya (recursos convertidos)"),
+    # El plano de "zfreeze" (GX coplanar) se calcula en cada dibujo transformando 3 vértices en la CPU (8.7 ms por
+    # cuadro en Golf, en el hilo del juego); el motor de Choya no lo usa, así que con el motor encendido no se calcula.
+    ("lib/gx/command_processor.cpp", '#include "shader_info.hpp"\n#include "../internal.hpp"\n',
+     '#include "shader_info.hpp"\n#include "../internal.hpp"\n#include "../choya/choya_gx.hpp"  // choya\n',
+     "motor de Choya (cabecera en command_processor)"),
+    ("lib/gx/command_processor.cpp",
+     "  if (!g_gxState.zFreeze) update_zfreeze_reference(prim, fmt, vertices, vtxCount, vtxSize, true);\n",
+     "  if (!g_gxState.zFreeze && !choya::enabled()) update_zfreeze_reference(prim, fmt, vertices, vtxCount, vtxSize, true);"
+     "  // choya\n",
+     "motor de Choya (sin plano zfreeze, dibujo directo)"),
+    ("lib/gx/command_processor.cpp",
+     "  if (!g_gxState.zFreeze) update_zfreeze_reference(prim, fmt, data + pos, vtxCount, vtxSize, bigEndian);\n",
+     "  if (!g_gxState.zFreeze && !choya::enabled()) update_zfreeze_reference(prim, fmt, data + pos, vtxCount, vtxSize,"
+     " bigEndian);  // choya\n",
+     "motor de Choya (sin plano zfreeze, FIFO)"),
 ]
 
 # Archivos del motor de Choya que se copian dentro de aurora (siempre se reemplazan: son de Choya).
