@@ -36,8 +36,11 @@ core::PipelineDesc describe(const gx::PipelineConfig& c) {
   }
   for (size_t i = 0; i < 4; ++i) {
     const auto& cc = s.colorChannels[i];
+    // pad: 0x80 | difusa (GXDiffuseFn) | atenuación (GXAttnFn) << 2, para la iluminación del motor (0.20.8).
     d.chans[i] = {static_cast<uint8_t>(cc.matSrc), static_cast<uint8_t>(cc.ambSrc),
-                  static_cast<uint8_t>(cc.lightingEnabled ? 1 : 0), 0};
+                  static_cast<uint8_t>(cc.lightingEnabled ? 1 : 0),
+                  static_cast<uint8_t>(0x80u | (static_cast<u32>(cc.diffFn) & 3u) |
+                                       ((static_cast<u32>(cc.attnFn) & 3u) << 2))};
   }
   const auto info = gx::build_shader_info(s);
   d.vtxStride = s.vtxStride;

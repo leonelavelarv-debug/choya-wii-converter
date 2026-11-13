@@ -95,6 +95,55 @@ static int replay(const char* in, const char* out) {
   return 0;
 }
 
+// harness sonda cuadro.bin dibujos x1 y1 [x2 y2 ...]: qué dibujos del cuadro cambian esos píxeles (arriba = y 0).
+// Vuelve a dibujar el volcado saltando un dibujo cada vez; para encontrar el dibujo de algo que sale mal.
+static int probe(int argc, char** argv) {
+  static auto ReadPixels = (void(*)(int,int,int,int,unsigned,unsigned,void*))dlsym(gles, "glReadPixels");
+  const int draws = std::atoi(argv[3]);
+  std::vector<std::pair<int, int>> pts;
+  for (int a = 4; a + 1 < argc; a += 2) pts.push_back({std::atoi(argv[a]), std::atoi(argv[a + 1])});
+  auto sample = [&](int skip, std::vector<uint32_t>& out) {
+    gx::debug_skip_draw(skip);
+    if (!gx::load_frame(argv[2]) || !gx::draw_frame(640, 480)) return false;
+    out.clear();
+    for (auto [x, y] : pts) {
+      unsigned char p[4];
+      ReadPixels(x, 479 - y, 1, 1, 0x1908, 0x1401, p);
+      out.push_back((p[0] << 16) | (p[1] << 8) | p[2]);
+    }
+    return true;
+  };
+  std::vector<uint32_t> base, now;
+  if (!sample(-1, base)) { std::puts("no dibujó"); return 1; }
+  std::printf("base");
+  for (uint32_t c : base) std::printf(" %06X", c);
+  std::printf("\n");
+  for (int k = 0; k < draws; ++k) {
+    if (!sample(k, now)) continue;
+    if (now != base) {
+      std::printf("dibujo %d:", k);
+      for (uint32_t c : now) std::printf(" %06X", c);
+      std::printf("\n");
+    }
+  }
+  return 0;
+}
+
+// harness copia cuadro.bin id salida.ppm: vuelve a dibujar el volcado y guarda una de sus copias del EFB.
+static int read_copy(const char* in, const char* idHex, const char* out) {
+  if (!gx::load_frame(in) || !gx::draw_frame(640, 480)) { std::puts("no dibujó"); return 1; }
+  std::vector<uint8_t> px;
+  uint32_t w = 0, h = 0;
+  if (!gx::debug_read_copy(std::strtoull(idHex, nullptr, 16), px, w, h)) { std::puts("no está esa copia"); return 1; }
+  FILE* f = std::fopen(out, "wb");
+  std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+  for (uint32_t i = 0; i < w * h; ++i) std::fwrite(&px[i * 4], 1, 3, f);
+  std::fclose(f);
+  std::printf("copia %ux%u: centro %d,%d,%d alfa %d\n", w, h, px[(h / 2 * w + w / 2) * 4], px[(h / 2 * w + w / 2) * 4 + 1],
+              px[(h / 2 * w + w / 2) * 4 + 2], px[(h / 2 * w + w / 2) * 4 + 3]);
+  return 0;
+}
+
 // harness paquete assets.wlpk textura.gx formato ancho alto: busca la textura GX en el paquete del conversor como
 // lo hace aurora en el juego, la dibuja a pantalla completa y escribe los cuatro cuadrantes.
 static int packed(int argc, char** argv) {
@@ -241,6 +290,52 @@ static int queue_test() {
   return 0;
 }
 
+// harness copia-vieja salida.bin: un cuadro copia el EFB (rojo) a la textura 900; el siguiente solo la dibuja a
+// pantalla completa (como las caras de los Miis o las texturas de luz, que se copian una vez). El volcado de ese
+// segundo cuadro tiene que llevar la copia: al volver a dibujarlo en otro proceso, la pantalla sale roja.
+static int old_copy_test(const char* path) {
+  gx::PipelineDesc p4 = base_desc();
+  p4.vtxStride = 20;
+  p4.attrs[GX_VA_POS] = {GX_DIRECT, 3, GX_F32, 0, 0, 0, 0, 0};
+  p4.attrs[GX_VA_TEX0] = {GX_DIRECT, 2, GX_F32, 12, 0, 0, 0, 0};
+  p4.sampledChannels = 0; p4.offChanMat[0] = 0; p4.offChanMatA[0] = 0;
+  p4.numTexGens = 1; p4.sampledTexCoords = 1;
+  p4.texgens[0] = {GX_TG_MTX2x4, GX_TG_TEX0, 0xFF, 0};
+  p4.stages[0].cd = GX_CC_TEXC; p4.stages[0].ad = GX_CA_TEXA; p4.stages[0].texCoord = 0; p4.stages[0].texMap = 0;
+  p4.offTexScale[0] = 48; p4.offTexSize[0] = 52;
+  gx::register_pipeline(4, p4);
+  gx::BindDesc bd{};
+  bd.tex[0] = 900;
+  bd.samp[0] = {0, 0, 0, 0, 0, {0, 0, 0}, 0.f, 0.f};
+  gx::register_bind_group(98, bd);
+  std::vector<uint8_t> v4;
+  float q[4][5] = {{-1,1,.5f,0,0},{1,1,.5f,1,0},{-1,-1,.5f,0,1},{1,-1,.5f,1,1}};
+  for (auto& v : q) for (float x : v) put_be_f32(v4, x);
+  std::vector<uint8_t> u4(256, 0);
+  for (int r = 0; r < 4; ++r) put_f(u4, 20 + r * 4 + r, 1.f);
+  for (int r = 0; r < 3; ++r) put_f(u4, 36 + r * 4 + r, 1.f);
+  put_f(u4, 48, 1.f); put_f(u4, 49, 1.f);
+  put_f(u4, 52, 1.f); put_f(u4, 53, 1.f);
+  std::vector<uint16_t> i4 = {0, 1, 2, 2, 1, 3};
+  const float red[4] = {1, 0, 0, 1}, black[4] = {0, 0, 0, 1};
+  gx::capture_begin(v4.data(), v4.size(), u4.data(), u4.size(), (const uint8_t*)i4.data(), 12, nullptr, 0);
+  gx::capture_pass(640, 480, true, true, red, 0.f, false, gx::Rect{0, 0, 0, 0});
+  gx::capture_copy(900, gx::Rect{0, 0, 64, 64}, 64, 64, 0x6, true);
+  gx::capture_pass(640, 480, true, true, black, 0.f, true, gx::Rect{0, 0, 640, 480});
+  gx::capture_end(true);
+  if (!gx::draw_frame(640, 480)) { std::puts("no dibujó"); return 1; }
+  gx::capture_begin(v4.data(), v4.size(), u4.data(), u4.size(), (const uint8_t*)i4.data(), 12, nullptr, 0);
+  gx::capture_pass(640, 480, true, true, black, 0.f, true, gx::Rect{0, 0, 640, 480});
+  gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+  gx::capture_scissor(gx::Rect{0, 0, 640, 480});
+  gx::capture_draw(4, 0, 6, 1, 0, UINT32_MAX, 98);
+  gx::capture_end(true);
+  if (!gx::draw_frame(640, 480)) { std::puts("no dibujó"); return 1; }
+  std::printf("en vivo %06X\n", pixel(320, 240));
+  std::printf("volcado %s\n", gx::dump_last_frame(path) ? "listo" : "falló");
+  return 0;
+}
+
 // harness borrado: pase borrado en negro y un borrado de aurora (GXCopyTex con borrado) en la mitad izquierda, azul.
 static int clear_test() {
   gx::register_clear(500, gx::ClearDesc{1, 1, 1, 0});
@@ -265,6 +360,9 @@ int main(int argc, char** argv) {
   if (argc >= 2 && std::strcmp(argv[1], "paquete") == 0) return packed(argc, argv);
   if (argc >= 3 && std::strcmp(argv[1], "paleta") == 0) return palette_test(std::atoi(argv[2]));
   if (argc >= 2 && std::strcmp(argv[1], "cola") == 0) return queue_test();
+  if (argc >= 3 && std::strcmp(argv[1], "copia-vieja") == 0) return old_copy_test(argv[2]);
+  if (argc >= 5 && std::strcmp(argv[1], "sonda") == 0) return probe(argc, argv);
+  if (argc >= 5 && std::strcmp(argv[1], "copia") == 0) return read_copy(argv[2], argv[3], argv[4]);
   if (argc >= 3) return replay(argv[1], argv[2]);
   auto GetString = (const char*(*)(unsigned))dlsym(gles, "glGetString");
   std::printf("GL: %s / %s\n", GetString(0x1F02), GetString(0x1F01));

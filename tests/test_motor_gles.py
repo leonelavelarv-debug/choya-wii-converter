@@ -128,6 +128,19 @@ class TestMotorGles(unittest.TestCase):
                 out = subprocess.run([exe, "paleta", str(variant)], env=env, capture_output=True, text=True)
                 self.assertIn(f"paleta {color} {color}", out.stdout, out.stdout + out.stderr)
 
+            # Una copia hecha en un cuadro anterior (caras, texturas de luz) viaja en el volcado del siguiente.
+            vieja = os.path.join(d, "vieja.bin")
+            out = subprocess.run([exe, "copia-vieja", vieja], env=env, capture_output=True, text=True)
+            self.assertIn("en vivo FF0000", out.stdout, out.stdout + out.stderr)
+            self.assertIn("volcado listo", out.stdout, out.stdout + out.stderr)
+            ppm = os.path.join(d, "vieja.ppm")
+            out = subprocess.run([exe, vieja, ppm], env=env, capture_output=True, text=True)
+            self.assertIn("listo", out.stdout, out.stdout + out.stderr)
+            with open(ppm, "rb") as f:
+                raw = f.read()
+            pix = raw[raw.index(b"255\n") + 4:]
+            self.assertEqual(tuple(pix[(240 * 640 + 320) * 3:(240 * 640 + 320) * 3 + 3]), (255, 0, 0))
+
 
 if __name__ == "__main__":
     unittest.main()

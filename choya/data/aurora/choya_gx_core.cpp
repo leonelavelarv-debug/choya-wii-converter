@@ -51,6 +51,7 @@ using u32 = uint32_t;
 
 LogFn g_logger = nullptr;
 WakeFn g_wake = nullptr;
+int g_debugSkipDraw = -1;  // índice de dibujo que no se hace (solo para depurar volcados en la PC)
 ProcFn g_loader = nullptr;
 bool g_reversedZ = true;
 
@@ -176,6 +177,7 @@ struct Gl {
   void (*DeleteBuffers)(GLsizei, const GLuint*);
   // Opcionales: caché de programas en disco (GLES 3.0, como el caché de shaders que galaxy-vita trae listo).
   void (*GetProgramBinary)(GLuint, GLsizei, GLsizei*, GLenum*, void*);
+  void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);  // opcional: volcados
   void (*ProgramBinary)(GLuint, GLenum, const void*, GLsizei);
   void (*ProgramParameteri)(GLuint, GLenum, GLint);
   const unsigned char* (*GetString)(GLenum);
@@ -274,6 +276,7 @@ bool load_gl() {
     gl.ProgramBinary = reinterpret_cast<decltype(gl.ProgramBinary)>(g_loader("glProgramBinary"));
     gl.ProgramParameteri = reinterpret_cast<decltype(gl.ProgramParameteri)>(g_loader("glProgramParameteri"));
     gl.GetString = reinterpret_cast<decltype(gl.GetString)>(g_loader("glGetString"));
+    gl.ReadPixels = reinterpret_cast<decltype(gl.ReadPixels)>(g_loader("glReadPixels"));
   }
   return ok;
 }
@@ -542,6 +545,51 @@ uint uw(uint w) { return u[w >> 2u][w & 3u]; }
 vec4 uv4(uint w) { return uintBitsToFloat(u[w >> 2u]); }
 )";
 
+// Iluminación de GX por vértice (0.20.8), igual que aurora (shader.cpp, build_light): ambiente + cada luz de la máscara
+// (color · atenuación · difusa), en enteros de 0 a 255 como el XF, y luego por el material. Las luces van en los
+// uniformes como 8 × {pos, dir, color, cos_att, dist_att} (20 palabras cada una). dfn: 0 sin, 1 con signo, 2 limitada.
+// afn: 0 especular, 1 foco, 2 ninguna.
+constexpr const char* kLightFn = R"(
+vec3 gx_light(uint lbase, uint mask, vec3 pos, vec3 nrm, vec3 amb, vec3 mat, int dfn, int afn, bool alpha) {
+  ivec3 acc = ivec3(round(amb * 255.0));
+  for (uint i = 0u; i < 8u; ++i) {
+    if ((mask & (1u << i)) == 0u) continue;
+    uint b = lbase + i * 20u;
+    vec3 lpos = uv4(b).xyz;
+    vec3 ldirv = uv4(b + 4u).xyz;
+    vec4 lc = uv4(b + 8u);
+    vec3 col = alpha ? vec3(lc.a) : lc.rgb;
+    vec3 cosa = uv4(b + 12u).xyz;
+    vec3 dista = uv4(b + 16u).xyz;
+    vec3 ldir = lpos - pos;
+    float dist2 = dot(ldir, ldir);
+    float dist = sqrt(dist2);
+    float attn = 1.0;
+    if (afn == 2) {
+      ldir = dist > 0.0 ? ldir / max(dist, 1e-20) : nrm;
+    } else {
+      ldir = ldir / dist;
+      if (afn == 1) {
+        float c = max(0.0, dot(ldir, ldirv));
+        float ca = dot(cosa, vec3(1.0, c, c * c));
+        float da = dot(dista, vec3(1.0, dist, dist2));
+        attn = max(0.0, ca / da);
+      } else {
+        attn = dot(nrm, ldir) >= 0.0 ? max(0.0, dot(nrm, ldirv)) : 0.0;
+        float ca = dot(cosa, vec3(1.0, attn, attn * attn));
+        float da = dfn != 0 ? dot(normalize(dista), vec3(1.0, attn, attn * attn)) : dot(dista, vec3(1.0, attn, attn * attn));
+        attn = da != 0.0 ? max(0.0, ca / da) : (ca > 0.0 ? 1.0 : 0.0);
+      }
+    }
+    float diff = dfn == 0 ? 1.0 : (dfn == 1 ? dot(ldir, nrm) : max(0.0, dot(ldir, nrm)));
+    acc += ivec3(round(attn * diff * col * 255.0));
+  }
+  ivec3 lacc = clamp(acc, ivec3(0), ivec3(255));
+  ivec3 m = ivec3(round(mat * 255.0));
+  return vec3((m * (lacc + (lacc >> 7))) >> 8) / 255.0;
+}
+)";
+
 // Expresión GLSL de un componente escalar del atributo (offset en bytes `o`).
 std::string comp_expr(char buf, u8 compType, const std::string& o, u8 frac, bool le) {
   const std::string le_s = le ? "true" : "false";
@@ -660,6 +708,41 @@ std::string vertex_color(const PipelineDesc& cfg, u32 channel) {
 }
 
 std::string num(u32 v) { return std::to_string(v) + "u"; }
+
+// Dónde van las luces y los colores ambiente en los uniformes de aurora (shader_info.cpp, build_uniform): después de
+// las matrices y los registros del TEV, 8 luces (160 palabras) y 4 máscaras; luego, por cada canal usado, ambiente
+// (si hay luz y viene del registro) y material (si viene del registro), primero el color y luego el alfa. Se calcula
+// con lo que ya trae la descripción y se comprueba contra los materiales que aurora sí anota (offChanMat).
+struct ChannelLayout {
+  bool ok = false;
+  u32 lights = 0;
+  u32 amb[2] = {0, 0}, ambA[2] = {0, 0};
+};
+ChannelLayout channel_layout(const PipelineDesc& cfg) {
+  ChannelLayout l;
+  u32 w = cfg.offPostex + 12u * (static_cast<u32>(cfg.postexCount) + cfg.nrmCount);
+  for (u32 i = 0; i < 4; ++i) {
+    if (cfg.offTevReg[i] != 0) w = std::max<u32>(w, cfg.offTevReg[i] + 4u);
+  }
+  l.lights = w;
+  if (cfg.lightingEnabled) w += 160u + 4u;
+  bool ok = true;
+  for (u32 ch = 0; ch < 2; ++ch) {
+    if (((cfg.sampledChannels >> ch) & 1) == 0) continue;
+    const auto& cc = cfg.chans[ch];
+    const auto& cca = cfg.chans[ch + GX_ALPHA0];
+    if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) { l.amb[ch] = w; w += 4u; }
+    if (cc.matSrc == GX_SRC_REG) { ok = ok && cfg.offChanMat[ch] == w; w += 4u; }
+    if (cca.lightingEnabled && cca.ambSrc == GX_SRC_REG) { l.ambA[ch] = w; w += 4u; }
+    if (cca.matSrc == GX_SRC_REG) { ok = ok && cfg.offChanMatA[ch] == w; w += 4u; }
+  }
+  l.ok = ok;
+  return l;
+}
+// Función difusa y atenuación del canal (byte libre de ChanDesc: 0x80 | difusa | atenuación << 2; volcados viejos sin
+// el dato: limitada y foco, que con los coeficientes por omisión de GX da atenuación 1).
+int chan_diff_fn(const ChanDesc& c) { return (c.pad & 0x80) ? (c.pad & 3) : 2; }
+int chan_attn_fn(const ChanDesc& c) { return (c.pad & 0x80) ? ((c.pad >> 2) & 3) : 1; }
 std::string uvec(u32 word) { return "uv4(" + num(word) + ")"; }
 
 // Componente de un canal según la tabla de intercambio (GX_CH_RED..GX_CH_ALPHA).
@@ -822,6 +905,7 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
     if ((cfg.sampledTexCoords >> i) & 1) vs += "out vec3 v_tex" + std::to_string(i) + ";\n";
   }
   vs += kHelpers;
+  if (channel_layout(cfg).ok && cfg.lightingEnabled) vs += kLightFn;
   vs += "void main() {\n  uint vidx = uint(gl_VertexID);\n  uint vtx_start = uw(0u);\n";
   auto raw_u8 = [&](GXAttr attr) {
     char buf;
@@ -846,8 +930,24 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
         "  vec4 mv = vec4(dot(p, uv4(m)), dot(p, uv4(m + 4u)), dot(p, uv4(m + 8u)), 1.0);\n"
         "  gl_Position = vec4(dot(mv, " + uvec(cfg.offProj) + "), dot(mv, " + uvec(cfg.offProj + 4u) + "), dot(mv, " +
         uvec(cfg.offProj + 8u) + "), dot(mv, " + uvec(cfg.offProj + 12u) + "));\n";
+  // Normal (0.20.8): la del vértice por la matriz de normales (después de las de posición, con el mismo índice), para
+  // la iluminación y las coordenadas de textura que salen de la normal (GX_TG_NRM).
+  if (cfg.attrs[GX_VA_NRM].attrType != GX_NONE) {
+    vs += "  vec3 in_nrm = " + vec_attr(cfg, GX_VA_NRM, 3) + ";\n";
+  } else {
+    vs += "  vec3 in_nrm = vec3(0.0, 0.0, 1.0);\n";
+  }
+  if (cfg.nrmCount != 0) {
+    vs += "  uint nm = " + num(cfg.offPostex + 12u * cfg.postexCount) + " + pnmtx * 12u;\n"
+          "  vec4 n4 = vec4(in_nrm, 0.0);\n"
+          "  vec3 mv_nrm = vec3(dot(n4, uv4(nm)), dot(n4, uv4(nm + 4u)), dot(n4, uv4(nm + 8u)));\n"
+          "  if (dot(mv_nrm, mv_nrm) > 1e-10) mv_nrm = normalize(mv_nrm);\n";
+  } else {
+    vs += "  vec3 mv_nrm = in_nrm;\n";
+  }
 
-  // Canales de color (sin iluminación todavía): material o color del vértice.
+  // Canales de color: material o color del vértice y, con iluminación (0.20.8), ambiente + luces como el XF de GX.
+  const ChannelLayout lay = channel_layout(cfg);
   for (u32 ch = 0; ch < 2; ++ch) {
     const std::string out = "v_color" + std::to_string(ch);
     if (((cfg.sampledChannels >> ch) & 1) == 0) {
@@ -856,10 +956,25 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
     }
     const auto& cc = cfg.chans[ch];
     const auto& cca = cfg.chans[ch + GX_ALPHA0];
+    const bool litC = lay.ok && cc.lightingEnabled, litA = lay.ok && cca.lightingEnabled;
     std::string vc = "vc" + std::to_string(ch);
-    if (cc.matSrc == GX_SRC_VTX || cca.matSrc == GX_SRC_VTX) vs += "  vec4 " + vc + " = " + vertex_color(cfg, ch) + ";\n";
-    const std::string rgb = cc.matSrc == GX_SRC_VTX ? vc + ".rgb" : uvec(cfg.offChanMat[ch]) + ".rgb";
-    const std::string a = cca.matSrc == GX_SRC_VTX ? vc + ".a" : uvec(cfg.offChanMatA[ch]) + ".a";
+    if (cc.matSrc == GX_SRC_VTX || cca.matSrc == GX_SRC_VTX || (litC && cc.ambSrc == GX_SRC_VTX) ||
+        (litA && cca.ambSrc == GX_SRC_VTX)) {
+      vs += "  vec4 " + vc + " = " + vertex_color(cfg, ch) + ";\n";
+    }
+    std::string rgb = cc.matSrc == GX_SRC_VTX ? vc + ".rgb" : uvec(cfg.offChanMat[ch]) + ".rgb";
+    std::string a = cca.matSrc == GX_SRC_VTX ? vc + ".a" : uvec(cfg.offChanMatA[ch]) + ".a";
+    if (litC) {
+      const std::string amb = cc.ambSrc == GX_SRC_VTX ? vc + ".rgb" : uvec(lay.amb[ch]) + ".rgb";
+      rgb = "gx_light(" + num(lay.lights) + ", uw(" + num(lay.lights + 160u + ch) + "), mv.xyz, mv_nrm, " + amb + ", " +
+            rgb + ", " + std::to_string(chan_diff_fn(cc)) + ", " + std::to_string(chan_attn_fn(cc)) + ", false)";
+    }
+    if (litA) {
+      const std::string amb = cca.ambSrc == GX_SRC_VTX ? vc + ".a" : uvec(lay.ambA[ch]) + ".a";
+      a = "gx_light(" + num(lay.lights) + ", uw(" + num(lay.lights + 162u + ch) + "), mv.xyz, mv_nrm, vec3(" + amb +
+          "), vec3(" + a + "), " + std::to_string(chan_diff_fn(cca)) + ", " + std::to_string(chan_attn_fn(cca)) +
+          ", true).x";
+    }
     vs += "  " + out + " = vec4(" + rgb + ", " + a + ");\n";
   }
 
@@ -881,7 +996,9 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
       vs += "  vec4 " + tc + " = " + tex_src(i) + ";\n";
     } else if (tg.src == GX_TG_COLOR0 || tg.src == GX_TG_COLOR1) {
       vs += "  vec4 " + tc + " = vec4(" + vertex_color(cfg, tg.src - GX_TG_COLOR0) + ".rgb, 1.0);\n";
-    } else {  // posición (y por ahora también normales y tangentes)
+    } else if (tg.src == GX_TG_NRM) {  // 0.20.8: antes usaba la posición (las texturas de luz salían mal)
+      vs += "  vec4 " + tc + " = vec4(in_nrm, 1.0);\n";
+    } else {  // posición (y por ahora también binormales y tangentes)
       vs += "  vec4 " + tc + " = vec4(in_pos, 1.0);\n";
     }
     std::string tmp;
@@ -2288,6 +2405,18 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
 
 void set_logger(LogFn fn) noexcept { g_logger = fn; }
 void set_wake(WakeFn fn) noexcept { g_wake = fn; }
+void debug_skip_draw(int index) noexcept { g_debugSkipDraw = index; }
+bool debug_read_copy(uint64_t id, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height) noexcept {
+  auto c = g_copyTextures.find(id);
+  if (c == g_copyTextures.end() || gl.ReadPixels == nullptr) return false;
+  width = c->second.width;
+  height = c->second.height;
+  rgba.resize(size_t{width} * height * 4);
+  gl.BindFramebuffer(kFramebuffer, c->second.fbo);
+  gl.ReadPixels(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), kRgba, kUnsignedByte, rgba.data());
+  gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+  return true;
+}
 bool has_copy_texture(uint64_t id) noexcept { return g_copyTextures.contains(id); }
 void queue_stats(uint64_t out[3]) noexcept {
   out[0] = g_openFlushes.load();
@@ -2809,6 +2938,31 @@ bool dump_last_frame(const char* path) noexcept {
     auto k = s.kept.find(id);
     if (k != s.kept.end()) texs_out.push_back(&k->second);
   }
+  // Copias del EFB que usa el cuadro pero que no rehace (las caras de los Miis, las texturas de luz): se hicieron en
+  // cuadros anteriores, así que se leen de la GPU y van como texturas RGBA8 (0.20.8; sin esto en la PC salían blancas).
+  // Este volcado corre en el hilo del motor, con el contexto GL.
+  std::vector<TexUpload> readback;
+  if (gl.ReadPixels != nullptr) {
+    for (uint64_t id : texIds) {
+      if (s.kept.contains(id)) continue;
+      bool redone = false;
+      for (const Item& it : f.items) {
+        if ((it.op == Op::Copy && it.copy.tex == id) || (it.op == Op::PaletteConv && it.conv.dst == id)) redone = true;
+      }
+      if (redone) continue;
+      const CopyTexture* ct = nullptr;
+      if (auto c = g_copyTextures.find(id); c != g_copyTextures.end()) ct = &c->second;
+      else if (auto v = g_convTextures.find(id); v != g_convTextures.end()) ct = &v->second;
+      if (ct == nullptr || ct->fbo == 0 || ct->width == 0 || ct->height == 0) continue;
+      TexUpload up{id, ct->width, ct->height, 1, std::vector<uint8_t>(size_t{ct->width} * ct->height * 4)};
+      gl.BindFramebuffer(kFramebuffer, ct->fbo);
+      gl.ReadPixels(0, 0, static_cast<GLsizei>(ct->width), static_cast<GLsizei>(ct->height), kRgba, kUnsignedByte,
+                    up.data.data());
+      readback.push_back(std::move(up));
+    }
+    gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+  }
+  for (const TexUpload& up : readback) texs_out.push_back(&up);
   const uint64_t nt = texs_out.size();
   std::fwrite(&nt, sizeof(nt), 1, out);
   for (const TexUpload* up : texs_out) {
@@ -3235,6 +3389,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       shadow_invalidate();
     }
   };
+  int debugDrawIndex = 0;
   for (const Item& it : f.items) {
     switch (it.op) {
     case Op::Pass: {
@@ -3354,6 +3509,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       ++g_stats.clears;
     } break;
     case Op::Draw: {
+      if (g_debugSkipDraw >= 0 && debugDrawIndex++ == g_debugSkipDraw) break;  // depuración en la PC (harness)
       if (it.draw.pipeline != lastPipeRef) {
         lastPipe = resolve_pipe(it.draw.pipeline);
         lastPipeRef = lastPipe != nullptr ? it.draw.pipeline : ~0ull;

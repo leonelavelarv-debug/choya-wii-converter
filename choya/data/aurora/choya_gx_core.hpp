@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace choya::gx {
 
@@ -78,6 +79,10 @@ void set_logger(LogFn fn) noexcept;
 // una pantalla de carga, o la cola llena (0.20.7). Sin esto el motor solo dibujaba al presentar el juego un cuadro.
 using WakeFn = void (*)();
 void set_wake(WakeFn fn) noexcept;
+// Depuración en la PC: el dibujo número index (en orden del cuadro) no se hace; -1 los hace todos.
+void debug_skip_draw(int index) noexcept;
+// Depuración en la PC: los píxeles RGBA8 de una copia del EFB ya hecha (filas desde la de abajo de GL).
+bool debug_read_copy(uint64_t id, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height) noexcept;
 // Desde el inicio: grupos de lotes sin mostrarse, esperas con la cola llena, copias únicas perdidas (pruebas).
 void queue_stats(uint64_t out[3]) noexcept;
 // ¿El motor ya hizo esa copia del EFB? (solo desde el hilo que dibuja; pruebas)
