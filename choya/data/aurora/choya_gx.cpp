@@ -21,6 +21,7 @@
 extern "C" __attribute__((weak)) void* choya_gl_proc(const char* name);
 extern "C" __attribute__((weak)) void choya_gles_log(const char* line);
 extern "C" __attribute__((weak)) void choya_gles_wake();  // despierta al hilo de la pantalla (choya_gles.cpp)
+extern "C" __attribute__((weak)) bool choya_webgpu_nulo();  // lib/choya/sin_dawn (sin Dawn, 0.22.0)
 
 namespace aurora::choya {
 namespace core = ::choya::gx;
@@ -272,6 +273,11 @@ bool enabled() noexcept {
 
 bool dawn_draws() noexcept {
   static const bool on = [] {
+    if (choya_webgpu_nulo != nullptr && choya_webgpu_nulo()) {  // 0.22.0: compilado sin Dawn
+      log_to_runtime("aurora: sin Dawn (WebGPU nulo de Choya): aurora no codifica, no arma WGSL ni presenta; "
+                     "dibuja solo el motor de Choya");
+      return false;
+    }
     const char* v = std::getenv("CHOYA_DAWN_DIBUJA");
     const bool draws = v != nullptr && std::strcmp(v, "1") == 0;
     log_to_runtime(draws ? "aurora: Dawn sigue codificando los dibujos (CHOYA_DAWN_DIBUJA=1)"
@@ -437,6 +443,8 @@ extern "C" bool choya_gx_copias_solo_gpu() {
   return aurora::choya::enabled() && !aurora::choya::dawn_draws();
 }
 extern "C" void choya_gx_log(const char* line) { aurora::choya::log_to_runtime(line); }
+// Sin GPU (0.22.0): aurora.cpp lo pregunta sin incluir choya_gx.hpp (allí `choya::` es el núcleo ::choya::gx).
+extern "C" bool choya_gx_sin_gpu() { return aurora::choya::sin_gpu(); }
 
 extern "C" bool choya_gx_draw_frame(int screenWidth, int screenHeight) {
   namespace core = ::choya::gx;

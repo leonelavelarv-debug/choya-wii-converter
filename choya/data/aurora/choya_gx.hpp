@@ -23,6 +23,9 @@ namespace aurora::choya {
 bool enabled() noexcept;
 // Con el motor encendido, Dawn (backend Null) no codifica los dibujos salvo con CHOYA_DAWN_DIBUJA=1 (0.20.3).
 bool dawn_draws() noexcept;
+// Sin GPU (0.22.0): con el motor encendido y Dawn sin dibujar, aurora no codifica pases ni presenta, no arma WGSL
+// para sus pipelines ni guarda la base de datos de pipelines. Con el WebGPU nulo de Choya (sin_dawn) no hay Dawn.
+inline bool sin_gpu() noexcept { return enabled() && !dawn_draws(); }
 
 // Texturas: datos ya decodificados (RGBA8) al crearse o escribirse, y aviso cuando se liberan.
 void texture_uploaded(const gfx::TextureRef& ref, const uint8_t* data, size_t size) noexcept;

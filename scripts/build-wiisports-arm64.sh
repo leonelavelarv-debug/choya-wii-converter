@@ -34,14 +34,15 @@ paso "4/6 Compilar para aarch64 (Cortex-A53)"
 MEM_GB=$(awk '/MemTotal/{print int($2/1024/1024)}' /proc/meminfo)
 JOBS=$(( MEM_GB * 2 / 3 )); [ "$JOBS" -lt 1 ] && JOBS=1; [ "$JOBS" -gt "$(nproc)" ] && JOBS=$(nproc)
 echo "Memoria ${MEM_GB} GB → ${JOBS} trabajos a la vez" | tee -a "$LOG"
-# Al compilar cruzado aurora quiere construir Dawn desde el código (y esa etiqueta no existe en google/dawn):
-# se usa el paquete ya compilado para Linux aarch64, igual que en la PC.
+# Sin Dawn (0.22.0): el motor GLES de Choya dibuja todo, así que aurora se compila con el WebGPU nulo de Choya
+# (proveedor "choya", lib/choya/sin_dawn): ni la biblioteca de Dawn ni su paquete. Lo que quedó de Dawn en la carpeta
+# de compilación se borra para que CMake no lo vuelva a usar.
 # KNULLI no tiene X11, Wayland ni /dev/dri: SDL3 se compila "de consola" (ventana offscreen por ahora).
 rm -rf "$WC/$BUILD/_deps/dawn-"*
 docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$WC":"$WC" -w "$WC" "$IMG" bash -c "
   cmake -S runtime-wiisports -B $BUILD -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE=/opt/choya/aarch64-clang.cmake \
-        -DAURORA_DAWN_PROVIDER=package -DAURORA_SDL3_PROVIDER=vendor \
+        -DAURORA_DAWN_PROVIDER=choya -UDawn_DIR -DAURORA_SDL3_PROVIDER=vendor \
         -DSDL_UNIX_CONSOLE_BUILD=ON -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=OFF &&
   cmake --build $BUILD -j $JOBS -- -k 0" >>"$LOG" 2>&1
 STATUS=$?

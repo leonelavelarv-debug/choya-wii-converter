@@ -1416,6 +1416,74 @@ AURORA_EDITS = [
      "      render_pass_impl(pass, renderPasses, i, interpolatedFrame, debugFrame);\n"
      "    }\n",
      "motor de Choya (Dawn sin dibujos)"),
+    # Sin Dawn (0.22.0): AURORA_DAWN_PROVIDER=choya compila el WebGPU nulo de Choya (lib/choya/sin_dawn) en lugar de
+    # Dawn. Las cabeceras son las de Dawn (generadas de dawn.json); las funciones no usan GPU. El motor GLES de Choya
+    # dibuja lo que aurora captura, así que aurora ya no necesita codificar, compilar WGSL ni presentar.
+    ("cmake/AuroraDawnProvider.cmake", 'if (_aurora_dawn_provider STREQUAL "vendor")\n',
+     '# choya: el WebGPU nulo de Choya en lugar de Dawn (el motor GLES de Choya dibuja; aurora no usa la GPU).\n'
+     'if (_aurora_dawn_provider STREQUAL "choya")\n'
+     '  if (NOT TARGET webgpu_dawn)\n'
+     '    set(_choya_sin_dawn "${CMAKE_CURRENT_LIST_DIR}/../lib/choya/sin_dawn")\n'
+     '    message(STATUS "aurora: WebGPU nulo de Choya, sin Dawn (${_choya_sin_dawn})")\n'
+     '    add_library(webgpu_dawn STATIC "${_choya_sin_dawn}/webgpu_nulo.cpp")\n'
+     '    target_include_directories(webgpu_dawn PUBLIC "${_choya_sin_dawn}/include")\n'
+     '    target_compile_features(webgpu_dawn PUBLIC cxx_std_20)\n'
+     '    set_target_properties(webgpu_dawn PROPERTIES POSITION_INDEPENDENT_CODE ON)\n'
+     '    add_library(dawn::webgpu_dawn ALIAS webgpu_dawn)\n'
+     '  endif ()\n'
+     '  _aurora_dawn_set_platform_backends()\n'
+     '  set(AURORA_DAWN_IS_SHARED FALSE PARENT_SCOPE)\n'
+     'elseif (_aurora_dawn_provider STREQUAL "vendor")\n',
+     "sin Dawn (proveedor choya)"),
+    ("lib/gfx/pipeline_cache.cpp", '#include "../webgpu/gpu.hpp"\n',
+     '#include "../webgpu/gpu.hpp"\n#include "../choya/choya_gx.hpp"  // choya\n',
+     "sin Dawn (cabecera en pipeline_cache)"),
+    ("lib/gfx/pipeline_cache.cpp", "  g_activeBackgroundPipelineWorkers = 0;\n\n  if (webgpu::g_backendType",
+     "  g_activeBackgroundPipelineWorkers = 0;\n"
+     "  if (choya::sin_gpu()) {\n"
+     "    // choya: sin GPU un pipeline es un objeto vacío; se crea al momento en el hilo de aurora. Sin hilos de\n"
+     "    // compilación ni base de datos de pipelines (ni lectura al arrancar ni escrituras en la microSD).\n"
+     "    g_hasPipelineThread = false;\n"
+     "    g_pipelineCacheBroken = true;\n"
+     "    Log.info(\"choya: pipelines sin GPU (sin hilos ni base de datos)\");\n"
+     "    return;\n"
+     "  }\n"
+     "\n  if (webgpu::g_backendType",
+     "sin Dawn (pipelines al momento)"),
+    ("lib/gx/pipeline.cpp", '#include "../webgpu/gpu.hpp"\n',
+     '#include "../webgpu/gpu.hpp"\n#include "../choya/choya_gx.hpp"  // choya\n',
+     "sin Dawn (cabecera en pipeline)"),
+    ("lib/gx/pipeline.cpp",
+     "wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {\n  ZoneScoped;\n",
+     "wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {\n  ZoneScoped;\n"
+     "  if (choya::sin_gpu()) {  // choya: el motor GLES arma sus programas; aurora no necesita WGSL\n"
+     "    const wgpu::RenderPipelineDescriptor descriptor{.label = \"Choya\"};\n"
+     "    return webgpu::g_device.CreateRenderPipeline(&descriptor);\n"
+     "  }\n",
+     "sin Dawn (sin WGSL)"),
+    ("lib/aurora.cpp", '#include "choya/choya_gx_core.hpp"  // choya\n',
+     '#include "choya/choya_gx_core.hpp"  // choya\n'
+     'extern "C" bool choya_gx_sin_gpu();  // choya: motor GLES encendido y Dawn sin dibujar (lib/choya/choya_gx.cpp)\n',
+     "sin Dawn (cabecera en aurora)"),
+    ("lib/aurora.cpp", '  ZoneScopedN("Encode sealed frame");\n  auto encoder = std::move(ctx.encoder);\n',
+     '  ZoneScopedN("Encode sealed frame");\n  auto encoder = std::move(ctx.encoder);\n'
+     '  if (choya_gx_sin_gpu()) {\n'
+     '    // choya: el cuadro ya se copió al motor GLES al sellarlo (gfx::end_frame). Sin GPU no hay pases que\n'
+     '    // codificar ni imágenes que presentar; solo se cierran las lecturas pendientes de copias chicas del EFB.\n'
+     '    gfx::efb_ram::encode_async_downloads(encoder);\n'
+     '    gfx::after_submit();\n'
+     '    gfx::g_stats.presentedFrameCount = 0;\n'
+     '    gfx::g_stats.interpolatedFrameCount = ctx.interpolatedFrameCount;\n'
+     '    return {};\n'
+     '  }\n',
+     "sin Dawn (sin codificar)"),
+    ("lib/aurora.cpp",
+     "void publish_presentations(std::vector<PresentationJob>&& presentationJobs, bool interpolationActive) {\n",
+     "void publish_presentations(std::vector<PresentationJob>&& presentationJobs, bool interpolationActive) {\n"
+     "  if (presentationJobs.empty()) {  // choya: sin GPU no hay nada que presentar (ni hilo presentador)\n"
+     "    return;\n"
+     "  }\n",
+     "sin Dawn (sin presentar)"),
     # Copias del EFB con el motor de Choya (0.21.1): aurora apuntaba cada copia para bajarla a la RAM cuando el juego
     # hiciera DCFlushRange sobre ella. Con Dawn en Null esa bajada parte el cuadro y escribe en la RAM algo que no es
     # la copia (la cara de un Mii del público quedaba en blanco). Solo se apuntan las chicas (sondas de 256 bytes o
@@ -1435,6 +1503,20 @@ AURORA_EDITS = [
 # Archivos del motor de Choya que se copian dentro de aurora (siempre se reemplazan: son de Choya).
 AURORA_FILES = [("choya_gx.hpp", "lib/choya/choya_gx.hpp"), ("choya_gx.cpp", "lib/choya/choya_gx.cpp"),
                 ("choya_gx_core.hpp", "lib/choya/choya_gx_core.hpp"), ("choya_gx_core.cpp", "lib/choya/choya_gx_core.cpp")]
+
+
+def _sin_dawn_files() -> list[tuple[str, str]]:
+    """El WebGPU nulo de Choya (0.22.0): cabeceras de Dawn + webgpu_nulo.cpp, en lib/choya/sin_dawn."""
+    base = os.path.join(os.path.dirname(__file__), "data", "aurora", "sin_dawn")
+    out = []
+    for root, _dirs, files in os.walk(base):
+        for name in sorted(files):
+            rel = os.path.relpath(os.path.join(root, name), os.path.join(base, "..")).replace(os.sep, "/")
+            out.append((rel, "lib/choya/" + rel))
+    return sorted(out)
+
+
+AURORA_FILES += _sin_dawn_files()
 
 
 _CONV_CAPTURE = (
