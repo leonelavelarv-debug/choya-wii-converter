@@ -930,7 +930,8 @@ uint64_t ChoyaHuella(uint32_t addr, uint32_t size) {
     const auto* p = static_cast<const uint8_t*>(GuestToHostPtr(addr, size));
     if (p == nullptr || size < 8) return 0;
     const uint32_t words = size / 8;
-    const uint32_t step = words > 8192 ? words / 256 : 1;
+    // 0.22.2: como mucho 512 muestras repartidas (y siempre la última palabra); las copias de hasta 4 KB se leen enteras.
+    const uint32_t step = words > 512 ? words / 512 : 1;
     uint64_t h = 0xcbf29ce484222325ull ^ size;
     auto mix = [&h](uint64_t w) {
         h = (h ^ w) * 0x9E3779B97F4A7C15ull;
@@ -939,6 +940,11 @@ uint64_t ChoyaHuella(uint32_t addr, uint32_t size) {
     for (uint32_t i = 0; i < words; i += step) {
         uint64_t w;
         std::memcpy(&w, p + size_t{i} * 8, 8);
+        mix(w);
+    }
+    if (step > 1) {
+        uint64_t w;
+        std::memcpy(&w, p + size_t{words - 1} * 8, 8);
         mix(w);
     }
     uint64_t last;
@@ -1100,6 +1106,33 @@ EDITS = [
     # caras del público en Tenis salían como cuadros blancos: RPSysKokeshiIcon::MakeTexture copia el icono y luego
     # hace CpuTexture::flush). Ahora se guarda una huella de la RAM del destino al copiar, y la copia solo se retira si
     # esa RAM cambió (el juego de verdad escribió ahí: un bloque reciclado, una lectura del disco).
+    # Hilo GX de Choya (0.23.0): GXSetDrawSync promete que el GX ya llegó al token (el juego puede reusar lo que
+    # dibujó); con el GX en otro núcleo, primero se espera a que el hilo GX termine lo entregado.
+    ("src/hle/gx/gx_stubs.cpp",
+     "extern \"C\" void GX__SetDrawSync_8016ed08(uint32_t token) {\n    (void)token;\n",
+     "extern \"C\" __attribute__((weak)) void choya_gx_hilo_esperar();  // choya: hilo GX (aurora)\n"
+     "extern \"C\" void GX__SetDrawSync_8016ed08(uint32_t token) {\n"
+     "    if (choya_gx_hilo_esperar != nullptr) choya_gx_hilo_esperar();  // choya: hilo GX\n    (void)token;\n",
+     "hilo GX (GXSetDrawSync espera)"),
+    ("src/hle/gx/gx_stubs.cpp",
+     "extern \"C\" void SPM_GXSetDrawSync(uint32_t token) {\n",
+     "extern \"C\" void SPM_GXSetDrawSync(uint32_t token) {\n"
+     "    if (choya_gx_hilo_esperar != nullptr) choya_gx_hilo_esperar();  // choya: hilo GX\n",
+     "hilo GX (GXSetDrawSync de SPM espera)"),
+    ("src/hle/gx/gx_guest_write_hooks.cpp",
+     "    aurora_set_guest_write_hooks(&GuestWriteGenerationHook, &GuestWriteNotifyHook);\n",
+     "    aurora_set_guest_write_hooks(&GuestWriteGenerationHook, &GuestWriteNotifyHook);\n"
+     "    // choya: hilo GX. Las listas de dibujo en la RAM del juego no se copian: el hilo GX las lee de ahí.\n"
+     "    for (int i = 0; i < 2; ++i) {\n"
+     "        if (choya_gx_hilo_memoria_juego != nullptr) {\n"
+     "            choya_gx_hilo_memoria_juego(i, g_aliases[i].hostBase, g_aliases[i].size);\n"
+     "        }\n"
+     "    }\n",
+     "hilo GX (RAM del juego)"),
+    ("src/hle/gx/gx_guest_write_hooks.cpp", "void InstallAuroraHooks() {\n",
+     "extern \"C\" __attribute__((weak)) void choya_gx_hilo_memoria_juego(int banco, const void* base, uint64_t size);\n"
+     "void InstallAuroraHooks() {\n",
+     "hilo GX (RAM del juego, declaración)"),
     ("src/hle/gx/gx_copy.cpp", '#include "runtime_log.h"\n',
      '#include "runtime_log.h"\n'
      'extern "C" bool choya_gx_copias_solo_gpu();  // choya: motor de Choya con Dawn en Null (lib/choya/choya_gx.cpp)\n'
@@ -1204,7 +1237,8 @@ AURORA_EDITS = [
      "ImGui sin dibujar en la ventana offscreen"),
     # Motor de Choya, paso 2a: el cuadro que arma aurora se copia al motor GLES de Choya (lib/choya/choya_gx.cpp).
     ("cmake/aurora_gx.cmake", "        lib/gfx/common.cpp\n",
-     "        lib/gfx/common.cpp\n        lib/choya/choya_gx.cpp\n        lib/choya/choya_gx_core.cpp\n",
+     "        lib/gfx/common.cpp\n        lib/choya/choya_gx.cpp\n        lib/choya/choya_gx_core.cpp\n"
+     "        lib/choya/choya_hilo.cpp\n",
      "motor de Choya en aurora_gx"),
     ("lib/gfx/common.cpp", '#include "../window.hpp"\n',
      '#include "../window.hpp"\n#include "../choya/choya_gx.hpp"  // choya: motor GLES de Choya\n',
@@ -1486,6 +1520,37 @@ AURORA_EDITS = [
      "    return;\n"
      "  }\n",
      "sin Dawn (sin presentar)"),
+    # GX más barato por dibujo (0.22.2). Cada cambio de material (unos 1350 por cuadro en Wii Sports) armaba la
+    # configuración del pipeline desde cero: borrar 2.7 KB, llenarla, hashearla y compararla byte a byte con la del
+    # caché. Ahora se rehúsa una configuración de trabajo (solo se vuelven a poner en cero las etapas TEV, indirectas y
+    # de coordenadas que usó la anterior) y, con el motor de Choya, el hash de 64 bits basta para reconocerla.
+    # CHOYA_VERIFICAR_PIPELINE=1 compara cada una con la armada desde cero (para pruebas).
+    ("lib/gx/command_processor.cpp",
+     "  PipelineConfig config{};\n  populate_pipeline_config(config, prim, fmt);\n",
+     "  // choya: configuración de trabajo reusada (sin borrar 2.7 KB por cambio de material).\n"
+     "  static PipelineConfig s_choyaConfig{};\n"
+     "  static u32 s_choyaStages = 0, s_choyaInd = 0, s_choyaTcgs = 0;\n"
+     "  PipelineConfig& config = s_choyaConfig;\n"
+     "  for (u32 i = 0; i < s_choyaStages; ++i) config.shaderConfig.tevStages[i] = TevStage{};\n"
+     "  for (u32 i = 0; i < s_choyaInd; ++i) config.shaderConfig.indStages[i] = IndStage{};\n"
+     "  for (u32 i = 0; i < s_choyaTcgs; ++i) config.shaderConfig.tcgs[i] = TcgConfig{};\n"
+     "  config.shaderConfig.zTexture = 0;\n"
+     "  populate_pipeline_config(config, prim, fmt);\n"
+     "  s_choyaStages = std::min<u32>(config.shaderConfig.tevStageCount, MaxTevStages);\n"
+     "  s_choyaInd = std::min<u32>(config.shaderConfig.numIndStages, MaxIndStages);\n"
+     "  s_choyaTcgs = std::min<u32>(config.shaderConfig.numTexGens, MaxTexCoord);\n"
+     "  static const bool s_choyaVerify = std::getenv(\"CHOYA_VERIFICAR_PIPELINE\") != nullptr;\n"
+     "  if (s_choyaVerify) {\n"
+     "    PipelineConfig fresh{};\n"
+     "    populate_pipeline_config(fresh, prim, fmt);\n"
+     "    CHECK(std::memcmp(&fresh, &config, sizeof(PipelineConfig)) == 0, \"choya: la configuración reusada difiere\");\n"
+     "  }\n",
+     "GX barato (configuración reusada)"),
+    ("lib/gx/command_processor.cpp",
+     "  if (entry.valid && entry.state.configHash == hash && same_pipeline_config(entry.config, config)) LIKELY {\n",
+     "  if (entry.valid && entry.state.configHash == hash &&\n"
+     "      (choya::sin_gpu() || same_pipeline_config(entry.config, config))) LIKELY {  // choya: el hash de 64 bits basta\n",
+     "GX barato (sin comparar 1 KB)"),
     # Copias del EFB con el motor de Choya (0.21.1): aurora apuntaba cada copia para bajarla a la RAM cuando el juego
     # hiciera DCFlushRange sobre ella. Con Dawn en Null esa bajada parte el cuadro y escribe en la RAM algo que no es
     # la copia (la cara de un Mii del público quedaba en blanco). Solo se apuntan las chicas (sondas de 256 bytes o
@@ -1500,11 +1565,230 @@ AURORA_EDITS = [
      "    aurora::gfx::efb_ram::schedule(dest, logicalDstWidth, logicalDstHeight, texCopyFmt, handle.handle, patchStride);\n"
      "  }\n",
      "copias del EFB solo en la GPU"),
+    # Hilo GX de Choya (0.23.0, lib/choya/choya_hilo.cpp): el procesador de comandos corre en otro núcleo. drain()
+    # entrega el FIFO al hilo GX; las listas se copian y van detrás; GXApplyBPReg y los cambios directos del estado se
+    # anotan en el punto ya entregado (antes del FIFO pendiente, como antes). Lo que lee o cambia el procesador de
+    # forma directa toma el procesador (AURORA_EXCLUSIVOS). CHOYA_GX_HILO=1 lo enciende.
+    ("lib/gx/fifo.cpp", '#include "../choya/choya_gx_core.hpp"  // choya\n',
+     '#include "../choya/choya_gx_core.hpp"  // choya\n#include "../choya/choya_hilo.hpp"  // choya: hilo GX\n',
+     "hilo GX (cabecera del FIFO)"),
+    ("lib/gx/fifo.cpp", "void drain() {\n  // SEALED, not DONE.\n",
+     "void drain() {\n"
+     "  if (::choya::hilo::activo()) {  // choya: hilo GX\n"
+     "    if (::choya::hilo::en_hilo()) return;  // el hilo GX procesa los lotes en orden\n"
+     "    if (!::choya::hilo::exclusivo()) {\n"
+     "      ::choya::hilo::fifo_listo();  // se entrega al hilo GX\n"
+     "      return;\n"
+     "    }\n"
+     "  }\n"
+     "  // SEALED, not DONE.\n",
+     "hilo GX (drain entrega)"),
+    ("lib/dolphin/gx/GXDispList.cpp", '#include "../../choya/choya_gx_core.hpp"  // choya\n\n#include <chrono>\n',
+     '#include "../../choya/choya_gx_core.hpp"  // choya\n\n#include <chrono>\n'
+     '#include "../../choya/choya_hilo.hpp"  // choya: hilo GX\n',
+     "hilo GX (cabecera de las listas)"),
+    ("lib/dolphin/gx/GXDispList.cpp", 'extern "C" {\nbool GXDisplayListIsEmpty() {\n',
+     '// choya: el hilo GX procesa las listas copiadas con el mismo código.\n'
+     'extern "C" void choya_gx_procesar_lista(const uint8_t* data, uint32_t nbytes, bool bigEndian) {\n'
+     '  process_display_list(data, nbytes, bigEndian);\n'
+     '}\n\n'
+     'extern "C" {\nbool GXDisplayListIsEmpty() {\n',
+     "hilo GX (listas en el hilo GX)"),
+    ("lib/dolphin/gx/GXDispList.cpp",
+     "  // Decode the display list immediately while its borrowed resources are valid.\n"
+     "  aurora::gx::fifo::drain();\n"
+     "  process_display_list(static_cast<const u8*>(data), nbytes, true);\n",
+     "  if (::choya::hilo::asincrono()) {  // choya: hilo GX (la lista se copia: puede ser prestada)\n"
+     "    ::choya::hilo::lista(data, nbytes, true);\n"
+     "    return;\n"
+     "  }\n"
+     "  // Decode the display list immediately while its borrowed resources are valid.\n"
+     "  aurora::gx::fifo::drain();\n"
+     "  process_display_list(static_cast<const u8*>(data), nbytes, true);\n",
+     "hilo GX (GXCallDisplayList)"),
+    ("lib/dolphin/gx/GXDispList.cpp",
+     "  // Decode little-endian lists separately after finishing the normal FIFO work.\n"
+     "  aurora::gx::fifo::drain();\n",
+     "  if (::choya::hilo::asincrono()) {  // choya: hilo GX\n"
+     "    ::choya::hilo::lista(data, nbytes, false);\n"
+     "    return;\n"
+     "  }\n"
+     "  // Decode little-endian lists separately after finishing the normal FIFO work.\n"
+     "  aurora::gx::fifo::drain();\n",
+     "hilo GX (GXCallDisplayListLE)"),
+    ("lib/gx/command_processor.cpp", '#include "../choya/choya_gx.hpp"  // choya\n',
+     '#include "../choya/choya_gx.hpp"  // choya\n#include "../choya/choya_hilo.hpp"  // choya: hilo GX\n',
+     "hilo GX (cabecera del procesador)"),
+    ("lib/gx/command_processor.cpp",
+     'extern "C" void GXApplyBPReg(u8 reg, u32 value) {\n'
+     "  const bool wasDirty = g_gxState.stateDirty;\n"
+     "  handle_bp((static_cast<u32>(reg) << 24) | (value & 0x00FFFFFFu), true);\n"
+     "  if (MergeSuspectsOn()) note_write(0, 0x100 | reg, value & 0x00FFFFFFu, wasDirty);\n"
+     "}\n",
+     '// choya: hilo GX. El cuerpo de antes, para el hilo GX y para el procesador tomado.\n'
+     'extern "C" void choya_gx_aplicar_bp(uint8_t reg, uint32_t value) {\n'
+     "  const bool wasDirty = g_gxState.stateDirty;\n"
+     "  handle_bp((static_cast<u32>(reg) << 24) | (value & 0x00FFFFFFu), true);\n"
+     "  if (MergeSuspectsOn()) note_write(0, 0x100 | reg, value & 0x00FFFFFFu, wasDirty);\n"
+     "}\n"
+     'extern "C" void GXApplyBPReg(u8 reg, u32 value) {\n'
+     "  if (::choya::hilo::asincrono() && !in_display_list()) {  // en el punto ya entregado, como antes\n"
+     "    ::choya::hilo::bp(reg, value);\n"
+     "    return;\n"
+     "  }\n"
+     "  CHOYA_HILO_EXCLUSIVO();\n"
+     "  choya_gx_aplicar_bp(reg, value);\n"
+     "}\n",
+     "hilo GX (GXApplyBPReg)"),
+    ("lib/dolphin/gx/GXGeometry.cpp", '#include "../../gx/fifo.hpp"\n',
+     '#include "../../gx/fifo.hpp"\n#include "../../choya/choya_hilo.hpp"  // choya: hilo GX\n',
+     "hilo GX (cabecera de la geometría)"),
+    ("lib/dolphin/gx/GXGeometry.cpp",
+     "static inline bool AuroraVtxDescDiffers(GXAttr attr, GXAttrType type) {\n",
+     "static inline bool AuroraVtxDescDiffers(GXAttr attr, GXAttrType type) {\n"
+     "  if (::choya::hilo::asincrono()) return true;  // choya: hilo GX (el procesador va atrás: se manda de nuevo)\n",
+     "hilo GX (descriptor de vértices)"),
+    ("lib/dolphin/gx/GXGeometry.cpp",
+     "static inline bool AuroraVtxAttrFmtDiffers(GXVtxFmt vtxfmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {\n",
+     "static inline bool AuroraVtxAttrFmtDiffers(GXVtxFmt vtxfmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {\n"
+     "  if (::choya::hilo::asincrono()) return true;  // choya: hilo GX\n",
+     "hilo GX (formato de vértices)"),
+    ("lib/dolphin/gx/GXGeometry.cpp",
+     "void GXSetSourceVtxDesc(GXAttr attr, GXAttrType type) {\n"
+     "  if (attr >= GX_VA_PNMTXIDX && attr < GX_VA_MAX_ATTR) {\n"
+     "    g_gxState.sourceVtxDesc[attr] = type;\n"
+     "  }\n"
+     "}\n",
+     "void GXSetSourceVtxDesc(GXAttr attr, GXAttrType type) {\n"
+     "  if (attr >= GX_VA_PNMTXIDX && attr < GX_VA_MAX_ATTR) {\n"
+     "    if (::choya::hilo::asincrono()) {  // choya: hilo GX\n"
+     "      ::choya::hilo::diferir([attr, type] { g_gxState.sourceVtxDesc[attr] = type; });\n"
+     "      return;\n"
+     "    }\n"
+     "    g_gxState.sourceVtxDesc[attr] = type;\n"
+     "  }\n"
+     "}\n",
+     "hilo GX (GXSetSourceVtxDesc)"),
+    ("lib/dolphin/gx/GXTransform.cpp", '#include "__gx.h"\n',
+     '#include "__gx.h"\n#include "../../choya/choya_hilo.hpp"  // choya: hilo GX\n',
+     "hilo GX (cabecera de las transformaciones)"),
+    ("lib/dolphin/gx/GXTransform.cpp",
+     "  g_gxState.zScale = scale;\n  g_gxState.zOffset = offset;\n",
+     "  if (::choya::hilo::asincrono()) {  // choya: hilo GX\n"
+     "    ::choya::hilo::diferir([scale, offset] {\n"
+     "      g_gxState.zScale = scale;\n"
+     "      g_gxState.zOffset = offset;\n"
+     "    });\n"
+     "  } else {\n"
+     "    g_gxState.zScale = scale;\n"
+     "    g_gxState.zOffset = offset;\n"
+     "  }\n",
+     "hilo GX (GXSetZScaleOffset)"),
+    ("lib/dolphin/gx/GXTransform.cpp",
+     "  g_gxState.scissorOffsetX = x_off;\n  g_gxState.scissorOffsetY = y_off;\n",
+     "  if (::choya::hilo::asincrono()) {  // choya: hilo GX\n"
+     "    ::choya::hilo::diferir([x_off, y_off] {\n"
+     "      g_gxState.scissorOffsetX = x_off;\n"
+     "      g_gxState.scissorOffsetY = y_off;\n"
+     "    });\n"
+     "  } else {\n"
+     "    g_gxState.scissorOffsetX = x_off;\n"
+     "    g_gxState.scissorOffsetY = y_off;\n"
+     "  }\n",
+     "hilo GX (GXSetScissorBoxOffset)"),
+    ("lib/aurora.cpp", 'extern "C" bool choya_gx_sin_gpu();  // choya: motor GLES encendido y Dawn sin dibujar (lib/choya/choya_gx.cpp)\n',
+     'extern "C" bool choya_gx_sin_gpu();  // choya: motor GLES encendido y Dawn sin dibujar (lib/choya/choya_gx.cpp)\n'
+     '#include "choya/choya_hilo.hpp"  // choya: hilo GX\n',
+     "hilo GX (cabecera de aurora)"),
+    ("lib/aurora.cpp",
+     "  if (const auto callback = g_frameWorkerWaitCallback.load(std::memory_order_acquire)) {\n"
+     "    callback();\n  }\n  return false;\n",
+     "  // choya: el hilo GX no atiende los tiempos del juego (eso es del hilo del juego).\n"
+     "  if (const auto callback = g_frameWorkerWaitCallback.load(std::memory_order_acquire);\n"
+     "      callback != nullptr && !::choya::hilo::en_hilo()) {\n"
+     "    callback();\n  }\n  return false;\n",
+     "hilo GX (espera del hilo de aurora)"),
+    ("lib/aurora.cpp", "void aurora_end_frame() { aurora::end_frame(); }\n",
+     "void aurora_end_frame() {\n  CHOYA_HILO_EXCLUSIVO();  // choya: hilo GX\n  aurora::end_frame();\n"
+     "  ::choya::hilo::cuadro();  // informe del hilo GX\n}\n",
+     "hilo GX (fin de cuadro)"),
+    ("lib/aurora.cpp", "void aurora_shutdown() { aurora::shutdown(); }\n",
+     "void aurora_shutdown() {\n"
+     "  {\n    CHOYA_HILO_EXCLUSIVO();  // choya: hilo GX\n  }\n"
+     "  ::choya::hilo::detener();\n"
+     "  aurora::shutdown();\n"
+     "}\n",
+     "hilo GX (cierre)"),
 ]
+
+# Hilo GX de Choya (0.23.0): funciones de aurora que leen o cambian el estado del procesador de forma directa. Al
+# entrar toman el procesador (CHOYA_HILO_EXCLUSIVO: esperan a que el hilo GX termine lo entregado) y corren como
+# antes en el hilo del juego. (archivo, cabecera tras la que va el include, funciones)
+AURORA_EXCLUSIVOS = [
+    ("lib/dolphin/gx/GXFrameBuffer.cpp", '../../choya/choya_hilo.hpp',
+     ["GXSetDispCopySrc", "GXSetTexCopySrc", "GXSetDispCopyDst", "GXSetTexCopyDst", "GXSetDispCopyFrame2Field",
+      "GXSetCopyClamp", "GXSetDispCopyYScale", "GXSetCopyClear", "GXSetCopyFilter", "GXSetDispCopyGamma",
+      "GXCopyDisp", "GXCopyTex", "GXClearBoundingBox", "GXReadBoundingBox"]),
+    ("lib/dolphin/gx/GXCpu2Efb.cpp", '../../choya/choya_hilo.hpp', ["GXPeekZ"]),
+    ("lib/dolphin/gx/GXAurora.cpp", '../../choya/choya_hilo.hpp',
+     ["AuroraSetViewportPolicy", "AuroraSetViewportFixedAspect", "AuroraGetRenderSize", "AuroraGetPictureSize",
+      "AuroraGetSurfaceSize", "GXSetViewportRender", "GXSetScissorRender", "GXSetViewportScissorRenderSafeArea",
+      "GXRestoreViewportScissorRender", "GXSetTexCopySrcRender", "GXCreateFrameBuffer", "GXRestoreFrameBuffer"]),
+    ("lib/dolphin/gx/GXManage.cpp", '../../choya/choya_hilo.hpp', ["GXInit", "GXDrawDone", "GXSetDrawDone"]),
+    ("lib/dolphin/vi/vi.cpp", '../../choya/choya_hilo.hpp',
+     ["VIConfigure", "VIConfigurePan", "VISetWindowFullscreen", "VISetWindowSize", "VISetFrameBufferScale",
+      "VISetFrameBufferLines", "VILockAspectRatio", "VIUnlockAspectRatio"]),
+    ("lib/gx/command_processor.cpp", '../choya/choya_hilo.hpp', ["submit_raw_draw", "aurora_spm_vtx_state"]),
+    ("lib/aurora.cpp", 'choya/choya_hilo.hpp',
+     ["aurora_update", "aurora_begin_frame", "aurora_wait_for_frame_worker",
+      "aurora_wait_for_frame_worker_for", "aurora_request_frame_capture", "aurora_flush_efb_copies_to_ram",
+      "aurora_flush_efb_copy_to_ram", "aurora_read_display_copy", "aurora_set_display_mode"]),
+]
+_EXCLUSIVO = "CHOYA_HILO_EXCLUSIVO();"
+
+
+def archivos_aurora() -> list[str]:
+    """Los archivos de aurora que Choya edita (AURORA_EDITS y AURORA_EXCLUSIVOS)."""
+    return sorted({r for r, _o, _n, _l in AURORA_EDITS} | {r for r, _h, _n in AURORA_EXCLUSIVOS})
+
+
+def num_exclusivos() -> int:
+    return sum(len(names) for _r, _h, names in AURORA_EXCLUSIVOS)
+
+
+def aplicar_exclusivos(text: str, rel: str, header: str, names: list[str]) -> tuple[str, list[tuple[str, int, str]]]:
+    """Pone CHOYA_HILO_EXCLUSIVO() al principio de cada función (y el include). Devuelve el texto y, por función,
+    (nombre, línea, 'edicion'|'ya estaba'|'no encontré')."""
+    out = []
+    inc = f'#include "{header}"  // choya: hilo GX\n'
+    if inc not in text:
+        m = re.search(r'^#include [^\n]*\n', text, re.M)
+        pos = m.end() if m else 0
+        text = text[:pos] + inc + text[pos:]
+    for name in names:
+        pat = re.compile(r'^[A-Za-z_][^\n;{}()]*\b' + re.escape(name) + r'\s*\([^()]*\)\s*(?:noexcept\s*)?\{', re.M)
+        found = list(pat.finditer(text))
+        if len(found) != 1:
+            out.append((name, 0, "no encontré" if not found else f"aparece {len(found)} veces"))
+            continue
+        m = found[0]
+        rest = text[m.end():]
+        line = _line_of(text, m.start())
+        if rest.lstrip(" \n").startswith(_EXCLUSIVO):
+            out.append((name, line, "ya estaba"))
+            continue
+        if rest.startswith("\n"):
+            text = text[:m.end()] + "\n  " + _EXCLUSIVO + "  // choya: hilo GX" + rest
+        else:
+            text = text[:m.end()] + " " + _EXCLUSIVO + " " + rest.lstrip(" ")
+        out.append((name, line, "edicion"))
+    return text, out
+
 
 # Archivos del motor de Choya que se copian dentro de aurora (siempre se reemplazan: son de Choya).
 AURORA_FILES = [("choya_gx.hpp", "lib/choya/choya_gx.hpp"), ("choya_gx.cpp", "lib/choya/choya_gx.cpp"),
-                ("choya_gx_core.hpp", "lib/choya/choya_gx_core.hpp"), ("choya_gx_core.cpp", "lib/choya/choya_gx_core.cpp")]
+                ("choya_gx_core.hpp", "lib/choya/choya_gx_core.hpp"), ("choya_gx_core.cpp", "lib/choya/choya_gx_core.cpp"),
+                ("choya_hilo.hpp", "lib/choya/choya_hilo.hpp"), ("choya_hilo.cpp", "lib/choya/choya_hilo.cpp")]
 
 
 def _sin_dawn_files() -> list[tuple[str, str]]:
@@ -1561,6 +1845,7 @@ AURORA_STRIPS = [("lib/gfx/common.cpp", s) for s in _capture_payloads()] + [
     ("lib/dolphin/gx/GXDispList.cpp", _CHOYA_LIST_TIMER_0202),
     ("cmake/aurora_gx.cmake", "        lib/choya/choya_gx_core.cpp\n"),
     ("cmake/aurora_gx.cmake", "        lib/choya/choya_gx.cpp\n"),
+    ("cmake/aurora_gx.cmake", "        lib/choya/choya_hilo.cpp\n"),
 ]
 
 
@@ -1609,6 +1894,24 @@ def patch_aurora(wiicompiled: str, changes: list[Change]) -> None:
             line = _line_of(text, text.index(old))
             text = text.replace(old, new, 1)
             changes.append(Change(shown, line, "edicion", 0, None, label, label))
+        if text != original:
+            with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+                f.write(text)
+    for rel, header, names in AURORA_EXCLUSIVOS:
+        path = os.path.join(base, rel)
+        shown = "aurora-main/" + rel
+        if not os.path.isfile(path):
+            changes.append(Change(shown, 0, "parche_fallido", 0, None, "hilo GX (procesador tomado)", "no encontré el archivo"))
+            continue
+        with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
+            original = f.read()
+        text, res = aplicar_exclusivos(original, rel, header, names)
+        for name, line, what in res:
+            label = f"hilo GX (procesador tomado en {name})"
+            if what in ("edicion", "ya estaba"):
+                changes.append(Change(shown, line, "edicion", 0, None, label, label + (" (ya estaba)" if what == "ya estaba" else "")))
+            else:
+                changes.append(Change(shown, 0, "parche_fallido", 0, None, label, what))
         if text != original:
             with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
                 f.write(text)

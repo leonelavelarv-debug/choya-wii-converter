@@ -161,6 +161,28 @@ static void draw_triangle() {
       GXEnd();
     }
   }
+  if (std::getenv("PRUEBA_SOLO_TRIANGULO") == nullptr) {
+    // Un cuadro verde más por lista de dibujo (GXBeginDisplayList / GXCallDisplayList), arriba a la derecha: con el
+    // hilo GX de Choya la lista se copia y la procesa el otro hilo.
+    static u8 lista[512] __attribute__((aligned(32)));
+    static u32 tam = 0;
+    if (tam == 0) {
+      GXBeginDisplayList(lista, sizeof(lista));
+      GXBegin(GX_QUADS, GX_VTXFMT1, 4);
+      GXPosition3f32(520, 20, -0.5f);
+      GXTexCoord2f32(0, 0);
+      GXPosition3f32(620, 20, -0.5f);
+      GXTexCoord2f32(1, 0);
+      GXPosition3f32(620, 120, -0.5f);
+      GXTexCoord2f32(1, 1);
+      GXPosition3f32(520, 120, -0.5f);
+      GXTexCoord2f32(0, 1);
+      GXEnd();
+      tam = GXEndDisplayList();
+    }
+    GXSetSourceVtxDesc(GX_VA_POS, GX_DIRECT);  // cambio directo del estado (diferido con el hilo GX)
+    GXCallDisplayList(lista, tam);
+  }
   GXSetDispCopySrc(0, 0, 640, 480);
   GXSetDispCopyDst(640, 480);
   GXCopyDisp(g_xfb, GX_TRUE);
@@ -209,10 +231,12 @@ int main(int argc, char** argv) {
   const unsigned esquina = pixel(10, 10);
   const unsigned copia = pixel(70, 479 - 410);
   const unsigned verde = pixel(570, 479 - 410);
+  const unsigned lista = pixel(570, 479 - 70);
   std::printf("cuadros %d\n", frames);
   aurora_shutdown();
   const bool ok = soloTriangulo ? centro == 0xFF0000 && esquina == 0x0000FF
-                                : centro == 0x0000FF && esquina == 0x0000FF && copia == 0xFF0000 && verde == 0x00FF00;
+                                : centro == 0x0000FF && esquina == 0x0000FF && copia == 0xFF0000 && verde == 0x00FF00 &&
+                                      lista == 0x00FF00;
   if (!ok) {
     std::puts("FALLO: colores");
     return 1;

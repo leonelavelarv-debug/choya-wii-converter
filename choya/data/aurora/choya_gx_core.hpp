@@ -140,7 +140,7 @@ void texture_packed_data(uint64_t id, uint32_t width, uint32_t height, uint32_t 
 size_t gx_level_size(uint32_t gxFormat, uint32_t width, uint32_t height) noexcept;
 uint64_t texture_key(const uint8_t* level0, size_t size, uint32_t width, uint32_t height, uint32_t gxFormat) noexcept;
 // Fija el hilo que la llama (el del juego) al último núcleo y el resto del proceso a los demás (CHOYA_NUCLEOS=0 no).
-void pin_game_thread() noexcept;
+void pin_game_thread(int gameTid = 0, int gxTid = 0) noexcept;  // 0: el hilo que llama
 // Tiempos de aurora fuera del motor (0.20.2), en ns, para el informe cada 10 s: 0 el juego esperando a que el hilo
 // de aurora suelte el cuadro anterior, 1 sellar, 2 codificar, 3 publicar, 4 esperar permiso para preparar, 5 preparar
 // el siguiente, 6 listas de dibujo (GXCallDisplayList), 7 cuántas listas, 8 bytes de listas, 9 ciclos (cuadros).

@@ -96,14 +96,15 @@ class TestCopiasEfb(unittest.TestCase):
             rel = "lib/dolphin/gx/GXFrameBuffer.cpp"
             os.makedirs(os.path.join(d, "aurora-main", os.path.dirname(rel)))
             shutil.copy(os.path.join(AURORA, rel), os.path.join(d, "aurora-main", rel))
-            saved = R.AURORA_EDITS
+            saved, saved_ex = R.AURORA_EDITS, R.AURORA_EXCLUSIVOS
+            R.AURORA_EXCLUSIVOS = []
             try:
                 R.AURORA_EDITS = [e for e in saved if e[0] == rel]
                 self.assertEqual(len(R.AURORA_EDITS), 2)
                 changes = []
                 R.patch_aurora(d, changes)
             finally:
-                R.AURORA_EDITS = saved
+                R.AURORA_EDITS, R.AURORA_EXCLUSIVOS = saved, saved_ex
             self.assertNotIn("parche_fallido", [c.kind for c in changes])
             text = open(os.path.join(d, "aurora-main", rel), encoding="utf-8").read()
             self.assertIn("handle.dataSize <= 256", text)

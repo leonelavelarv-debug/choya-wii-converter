@@ -2978,38 +2978,55 @@ void texture_packed_data(uint64_t id, uint32_t width, uint32_t height, uint32_t 
   s.pending.push_back(std::move(up));
 }
 
-// Núcleos: el hilo del juego (el que procesa el GX) se queda solo en el último núcleo y los demás hilos del proceso
-// (motor de Choya, hilos de la Mali, audio, aurora) en los otros tres, para que nada le quite tiempo ni lo mueva de
-// núcleo (cachés frías). Se llama desde el hilo del juego; dos veces, para alcanzar a los hilos que nacen después.
-// CHOYA_NUCLEOS=0 lo apaga.
-void pin_game_thread() noexcept {
+// Núcleos: el hilo del juego se queda solo en el último núcleo y los demás hilos del proceso (motor de Choya, hilos de
+// la Mali, audio, aurora) en los otros, para que nada le quite tiempo ni lo mueva de núcleo (cachés frías). Con el
+// hilo GX de Choya (0.23.0, gameTid y gxTid), el hilo GX va solo en el penúltimo núcleo y los demás en el resto. Se
+// llama desde el hilo que procesa el GX; dos veces, para alcanzar a los hilos que nacen después. CHOYA_NUCLEOS=0 lo
+// apaga.
+void pin_game_thread(int gameTid, int gxTid) noexcept {
 #if defined(__linux__)
   const char* env = std::getenv("CHOYA_NUCLEOS");
   if (env != nullptr && std::strcmp(env, "0") == 0) return;
   const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
   if (ncpu < 3 || ncpu > CPU_SETSIZE) return;
+  const pid_t self = gameTid > 0 ? static_cast<pid_t>(gameTid) : static_cast<pid_t>(syscall(SYS_gettid));
+  const bool conGx = gxTid > 0 && gxTid != self && ncpu >= 4;
   const int gameCpu = static_cast<int>(ncpu) - 1;
-  cpu_set_t game, others;
+  const int gxCpu = gameCpu - 1;
+  const int otros = conGx ? gxCpu : gameCpu;  // núcleos 0..otros-1
+  cpu_set_t game, gx, others;
   CPU_ZERO(&game);
+  CPU_ZERO(&gx);
   CPU_ZERO(&others);
   CPU_SET(gameCpu, &game);
-  for (int i = 0; i < gameCpu; ++i) CPU_SET(i, &others);
-  const pid_t self = static_cast<pid_t>(syscall(SYS_gettid));
+  CPU_SET(gxCpu, &gx);
+  for (int i = 0; i < otros; ++i) CPU_SET(i, &others);
   if (sched_setaffinity(self, sizeof(game), &game) != 0) {
     log_line("motor: no pude fijar el hilo del juego a un núcleo");
     return;
+  }
+  if (conGx && sched_setaffinity(static_cast<pid_t>(gxTid), sizeof(gx), &gx) != 0) {
+    log_line("motor: no pude fijar el hilo GX a un núcleo");
   }
   int moved = 0;
   if (DIR* d = ::opendir("/proc/self/task")) {
     while (const dirent* e = ::readdir(d)) {
       const pid_t tid = static_cast<pid_t>(std::atoi(e->d_name));
-      if (tid <= 0 || tid == self) continue;
+      if (tid <= 0 || tid == self || (conGx && tid == static_cast<pid_t>(gxTid))) continue;
       if (sched_setaffinity(tid, sizeof(others), &others) == 0) ++moved;
     }
     ::closedir(d);
   }
-  log_line("motor: hilo del juego %d solo en el núcleo %d; %d hilos más en los núcleos 0-%d", static_cast<int>(self),
-           gameCpu, moved, gameCpu - 1);
+  if (conGx) {
+    log_line("motor: hilo del juego %d solo en el núcleo %d; hilo GX %d solo en el núcleo %d; %d hilos más en los "
+             "núcleos 0-%d", static_cast<int>(self), gameCpu, gxTid, gxCpu, moved, otros - 1);
+  } else {
+    log_line("motor: hilo del juego %d solo en el núcleo %d; %d hilos más en los núcleos 0-%d", static_cast<int>(self),
+             gameCpu, moved, otros - 1);
+  }
+#else
+  (void)gameTid;
+  (void)gxTid;
 #endif
 }
 

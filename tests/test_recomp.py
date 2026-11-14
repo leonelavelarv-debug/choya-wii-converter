@@ -379,7 +379,7 @@ class TestEdits(unittest.TestCase):
         if not os.path.exists(real):
             self.skipTest("sin aurora")
         with tempfile.TemporaryDirectory() as d:
-            for rel in sorted({r for r, _o, _n, _l in R.AURORA_EDITS}):
+            for rel in R.archivos_aurora():
                 os.makedirs(os.path.dirname(os.path.join(d, "aurora-main", rel)), exist_ok=True)
                 shutil.copy(os.path.join(real, rel), os.path.join(d, "aurora-main", rel))
             common = os.path.join(d, "aurora-main/lib/gfx/common.cpp")
@@ -414,13 +414,14 @@ class TestEdits(unittest.TestCase):
         if not os.path.exists(real):
             self.skipTest("sin aurora")
         with tempfile.TemporaryDirectory() as d:
-            for rel in sorted({r for r, _o, _n, _l in R.AURORA_EDITS}):
+            for rel in R.archivos_aurora():
                 os.makedirs(os.path.dirname(os.path.join(d, "aurora-main", rel)), exist_ok=True)
                 shutil.copy(os.path.join(real, rel), os.path.join(d, "aurora-main", rel))
             for _ in range(2):  # la segunda vez no debe duplicar nada
                 changes = []
                 R.patch_aurora(d, changes)
-                self.assertEqual([c.kind for c in changes], ["edicion"] * (len(R.AURORA_EDITS) + len(R.AURORA_FILES)))
+                self.assertEqual([c.kind for c in changes],
+                                 ["edicion"] * (len(R.AURORA_EDITS) + len(R.AURORA_FILES) + R.num_exclusivos()))
             text = open(os.path.join(d, "aurora-main/lib/dawn/BackendBinding.cpp")).read()
             self.assertEqual(text.count("choyaDisplay;"), 1)
             common = open(os.path.join(d, "aurora-main/lib/gfx/common.cpp")).read()

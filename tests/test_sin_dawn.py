@@ -60,7 +60,7 @@ class TestWebgpuNulo(unittest.TestCase):
     @unittest.skipUnless(os.path.isdir(AURORA), "sin aurora")
     def test_proveedor_choya(self):
         with tempfile.TemporaryDirectory() as d:
-            for rel in sorted({r for r, _o, _n, _l in R.AURORA_EDITS}):
+            for rel in R.archivos_aurora():
                 os.makedirs(os.path.dirname(os.path.join(d, "aurora-main", rel)), exist_ok=True)
                 shutil.copy(os.path.join(AURORA, rel), os.path.join(d, "aurora-main", rel))
             changes = []
@@ -94,14 +94,26 @@ class TestWebgpuNulo(unittest.TestCase):
                         "-DAURORA_DAWN_PROVIDER=choya", "-DAURORA_SDL3_PROVIDER=vendor", "-DSDL_X11=OFF",
                         "-DSDL_WAYLAND=OFF", "-DSDL_KMSDRM=OFF", "-DSDL_UNIX_CONSOLE_BUILD=ON"],
                        check=True, capture_output=True)
-        subprocess.run(["cmake", "--build", build, "--target", "prueba_aurora"], check=True, capture_output=True)
+        subprocess.run(["cmake", "--build", build, "--target", "prueba_aurora", "banco_gx"], check=True,
+                       capture_output=True)
         env = dict(os.environ, EGL_PLATFORM="surfaceless", SDL_VIDEODRIVER="offscreen")
-        for extra in ({}, {"PRUEBA_SOLO_TRIANGULO": "1"}):
-            out = subprocess.run([os.path.join(build, "prueba_aurora")], cwd=build, env=dict(env, **extra),
-                                 capture_output=True, text=True, timeout=300)
+        # Con y sin el hilo GX de Choya (0.23.0): los mismos píxeles.
+        for hilo in ("0", "1"):
+            for extra in ({}, {"PRUEBA_SOLO_TRIANGULO": "1"}):
+                out = subprocess.run([os.path.join(build, "prueba_aurora")], cwd=build,
+                                     env=dict(env, CHOYA_GX_HILO=hilo, **extra), capture_output=True, text=True,
+                                     timeout=300)
+                self.assertEqual(out.returncode, 0, out.stdout[-3000:] + out.stderr[-2000:])
+                self.assertIn("sin Dawn: bien", out.stdout)
+                self.assertIn("aurora: sin Dawn (WebGPU nulo de Choya)", out.stdout)
+                self.assertEqual("hilo GX de Choya" in out.stdout, hilo == "1")
+            out = subprocess.run([os.path.join(build, "banco_gx"), "40"], cwd=build,
+                                 env=dict(env, CHOYA_GLES="1", CHOYA_GX_HILO=hilo, CHOYA_GX_HILO_INFORME="20"),
+                                 capture_output=True, text=True, timeout=600)
             self.assertEqual(out.returncode, 0, out.stdout[-3000:] + out.stderr[-2000:])
-            self.assertIn("sin Dawn: bien", out.stdout)
-            self.assertIn("aurora: sin Dawn (WebGPU nulo de Choya)", out.stdout)
+            self.assertIn("dibujos por cuadro: 6000", out.stdout)
+            if hilo == "1":
+                self.assertIn("aurora: hilo GX: 20 cuadros", out.stdout + out.stderr)
 
 
 if __name__ == "__main__":

@@ -101,6 +101,13 @@ if [ -f "$DIR/volcados-sin-texturas" ]; then export CHOYA_GX_GUARDAR_TEXTURAS=0;
 # TEV exacto (0.20.9): la combinación de colores se cuenta en enteros de 8 bits como la Wii. Un archivo vacío llamado
 # "tev-flotante" junto al juego vuelve a la cuenta en flotante de antes (para comparar velocidad o colores).
 if [ -f "$DIR/tev-flotante" ]; then export CHOYA_GX_TEV=flotante; fi
+# Hilo GX (0.23.0): aurora decodifica el GX (listas, registros, dibujos) en otro núcleo, como el doble núcleo de
+# Dolphin; el hilo del juego solo arma los comandos. Un archivo vacío llamado "sin-hilo-gx" junto al juego lo apaga
+# (todo en el hilo del juego, como antes).
+if [ -f "$DIR/sin-hilo-gx" ]; then export CHOYA_GX_HILO=0; else export CHOYA_GX_HILO="${CHOYA_GX_HILO:-1}"; fi
+# Con el hilo GX, las listas de dibujo de la RAM del juego se leen de ahí (como la GPU de la Wii). Un archivo vacío
+# llamado "hilo-gx-copiar" las copia al entregarlas (por si algo se dibuja mal solo con el hilo encendido).
+if [ -f "$DIR/hilo-gx-copiar" ]; then export CHOYA_GX_HILO_COPIAR=1; fi
 # Recursos convertidos por el conversor de Choya (assets.wlpk junto al juego): texturas en ETC2/EAC ya reducidas.
 # CHOYA_PAQUETE=0 usa solo las del disco.
 if [ "${CHOYA_PAQUETE:-}" != "0" ] && [ -f "$DIR/assets.wlpk" ]; then
@@ -119,6 +126,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "PortMaster: ${controlfolder:-no encontrado}  dispositivo: ${DEVICE_NAME:-?}  CFW: ${CFW_NAME:-?}"
   echo "mapeo del mando: ${SDL_GAMECONTROLLERCONFIG:-ninguno}" | cut -c1-200
   echo "efectos de audio: $([ "${CHOYA_SIN_REVERB:-0}" = 1 ] && echo "apagados (para oírlos: archivo con-reverb)" || echo "encendidos (archivo con-reverb)")"
+  echo "hilo GX: $([ "$CHOYA_GX_HILO" = 1 ] && echo "encendido, el GX en otro núcleo (para apagarlo: archivo vacío sin-hilo-gx)" || echo "apagado (archivo sin-hilo-gx)")$([ "${CHOYA_GX_HILO_COPIAR:-0}" = 1 ] && echo "; listas copiadas (archivo hilo-gx-copiar)")"
   echo "TEV: $([ "${CHOYA_GX_TEV:-}" = flotante ] && echo "en flotante (archivo tev-flotante)" || echo "exacto en enteros (para el de antes: archivo vacío tev-flotante)")"
   echo "memoria del juego: $([ "$CHOYA_PRESTAMOS" = 0 ] && echo "solo anota (archivo sin-prestamos)" || echo "un montón presta si a otro no le cabe un bloque (para solo anotar: archivo vacío sin-prestamos)")"
   echo "volcados con texturas (MENU + R1): $([ "${CHOYA_GX_GUARDAR_TEXTURAS:-0}" = 1 ] && echo "sí (para quitarlas: archivo vacío volcados-sin-texturas)" || echo "no (archivo volcados-sin-texturas)")"
@@ -153,6 +161,7 @@ escribir_resumen() {
     echo "--- hilo de aurora y listas de dibujo (por cuadro del juego)"
     grep -hE "aurora: (sin Dawn|Dawn)" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | head -1
     grep -h "aurora: por cuadro" "$DIR/choya-gles.txt" 2>/dev/null | tail -6
+    grep -h "aurora: hilo GX" "$DIR/choya-gles.txt" 2>/dev/null | tail -4
     echo "--- núcleos"
     grep -h "motor: hilo del juego\|no pude fijar" "$DIR/choya-gles.txt" 2>/dev/null | tail -2
     echo "--- texturas sin datos en el motor (las primeras; tamaño y formato que dio aurora)"
