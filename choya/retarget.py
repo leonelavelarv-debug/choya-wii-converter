@@ -922,13 +922,15 @@ bool ChoyaCopiasSoloGpu() {
     return on;
 }
 
-// Hasta 4096 palabras de 8 bytes repartidas por el destino, más la última: una escritura de la CPU que rellena una
-// textura cambia muchas.
+// Copias de hasta 64 KB (los iconos de los Miis: 8 y 32 KB): todas sus palabras, en orden. Las más grandes (copias
+// de pantalla, cientos de KB): 256 palabras repartidas, más la última. 0.22.1: antes se leían hasta 4096 palabras
+// salteadas de las copias grandes, cada una un fallo de caché, y eso costaba unos 2.5 ms por cuadro al hilo del juego
+// (GXCopyTex 4.8 ms en el perfil). Una escritura de la CPU que rellena una textura cambia muchas palabras.
 uint64_t ChoyaHuella(uint32_t addr, uint32_t size) {
     const auto* p = static_cast<const uint8_t*>(GuestToHostPtr(addr, size));
     if (p == nullptr || size < 8) return 0;
     const uint32_t words = size / 8;
-    const uint32_t step = words > 4096 ? words / 4096 : 1;
+    const uint32_t step = words > 8192 ? words / 256 : 1;
     uint64_t h = 0xcbf29ce484222325ull ^ size;
     auto mix = [&h](uint64_t w) {
         h = (h ^ w) * 0x9E3779B97F4A7C15ull;

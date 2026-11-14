@@ -151,7 +151,7 @@ escribir_resumen() {
     echo "--- tramos del cuadro (MENU sola 2 s mide 20 s; detalle en la PC: choya perfil perfil.txt)"
     grep -hE "\[choya\] (midiendo|tramos|esperas|perfil escrito|la medición)|MENU sola" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | tail -7
     echo "--- hilo de aurora y listas de dibujo (por cuadro del juego)"
-    grep -hE "aurora: (sin Dawn|Dawn)" "$DIR/choya-gles.txt" 2>/dev/null | head -1
+    grep -hE "aurora: (sin Dawn|Dawn)" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | head -1
     grep -h "aurora: por cuadro" "$DIR/choya-gles.txt" 2>/dev/null | tail -6
     echo "--- núcleos"
     grep -h "motor: hilo del juego\|no pude fijar" "$DIR/choya-gles.txt" 2>/dev/null | tail -2
