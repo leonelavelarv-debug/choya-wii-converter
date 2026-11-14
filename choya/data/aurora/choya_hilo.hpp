@@ -8,7 +8,7 @@
 // forma directa (copias del EFB, GXDrawDone, inicio y fin de cuadro, lecturas) toman el procesador: esperan a que el
 // hilo GX termine lo entregado y corren como antes en el hilo del juego (CHOYA_HILO_EXCLUSIVO).
 //
-// CHOYA_GX_HILO=1 lo enciende (solo con el motor de Choya sin Dawn y sin reemplazo de texturas).
+// CHOYA_GX_HILO=1 lo enciende (solo con el motor de Choya sin Dawn).
 #pragma once
 
 #include <cstddef>

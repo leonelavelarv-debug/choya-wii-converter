@@ -108,7 +108,8 @@ class TestWebgpuNulo(unittest.TestCase):
                 self.assertIn("aurora: sin Dawn (WebGPU nulo de Choya)", out.stdout)
                 self.assertEqual("hilo GX de Choya" in out.stdout, hilo == "1")
             out = subprocess.run([os.path.join(build, "banco_gx"), "40"], cwd=build,
-                                 env=dict(env, CHOYA_GLES="1", CHOYA_GX_HILO=hilo, CHOYA_GX_HILO_INFORME="20"),
+                                 env=dict(env, CHOYA_GLES="1", CHOYA_GX_HILO=hilo, CHOYA_GX_HILO_INFORME="20",
+                                          BANCO_REEMPLAZOS="1"),  # el runtime deja encendido el reemplazo
                                  capture_output=True, text=True, timeout=600)
             self.assertEqual(out.returncode, 0, out.stdout[-3000:] + out.stderr[-2000:])
             self.assertIn("dibujos por cuadro: 6000", out.stdout)

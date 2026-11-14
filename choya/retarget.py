@@ -1696,6 +1696,47 @@ AURORA_EDITS = [
      "    g_gxState.scissorOffsetY = y_off;\n"
      "  }\n",
      "hilo GX (GXSetScissorBoxOffset)"),
+    # El reemplazo de texturas de aurora (el runtime lo deja encendido) guarda las paletas cargadas para buscar
+    # reemplazos al dibujar: con el hilo GX, registrar y cargar la paleta se hace en el hilo GX, en orden, con la
+    # paleta copiada al momento (como antes).
+    ("lib/dolphin/gx/GXTexture.cpp", '#include "../../gfx/texture_replacement.hpp"\n',
+     '#include "../../gfx/texture_replacement.hpp"\n#include "../../choya/choya_hilo.hpp"  // choya: hilo GX\n'
+     '#include <cstring>  // choya: hilo GX\n#include <vector>  // choya: hilo GX\n',
+     "hilo GX (cabecera de las texturas)"),
+    ("lib/dolphin/gx/GXTexture.cpp",
+     "  aurora::gfx::texture_replacement::register_tlut(obj_, data, format, entries);\n",
+     "  if (::choya::hilo::asincrono()) {  // choya: hilo GX (el reemplazo de texturas es del hilo GX)\n"
+     "    if (data != nullptr) {\n"
+     "      struct Cab {\n"
+     "        const GXTlutObj* obj;\n"
+     "        GXTlutFmt format;\n"
+     "        u16 entries;\n"
+     "      };\n"
+     "      const Cab cab{obj_, format, entries};\n"
+     "      std::vector<u8> buf(sizeof(Cab) + static_cast<size_t>(entries) * 2);\n"
+     "      std::memcpy(buf.data(), &cab, sizeof(Cab));\n"
+     "      std::memcpy(buf.data() + sizeof(Cab), data, static_cast<size_t>(entries) * 2);\n"
+     "      ::choya::hilo::cierre(\n"
+     "          [](const void* d) {\n"
+     "            Cab c;\n"
+     "            std::memcpy(&c, d, sizeof(Cab));\n"
+     "            aurora::gfx::texture_replacement::register_tlut(c.obj, static_cast<const u8*>(d) + sizeof(Cab),\n"
+     "                                                           c.format, c.entries);\n"
+     "          },\n"
+     "          buf.data(), buf.size());\n"
+     "    }\n"
+     "  } else {\n"
+     "    aurora::gfx::texture_replacement::register_tlut(obj_, data, format, entries);\n"
+     "  }\n",
+     "hilo GX (registrar paleta)"),
+    ("lib/dolphin/gx/GXTexture.cpp",
+     "  aurora::gfx::texture_replacement::load_tlut(obj_, idx);\n",
+     "  if (::choya::hilo::asincrono()) {  // choya: hilo GX\n"
+     "    ::choya::hilo::diferir([obj_, idx] { aurora::gfx::texture_replacement::load_tlut(obj_, idx); });\n"
+     "  } else {\n"
+     "    aurora::gfx::texture_replacement::load_tlut(obj_, idx);\n"
+     "  }\n",
+     "hilo GX (cargar paleta)"),
     ("lib/aurora.cpp", 'extern "C" bool choya_gx_sin_gpu();  // choya: motor GLES encendido y Dawn sin dibujar (lib/choya/choya_gx.cpp)\n',
      'extern "C" bool choya_gx_sin_gpu();  // choya: motor GLES encendido y Dawn sin dibujar (lib/choya/choya_gx.cpp)\n'
      '#include "choya/choya_hilo.hpp"  // choya: hilo GX\n',

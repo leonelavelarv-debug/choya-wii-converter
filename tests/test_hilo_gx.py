@@ -83,6 +83,11 @@ class AuroraTest(unittest.TestCase):
             self.assertEqual(au.count('#include "choya/choya_hilo.hpp"'), 1)
             geo = leer("lib/dolphin/gx/GXGeometry.cpp")
             self.assertIn("::choya::hilo::diferir([attr, type]", geo)
+            tex = leer("lib/dolphin/gx/GXTexture.cpp")  # 0.23.1: con el reemplazo de texturas encendido
+            self.assertIn("texture_replacement::register_tlut(c.obj,", tex)
+            self.assertIn("::choya::hilo::diferir([obj_, idx]", tex)
+            with open(os.path.join(DATA, "choya_hilo.cpp"), encoding="utf-8") as f:
+                self.assertNotIn("allowTextureReplacements", f.read())
             self.assertIn("lib/choya/choya_hilo.cpp", leer("cmake/aurora_gx.cmake"))
             self.assertTrue(os.path.isfile(os.path.join(d, "aurora-main", "lib/choya/choya_hilo.cpp")))
 
@@ -128,6 +133,7 @@ class LanzadorTest(unittest.TestCase):
             text = f.read()
         self.assertIn('if [ -f "$DIR/sin-hilo-gx" ]; then export CHOYA_GX_HILO=0', text)
         self.assertIn("aurora: hilo GX", text)
+        self.assertIn('"$DIR/run.log" "$DIR/choya-gles.txt"', text[text.index("aurora: hilo GX (de Choya|apagado)") - 80:][:200])
 
     def test_archivos(self):
         for n in ("choya_hilo.hpp", "choya_hilo.cpp"):

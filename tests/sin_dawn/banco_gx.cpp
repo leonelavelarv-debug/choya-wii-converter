@@ -166,6 +166,8 @@ void estado_inicial() {
   GXSetProjection(proj, GX_PERSPECTIVE);
 }
 
+bool g_reemplazos = false;  // BANCO_REEMPLAZOS=1: el reemplazo de texturas de aurora encendido (el runtime lo enciende)
+
 // Un cuadro del "juego". noinline para que callgrind --toggle-collect lo encuentre.
 __attribute__((noinline)) void banco_cuadro(int frame) {
   estado_inicial();
@@ -185,6 +187,13 @@ __attribute__((noinline)) void banco_cuadro(int frame) {
     }
     GXLoadTexObj(&g_texObjs[(m + frame) % 40], GX_TEXMAP0);
     GXApplyBPReg(0x0F, 0);  // como el runtime con un registro BP suelto (máscara indirecta: sin efecto aquí)
+    if (g_reemplazos && m % 50 == 0) {  // paletas con el reemplazo de texturas encendido (como el runtime)
+      static u16 paleta[16] __attribute__((aligned(32))) = {};
+      paleta[m % 16] = static_cast<u16>(frame + m);
+      GXTlutObj tlut;
+      GXInitTlutObj(&tlut, paleta, GX_TL_RGB565, 16);
+      GXLoadTlut(&tlut, GX_TLUT0);
+    }
     const Dl& mat = g_mats[m % 60];
     GXCallDisplayList(mat.b.data(), static_cast<u32>(mat.b.size()));
     const Dl& shp = g_shapes[m % 80];
@@ -245,6 +254,8 @@ int main(int argc, char** argv) {
   config.windowHeight = 480;
   config.logCallback = log_cb;
   config.logLevel = LOG_WARNING;
+  g_reemplazos = std::getenv("BANCO_REEMPLAZOS") != nullptr;
+  config.allowTextureReplacements = g_reemplazos;
   aurora_initialize(argc, argv, &config);
   static u8 fifo[1 << 20] __attribute__((aligned(32)));
   GXInit(fifo, sizeof(fifo));

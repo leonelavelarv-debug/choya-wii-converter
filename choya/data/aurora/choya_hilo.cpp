@@ -310,10 +310,6 @@ bool activo() noexcept {
       log_line("aurora: hilo GX apagado: necesita el motor de Choya sin Dawn");
       return false;
     }
-    if (aurora::g_config.allowTextureReplacements) {
-      log_line("aurora: hilo GX apagado: no funciona con el reemplazo de texturas de aurora");
-      return false;
-    }
     log_line("aurora: hilo GX de Choya: el GX se decodifica en otro núcleo (CHOYA_GX_HILO=1; el archivo sin-hilo-gx "
              "lo apaga)");
     return true;

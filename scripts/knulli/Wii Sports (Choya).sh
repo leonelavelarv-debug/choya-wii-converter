@@ -161,7 +161,8 @@ escribir_resumen() {
     echo "--- hilo de aurora y listas de dibujo (por cuadro del juego)"
     grep -hE "aurora: (sin Dawn|Dawn)" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | head -1
     grep -h "aurora: por cuadro" "$DIR/choya-gles.txt" 2>/dev/null | tail -6
-    grep -h "aurora: hilo GX" "$DIR/choya-gles.txt" 2>/dev/null | tail -4
+    grep -hE "aurora: hilo GX (de Choya|apagado)" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | head -1
+    grep -h "aurora: hilo GX:" "$DIR/choya-gles.txt" 2>/dev/null | tail -4
     echo "--- núcleos"
     grep -h "motor: hilo del juego\|no pude fijar" "$DIR/choya-gles.txt" 2>/dev/null | tail -2
     echo "--- texturas sin datos en el motor (las primeras; tamaño y formato que dio aurora)"
