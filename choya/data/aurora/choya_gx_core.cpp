@@ -415,7 +415,7 @@ bool invalidar_activo() {
 }
 bool g_grupoBorra = false;  // el grupo del cuadro que se dibuja empieza borrando color y profundidad (draw_frame)
 struct Invalidaciones {
-  uint64_t color = 0, profundidad = 0, finCuadro = 0, noSeguro = 0, cuadros = 0;
+  uint64_t color = 0, profundidad = 0, finCuadro = 0, noSeguro = 0, cuadros = 0, copias = 0;
 } g_inval, g_invalTotal;  // g_invalTotal: lo de los informes anteriores (para las pruebas)
 
 bool empieza_borrando(const Frame& f) {
@@ -2767,6 +2767,11 @@ void present_efb(const Rect& r, int screenWidth, int screenHeight) {
   gl.Disable(kScissorTest);
   gl.BindFramebuffer(kReadFramebuffer, g_efb.fbo);
   gl.BindFramebuffer(kDrawFramebuffer, 0);
+  if (invalidar_activo()) {
+    // 0.26.0: la copia a la pantalla la tapa entera: lo que tenía la ventana no se carga.
+    const GLenum att[3] = {0x1800 /*GL_COLOR*/, 0x1801 /*GL_DEPTH*/, 0x1802 /*GL_STENCIL*/};
+    gl.InvalidateFramebuffer(kDrawFramebuffer, 3, att);
+  }
   // El EFB se dibuja con y hacia arriba en GL (como la pantalla): la copia no voltea.
   const int y0 = g_efb.height - r.y - r.height;
   gl.BlitFramebuffer(r.x, y0, r.x + r.width, y0 + r.height, 0, 0, screenWidth, screenHeight, kColorBufferBit, kLinear);
@@ -2962,6 +2967,13 @@ void run_copy(const Item& it) {
     ct.height = c.texH;
   }
   gl.BindFramebuffer(kFramebuffer, ct.fbo);
+  if (invalidar_activo()) {
+    // 0.26.0: la copia pinta toda la textura: que la Mali no cargue lo que tenía (ni lo conserve para los cuadros en
+    // vuelo que todavía la leen); en la 0.25.0 las copias eran ~2/3 del tiempo de GPU del cuadro.
+    const GLenum att = kColorAttachment0;
+    gl.InvalidateFramebuffer(kFramebuffer, 1, &att);
+    ++g_inval.copias;
+  }
   gl.Viewport(0, 0, static_cast<GLsizei>(c.texW), static_cast<GLsizei>(c.texH));
   gl.Disable(kScissorTest);
   gl.Disable(kDepthTest);
@@ -3091,6 +3103,10 @@ void run_palette_conv(const Item& it) {
     dt.height = h;
   }
   gl.BindFramebuffer(kFramebuffer, dt.fbo);
+  if (invalidar_activo()) {  // 0.26.0: pinta toda la textura (ver run_copy)
+    const GLenum att = kColorAttachment0;
+    gl.InvalidateFramebuffer(kFramebuffer, 1, &att);
+  }
   gl.Viewport(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h));
   gl.Disable(kScissorTest);
   gl.Disable(kDepthTest);
@@ -4555,17 +4571,19 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
         auto& v = g_inval;
         const double c = std::max<double>(static_cast<double>(v.cuadros), 1.0);
         log_line("motor: EFB sin recargar: %s; por cuadro: %.1f borrados sin leer el color, %.1f sin leer la "
-                 "profundidad, %.1f no se pudo (algo lee fuera del borrado); el EFB sin guardar al terminar en el "
-                 "%.0f %% de los cuadros",
+                 "profundidad, %.1f no se pudo (algo lee fuera del borrado), %.1f copias sin cargar su destino; el "
+                 "EFB sin guardar al terminar en el %.0f %% de los cuadros",
                  invalidar_activo() ? "encendido" : (gl.InvalidateFramebuffer ? "apagado (sin-invalidar-efb)"
                                                                                : "el driver no tiene glInvalidateFramebuffer"),
                  static_cast<double>(v.color) / c, static_cast<double>(v.profundidad) / c,
-                 static_cast<double>(v.noSeguro) / c, 100.0 * static_cast<double>(v.finCuadro) / c);
+                 static_cast<double>(v.noSeguro) / c, static_cast<double>(v.copias) / c,
+                 100.0 * static_cast<double>(v.finCuadro) / c);
         g_invalTotal.color += v.color;
         g_invalTotal.profundidad += v.profundidad;
         g_invalTotal.finCuadro += v.finCuadro;
         g_invalTotal.noSeguro += v.noSeguro;
         g_invalTotal.cuadros += v.cuadros;
+        g_invalTotal.copias += v.copias;
         v = Invalidaciones{};
       }
       g_tiempos = TiemposMotor{};
