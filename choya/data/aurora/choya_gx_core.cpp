@@ -888,10 +888,31 @@ bool tev_float() { return tev_modo() == TevModo::Flotante; }
 int tev_necesita_exacto(const PipelineDesc& cfg) {
   int r = 0;
   const u32 n = std::min<u32>(cfg.tevStageCount, 16);
+  // 0.27.1: una comparación solo necesita lo exacto si compara algo que calculó una etapa anterior de este programa
+  // (un registro ya escrito): texturas, rasterizador, constantes y registros sin escribir (los valores que puso el
+  // juego) ya son de 8 bits y en flotante se comparan igual. Así las sombras de Wii Sports (comparan la profundidad
+  // copiada, una textura) van en flotante.
+  unsigned escritoC = 0, escritoA = 0;  // registros ya escritos: bit 0 prev, 1-3 r0-r2
+  auto regBit = [](u8 reg) { return reg == GX_TEVPREV ? 1u : 2u << (reg - GX_TEVREG0); };
+  auto colorCalc = [&](u8 arg) {  // GX_CC_*: CPREV, APREV, C0, A0, C1, A1, C2, A2
+    if (arg > GX_CC_A2) return false;
+    const unsigned bit = arg / 2 == 0 ? 1u : 2u << (arg / 2 - 1);
+    return (((arg & 1) ? escritoA : escritoC) & bit) != 0;
+  };
+  auto alphaCalc = [&](u8 arg) {  // GX_CA_*: APREV, A0, A1, A2
+    if (arg > GX_CA_A2) return false;
+    return (escritoA & (arg == 0 ? 1u : 2u << (arg - 1))) != 0;
+  };
   for (u32 i = 0; i < n; ++i) {
     const auto& st = cfg.stages[i];
     if (!st.cclamp || !st.aclamp) r |= 1;
-    if (st.cop > GX_TEV_SUB || st.aop > GX_TEV_SUB) r |= 2;
+    if (st.cop > GX_TEV_SUB && (colorCalc(st.ca) || colorCalc(st.cb))) r |= 2;
+    if (st.aop > GX_TEV_SUB) {
+      const bool colorIn = st.aop <= GX_TEV_COMP_BGR24_EQ;
+      if (colorIn ? (colorCalc(st.ca) || colorCalc(st.cb)) : (alphaCalc(st.aa) || alphaCalc(st.ab))) r |= 2;
+    }
+    escritoC |= regBit(st.cout);
+    escritoA |= regBit(st.aout);
   }
   auto eq = [](u8 c) { return c == GX_EQUAL || c == GX_NEQUAL; };
   if (cfg.alphaComp0 != GX_ALWAYS || cfg.alphaComp1 != GX_ALWAYS) {
