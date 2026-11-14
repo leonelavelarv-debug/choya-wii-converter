@@ -129,6 +129,16 @@ static int probe(int argc, char** argv) {
   return 0;
 }
 
+// harness repetir cuadro.bin N: dibuja el volcado N veces (el informe del motor sale a los 300 cuadros: tiempos por
+// parte del cuadro y cuadros por segundo, 0.23.3).
+static int repeat(const char* in, int n) {
+  for (int i = 0; i < n; ++i) {
+    if (!gx::load_frame(in) || !gx::draw_frame(640, 480)) { std::puts("no dibujó"); return 1; }
+  }
+  std::puts("repetido");
+  return 0;
+}
+
 // harness copia cuadro.bin id salida.ppm: vuelve a dibujar el volcado y guarda una de sus copias del EFB.
 static int read_copy(const char* in, const char* idHex, const char* out) {
   if (!gx::load_frame(in) || !gx::draw_frame(640, 480)) { std::puts("no dibujó"); return 1; }
@@ -458,6 +468,7 @@ int main(int argc, char** argv) {
   if (argc >= 3 && std::strcmp(argv[1], "copia-vieja") == 0) return old_copy_test(argv[2]);
   if (argc >= 5 && std::strcmp(argv[1], "sonda") == 0) return probe(argc, argv);
   if (argc >= 5 && std::strcmp(argv[1], "copia") == 0) return read_copy(argv[2], argv[3], argv[4]);
+  if (argc >= 4 && std::strcmp(argv[1], "repetir") == 0) return repeat(argv[2], std::atoi(argv[3]));
   if (argc >= 3) return replay(argv[1], argv[2]);
   auto GetString = (const char*(*)(unsigned))dlsym(gles, "glGetString");
   std::printf("GL: %s / %s\n", GetString(0x1F02), GetString(0x1F01));

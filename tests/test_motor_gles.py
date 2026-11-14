@@ -44,6 +44,18 @@ class TestMotorGles(unittest.TestCase):
             pix = raw[raw.index(b"255\n") + 4:]
             at = lambda x, y: tuple(pix[(y * 640 + x) * 3:(y * 640 + x) * 3 + 3])
             self.assertEqual((at(160, 240), at(480, 240), at(320, 10)), ((255, 0, 0), (0, 255, 0), (0, 0, 255)))
+            # 0.23.3: el informe del motor dice dónde se va el tiempo de cada cuadro y cuántos cuadros dibuja.
+            out = subprocess.run([exe, "repetir", dump, "305"], env=env, capture_output=True, text=True)
+            self.assertIn("repetido", out.stdout, out.stdout + out.stderr)
+            log = out.stdout + out.stderr
+            m = re.search(r"motor: tiempo por cuadro dibujado ([\d.]+) ms \(CPU del hilo ([\d.]+) ms\): texturas ([\d.]+), "
+                          r"subidas ([\d.]+), pases ([\d.]+), borrados ([\d.]+), dibujos ([\d.]+), copias del EFB ([\d.]+), "
+                          r"pantalla ([\d.]+), cierre ([\d.]+), esperando a la GPU ([\d.]+), memoria de la Mali ([\d.]+)", log)
+            self.assertIsNotNone(m, log[-3000:])
+            total = float(m.group(1))
+            partes = sum(float(m.group(i)) for i in range(3, 13))
+            self.assertAlmostEqual(partes, total, delta=0.15 + 0.02 * total)  # las partes suman el total
+            self.assertRegex(log, r"motor: cuadros por segundo: [\d.]+ dibujados por el motor")
             # Caché de programas en disco: la primera vez compila y guarda, la segunda carga los binarios y dibuja igual.
             cache = os.path.join(d, "cache")
             env_cache = dict(env, CHOYA_GX_CACHE=cache)

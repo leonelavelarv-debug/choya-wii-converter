@@ -109,6 +109,7 @@ struct State {
     FbdevWindow window{640, 480};
     uint64_t frames = 0;
     double swapMsTotal = 0, swapMsWorst = 0;
+    uint64_t swaps = 0;  // intercambios en la ventana del informe (0.23.3: antes se contaba con g.frames)
     std::chrono::steady_clock::time_point windowStart{};
     FILE* log = nullptr;
 };
@@ -444,17 +445,22 @@ void Present() {
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - swapStart).count();
     g.swapMsTotal += swapMs;
     if (swapMs > g.swapMsWorst) g.swapMsWorst = swapMs;
+    ++g.swaps;
 
-    if (g.frames % 300 == 0) {
-        const double secs =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - g.windowStart).count();
-        char line[160];
+    // Cada 10 s: cuadros que de verdad se mostraron. Antes la ventana iba por g.frames, que cuenta también las vueltas
+    // sin cuadro nuevo, y el informe salía con la mitad o menos de lo que se veía.
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - g.windowStart).count();
+    if (secs >= 10.0) {
+        char line[192];
         std::snprintf(line, sizeof(line),
-                      "%.1f cuadros/s, intercambio promedio %.2f ms, peor %.2f ms; del motor %llu, sin cuadro nuevo %llu",
-                      300.0 / secs, g.swapMsTotal / 300.0, g.swapMsWorst,
+                      "%.1f cuadros/s en pantalla, intercambio promedio %.2f ms, peor %.2f ms; del motor %llu, sin cuadro "
+                      "nuevo %llu",
+                      static_cast<double>(g.swaps) / secs, g.swapMsTotal / static_cast<double>(g.swaps), g.swapMsWorst,
                       static_cast<unsigned long long>(g.motorFrames), static_cast<unsigned long long>(g.patternFrames));
         Log("presentación: %s", line);
         g.swapMsTotal = g.swapMsWorst = 0;
+        g.swaps = 0;
         g.windowStart = std::chrono::steady_clock::now();
     }
 }

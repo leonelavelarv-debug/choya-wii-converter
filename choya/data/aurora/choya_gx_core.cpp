@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <condition_variable>
 #include <mutex>
 #include <string>
@@ -351,6 +352,8 @@ std::condition_variable g_queueCv;          // el motor tomó la cola (para el q
 std::atomic<uint64_t> g_openFlushes{0};     // grupos de lotes sin mostrarse mandados al motor (pantallas de carga)
 std::atomic<uint64_t> g_queueWaits{0};      // veces que el que captura esperó al motor con la cola llena
 std::atomic<uint64_t> g_lostCopies{0};      // copias únicas tiradas porque el motor no avanzó en 2 s
+std::atomic<uint64_t> g_capturedFrames{0};  // 0.23.3: cuadros del juego que llegaron al motor (para mostrarse)
+std::atomic<uint64_t> g_skippedFrames{0};   // 0.23.3: cuadros que el motor no dibujó (los más nuevos rehacen sus copias)
 
 std::mutex g_pipelineMutex;
 std::unordered_map<uint64_t, PipelineDesc> g_pipelines;
@@ -2334,6 +2337,88 @@ StateBlock with_dst_alpha(StateBlock st, uint32_t dstAlpha) {
   return st;
 }
 
+// Tiempo de GPU por cuadro (0.23.3): GL_EXT_disjoint_timer_query, si el driver lo tiene. Un anillo de consultas: el
+// resultado de un cuadro se lee unos cuadros después, sin esperar a la GPU.
+struct GpuTiempo {
+  bool listo = false;
+  void (*GenQueries)(GLsizei, GLuint*) = nullptr;
+  void (*BeginQuery)(GLenum, GLuint) = nullptr;
+  void (*EndQuery)(GLenum) = nullptr;
+  void (*GetQueryObjectuiv)(GLuint, GLenum, GLuint*) = nullptr;
+  void (*GetQueryObjectui64v)(GLuint, GLenum, unsigned long long*) = nullptr;
+  static constexpr int kN = 6;
+  GLuint q[kN] = {};
+  bool pendiente[kN] = {};
+  int actual = 0;
+  bool abierta = false;
+  double ms = 0;        // sumado en el intervalo del informe
+  uint64_t cuadros = 0;
+} g_gpu;
+constexpr GLenum kTimeElapsedExt = 0x88BF, kQueryResultExt = 0x8866, kQueryResultAvailableExt = 0x8867,
+                 kGpuDisjointExt = 0x8FBB, kExtensions = 0x1F03;
+
+void gpu_tiempo_init() {
+  if (gl.GetString == nullptr || g_loader == nullptr) return;
+  const char* env = std::getenv("CHOYA_GX_TIEMPO_GPU");
+  if (env != nullptr && std::strcmp(env, "0") == 0) return;
+  const auto* ext = reinterpret_cast<const char*>(gl.GetString(kExtensions));
+  if (ext == nullptr || std::strstr(ext, "GL_EXT_disjoint_timer_query") == nullptr) {
+    log_line("motor: el driver no tiene GL_EXT_disjoint_timer_query: sin tiempo de GPU por cuadro");
+    return;
+  }
+  g_gpu.GenQueries = reinterpret_cast<decltype(g_gpu.GenQueries)>(g_loader("glGenQueriesEXT"));
+  g_gpu.BeginQuery = reinterpret_cast<decltype(g_gpu.BeginQuery)>(g_loader("glBeginQueryEXT"));
+  g_gpu.EndQuery = reinterpret_cast<decltype(g_gpu.EndQuery)>(g_loader("glEndQueryEXT"));
+  g_gpu.GetQueryObjectuiv = reinterpret_cast<decltype(g_gpu.GetQueryObjectuiv)>(g_loader("glGetQueryObjectuivEXT"));
+  g_gpu.GetQueryObjectui64v =
+      reinterpret_cast<decltype(g_gpu.GetQueryObjectui64v)>(g_loader("glGetQueryObjectui64vEXT"));
+  if (g_gpu.GenQueries == nullptr || g_gpu.BeginQuery == nullptr || g_gpu.EndQuery == nullptr ||
+      g_gpu.GetQueryObjectuiv == nullptr || g_gpu.GetQueryObjectui64v == nullptr) {
+    log_line("motor: GL_EXT_disjoint_timer_query sin sus funciones: sin tiempo de GPU por cuadro");
+    return;
+  }
+  g_gpu.GenQueries(GpuTiempo::kN, g_gpu.q);
+  g_gpu.listo = true;
+  log_line("motor: midiendo el tiempo de GPU de cada cuadro (GL_EXT_disjoint_timer_query)");
+}
+
+void gpu_tiempo_recoger() {
+  if (!g_gpu.listo) return;
+  GLint disjoint = 0;
+  gl.GetIntegerv(kGpuDisjointExt, &disjoint);
+  for (int i = 0; i < GpuTiempo::kN; ++i) {
+    if (!g_gpu.pendiente[i] || (g_gpu.abierta && i == g_gpu.actual)) continue;
+    GLuint disponible = 0;
+    g_gpu.GetQueryObjectuiv(g_gpu.q[i], kQueryResultAvailableExt, &disponible);
+    if (!disponible) continue;
+    unsigned long long ns = 0;
+    g_gpu.GetQueryObjectui64v(g_gpu.q[i], kQueryResultExt, &ns);
+    g_gpu.pendiente[i] = false;
+    if (disjoint) continue;  // la medida no sirve (cambió la frecuencia o hubo otra interrupción)
+    if (ns > 1000000000ull) continue;  // más de 1 s: medida rota (llvmpipe da una así en la primera consulta)
+    g_gpu.ms += static_cast<double>(ns) / 1e6;
+    ++g_gpu.cuadros;
+  }
+}
+
+void gpu_tiempo_terminar();
+void gpu_tiempo_empezar() {
+  if (!g_gpu.listo) return;
+  if (g_gpu.abierta) gpu_tiempo_terminar();  // un cuadro anterior salió antes de tiempo
+  gpu_tiempo_recoger();
+  if (g_gpu.pendiente[g_gpu.actual]) return;  // la GPU va muy atrás: este cuadro no se mide
+  g_gpu.BeginQuery(kTimeElapsedExt, g_gpu.q[g_gpu.actual]);
+  g_gpu.abierta = true;
+}
+
+void gpu_tiempo_terminar() {
+  if (!g_gpu.listo || !g_gpu.abierta) return;
+  g_gpu.EndQuery(kTimeElapsedExt);
+  g_gpu.abierta = false;
+  g_gpu.pendiente[g_gpu.actual] = true;
+  g_gpu.actual = (g_gpu.actual + 1) % GpuTiempo::kN;
+}
+
 bool init_gl() {
   if (!load_gl()) return false;
   for (auto& r : g_ring) {
@@ -2369,6 +2454,7 @@ bool init_gl() {
       }
     }
   }
+  gpu_tiempo_init();
   log_line("motor: listo (alineación de UBO %d; búferes persistentes %s)", g_uboAlign,
            g_persistent ? "sí, como en Nebula" : "no, se suben los datos en cada cuadro");
   return true;
@@ -3211,6 +3297,7 @@ void capture_end(bool present) noexcept {
       std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - g_captureStart).count());
   g_recording.present = present;
   g_recording.ready = true;
+  if (present) g_capturedFrames.fetch_add(1, std::memory_order_relaxed);
   std::unique_lock lock(g_frameMutex);
   g_open.push_back(std::move(g_recording));
   g_recording = Frame{};
@@ -3237,6 +3324,7 @@ void capture_end(bool present) noexcept {
   for (size_t i = g_queue.size() - 1; i-- > 0;) {
     Group& old = g_queue[i];
     if (std::includes(later.begin(), later.end(), old.copies.begin(), old.copies.end())) {
+      g_skippedFrames.fetch_add(old.frames.size(), std::memory_order_relaxed);
       for (Frame& f : old.frames) recycle(std::move(f));
       g_queue.erase(g_queue.begin() + static_cast<std::ptrdiff_t>(i));
     } else {
@@ -3548,9 +3636,43 @@ bool mali_on() {
   return g_mali.state == 1;
 }
 
+// --- Tiempo del motor por partes del cuadro (0.23.3) ------------------------------------------------------------
+// En los mismos puntos que la memoria de la Mali: cuánto tarda el hilo de la pantalla en cada parte (sin contar las
+// lecturas de la memoria de la Mali, que se cuentan aparte), su CPU real y, si el driver lo permite, el tiempo de GPU.
+constexpr int kParteCierre = kMaliParts;  // después de mostrar: la valla del cuadro y soltar el estado
+struct TiemposMotor {
+  double parte[kMaliParts + 1] = {};
+  double esperaGpu = 0;   // esperando a que la GPU suelte los recursos del anillo
+  double cpuHilo = 0;     // CPU del hilo (CLOCK_THREAD_CPUTIME_ID)
+  double maliMs = 0;      // leyendo la memoria de la Mali (debugfs)
+  uint64_t maliLecturas = 0;
+} g_tiempos;
+std::chrono::steady_clock::time_point g_tMarca;
+
+double ms_entre(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+  return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+double cpu_hilo_ms() {
+  timespec ts{};
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+  return static_cast<double>(ts.tv_sec) * 1e3 + static_cast<double>(ts.tv_nsec) / 1e6;
+}
+
+void tiempo_parte(int parte) {
+  const auto now = std::chrono::steady_clock::now();
+  g_tiempos.parte[parte] += ms_entre(g_tMarca, now);
+  g_tMarca = now;
+}
+
 void mali_mark(MaliPart part) {
+  tiempo_parte(part);
   if (!mali_on()) return;
+  const auto lecturaIni = std::chrono::steady_clock::now();
   const long now = mali_read();
+  g_tMarca = std::chrono::steady_clock::now();
+  g_tiempos.maliMs += ms_entre(lecturaIni, g_tMarca);
+  ++g_tiempos.maliLecturas;
   if (now < 0) return;
   const long delta = now - g_mali.last;
   g_mali.part[part] += delta;
@@ -3655,6 +3777,9 @@ void low_memory_relief() {
 bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present) {
   present = present && f.present;
   const auto cpuStart = std::chrono::steady_clock::now();
+  g_tMarca = cpuStart;
+  const double cpuHiloIni = cpu_hilo_ms();
+  gpu_tiempo_empezar();
   // Tamaño del EFB: el pase más grande del cuadro.
   int efbW = 1, efbH = 1;
   for (const Item& pass : f.items) {
@@ -3695,8 +3820,10 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       for (int tries = 0; tries < 20; ++tries) {
         if (gl.ClientWaitSync(prev.fence, 1, 100000000ull) != 0x911B /* GL_TIMEOUT_EXPIRED */) break;
       }
-      g_stats.gpuWaitMs +=
-          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+      const auto waitEnd = std::chrono::steady_clock::now();
+      g_stats.gpuWaitMs += std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();
+      g_tiempos.esperaGpu += ms_entre(waitStart, waitEnd);
+      g_tMarca += waitEnd - waitStart;
     }
   }
   FrameResources& res = g_ring[g_ringIndex];
@@ -3713,8 +3840,10 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     }
     gl.DeleteSync(res.fence);
     res.fence = nullptr;
-    g_stats.gpuWaitMs +=
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+    const auto waitEnd = std::chrono::steady_clock::now();
+    g_stats.gpuWaitMs += std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();
+    g_tiempos.esperaGpu += ms_entre(waitStart, waitEnd);
+    g_tMarca += waitEnd - waitStart;
   }
   gl.ActiveTexture(kTexture0);
   if (!upload_words(res.vtex, f.verts, g_persistent ? &res.rv : nullptr)) {
@@ -3982,7 +4111,10 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   gl.ColorMask(1, 1, 1, 1);
   gl.DepthMask(1);
 
+  gpu_tiempo_terminar();
   res.fence = gl.FenceSync(0x9117 /* GL_SYNC_GPU_COMMANDS_COMPLETE */, 0);
+  tiempo_parte(kParteCierre);
+  g_tiempos.cpuHilo += cpu_hilo_ms() - cpuHiloIni;
   g_stats.cpuMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count();
   // Informe cada 300 cuadros o cada 10 s (lo que llegue antes: con el juego lento también se ve qué pasa).
   ++g_stats.frames;
@@ -3990,8 +4122,34 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   static auto lastReport = std::chrono::steady_clock::now();
   const auto nowReport = std::chrono::steady_clock::now();
   if (g_stats.interval >= 300 || nowReport - lastReport >= std::chrono::seconds(10)) {
+    const double segundos = std::max(ms_entre(lastReport, nowReport) / 1000.0, 0.001);
     lastReport = nowReport;
     const double n = static_cast<double>(g_stats.interval);
+    {  // 0.23.3: dónde se va el tiempo del hilo de la pantalla y cuántos cuadros se ven de verdad
+      const auto& t = g_tiempos;
+      char gpu[96];
+      if (g_gpu.cuadros > 0) {
+        std::snprintf(gpu, sizeof(gpu), "GPU %.1f ms por cuadro (%llu medidos)", g_gpu.ms / g_gpu.cuadros,
+                      static_cast<unsigned long long>(g_gpu.cuadros));
+      } else {
+        std::snprintf(gpu, sizeof(gpu), "GPU sin medir");
+      }
+      g_gpu.ms = 0;
+      g_gpu.cuadros = 0;
+      log_line("motor: tiempo por cuadro dibujado %.1f ms (CPU del hilo %.1f ms): texturas %.1f, subidas %.1f, pases "
+               "%.1f, borrados %.1f, dibujos %.1f, copias del EFB %.1f, pantalla %.1f, cierre %.1f, esperando a la GPU "
+               "%.1f, memoria de la Mali %.1f (%.0f lecturas); %s",
+               g_stats.cpuMs / n, t.cpuHilo / n, t.parte[kMaliFuera] / n, t.parte[kMaliSubidas] / n,
+               t.parte[kMaliPases] / n, t.parte[kMaliBorrados] / n, t.parte[kMaliDibujos] / n,
+               t.parte[kMaliCopias] / n, t.parte[kMaliPantalla] / n, t.parte[kParteCierre] / n, t.esperaGpu / n,
+               t.maliMs / n, static_cast<double>(t.maliLecturas) / n, gpu);
+      const uint64_t juego = g_capturedFrames.exchange(0, std::memory_order_relaxed);
+      const uint64_t saltados = g_skippedFrames.exchange(0, std::memory_order_relaxed);
+      log_line("motor: cuadros por segundo: %.1f dibujados por el motor, %.1f del juego, %.1f que el motor no alcanzó "
+               "(en %.0f s)", n / segundos, static_cast<double>(juego) / segundos,
+               static_cast<double>(saltados) / segundos, segundos);
+      g_tiempos = TiemposMotor{};
+    }
     log_line("motor: KB por cuadro: vértices %.0f, uniformes %.0f, índices %.0f, arreglos %.0f; CPU del motor %.2f ms "
              "por cuadro (copia %.2f ms, esperando a la GPU %.2f ms)",
              g_stats.bytesVerts / n / 1024, g_stats.bytesUniforms / n / 1024, g_stats.bytesIndices / n / 1024,
