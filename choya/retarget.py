@@ -931,7 +931,11 @@ uint64_t ChoyaHuella(uint32_t addr, uint32_t size) {
     if (p == nullptr || size < 8) return 0;
     const uint32_t words = size / 8;
     // 0.22.2: como mucho 512 muestras repartidas (y siempre la última palabra); las copias de hasta 4 KB se leen enteras.
-    const uint32_t step = words > 512 ? words / 512 : 1;
+    // 0.27.2: las copias de más de 32 KB (las de pantalla, que el juego rehace cada cuadro: 19 por cuadro en Wii Sports)
+    // con 64 muestras: cada una es un fallo de caché y las 512 costaban ~1.4 ms por cuadro al hilo del juego. Las de
+    // hasta 32 KB (iconos de los Miis) siguen con 512.
+    const uint32_t muestras = size > 32768 ? 64 : 512;
+    const uint32_t step = words > muestras ? words / muestras : 1;
     uint64_t h = 0xcbf29ce484222325ull ^ size;
     auto mix = [&h](uint64_t w) {
         h = (h ^ w) * 0x9E3779B97F4A7C15ull;
