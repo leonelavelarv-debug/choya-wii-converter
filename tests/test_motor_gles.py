@@ -56,6 +56,12 @@ class TestMotorGles(unittest.TestCase):
             partes = sum(float(m.group(i)) for i in range(3, 13))
             self.assertAlmostEqual(partes, total, delta=0.15 + 0.02 * total)  # las partes suman el total
             self.assertRegex(log, r"motor: cuadros por segundo: [\d.]+ dibujados por el motor")
+            # 0.24.0: saltos del motor y tiempo de GPU por pase (1 de cada 30 cuadros, si el driver mide tiempos).
+            self.assertRegex(log, r"motor: saltos: encendidos; [\d.]+ tomas por s")
+            if "GL_EXT_disjoint_timer_query)" in log and "midiendo el tiempo de GPU por pase" in log:
+                self.assertRegex(log, r"motor: GPU por pase \(\d+ cuadros medidos; suma [\d.]+ ms por cuadro\): "
+                                      r"dibujos [\d.]+, copias del EFB [\d.]+, pantalla [\d.]+")
+            self.assertNotIn("memoria de la Mali por partes", log)  # 0.24.0: apagada salvo CHOYA_GX_MALI=1
             # Caché de programas en disco: la primera vez compila y guarda, la segunda carga los binarios y dibuja igual.
             cache = os.path.join(d, "cache")
             env_cache = dict(env, CHOYA_GX_CACHE=cache)

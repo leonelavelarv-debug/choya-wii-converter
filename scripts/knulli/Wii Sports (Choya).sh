@@ -108,9 +108,13 @@ if [ -f "$DIR/sin-hilo-gx" ]; then export CHOYA_GX_HILO=0; else export CHOYA_GX_
 # Con el hilo GX, las listas de dibujo de la RAM del juego se leen de ahí (como la GPU de la Wii). Un archivo vacío
 # llamado "hilo-gx-copiar" las copia al entregarlas (por si algo se dibuja mal solo con el hilo encendido).
 if [ -f "$DIR/hilo-gx-copiar" ]; then export CHOYA_GX_HILO_COPIAR=1; fi
-# El motor mide la memoria de la Mali en cada parte del cuadro (lee /sys/kernel/debug/mali0/gpu_memory unas 80 veces
-# por cuadro). Un archivo vacío llamado "sin-medir-mali" lo apaga (el resumen dice cuánto costaba).
-if [ -f "$DIR/sin-medir-mali" ]; then export CHOYA_GX_MALI=0; fi
+# Memoria de la Mali en cada parte del cuadro (lee /sys/kernel/debug/mali0/gpu_memory ~100 veces por cuadro): desde
+# 0.24.0 no se mide (costaba 1.7 ms por cuadro). Un archivo vacío llamado "medir-mali" la vuelve a medir.
+if [ -f "$DIR/medir-mali" ]; then export CHOYA_GX_MALI=1; else export CHOYA_GX_MALI=0; fi
+# Saltar cuadros (0.24.0): si el motor va atrasado, los cuadros viejos que no se van a mostrar ya no se dibujan
+# (salvo los que hacen copias del EFB que el juego no repite, como las caras de los Miis). Un archivo vacío llamado
+# "sin-saltar-cuadros" vuelve a dibujarlos todos.
+if [ -f "$DIR/sin-saltar-cuadros" ]; then export CHOYA_GX_SALTAR=0; fi
 # Recursos convertidos por el conversor de Choya (assets.wlpk junto al juego): texturas en ETC2/EAC ya reducidas.
 # CHOYA_PAQUETE=0 usa solo las del disco.
 if [ "${CHOYA_PAQUETE:-}" != "0" ] && [ -f "$DIR/assets.wlpk" ]; then
@@ -129,7 +133,8 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "PortMaster: ${controlfolder:-no encontrado}  dispositivo: ${DEVICE_NAME:-?}  CFW: ${CFW_NAME:-?}"
   echo "mapeo del mando: ${SDL_GAMECONTROLLERCONFIG:-ninguno}" | cut -c1-200
   echo "efectos de audio: $([ "${CHOYA_SIN_REVERB:-0}" = 1 ] && echo "apagados (para oírlos: archivo con-reverb)" || echo "encendidos (archivo con-reverb)")"
-  echo "memoria de la Mali por partes del cuadro: $([ "${CHOYA_GX_MALI:-1}" = 0 ] && echo "sin medir (archivo sin-medir-mali)" || echo "se mide (para apagarla: archivo vacío sin-medir-mali)")"
+  echo "memoria de la Mali por partes del cuadro: $([ "${CHOYA_GX_MALI:-0}" = 1 ] && echo "se mide (archivo medir-mali)" || echo "no se mide (para medirla: archivo vacío medir-mali)")"
+  echo "saltar cuadros en el motor: $([ "${CHOYA_GX_SALTAR:-1}" = 0 ] && echo "no, se dibujan todos (archivo sin-saltar-cuadros)" || echo "sí (para dibujarlos todos: archivo vacío sin-saltar-cuadros)")"
   echo "hilo GX: $([ "$CHOYA_GX_HILO" = 1 ] && echo "encendido, el GX en otro núcleo (para apagarlo: archivo vacío sin-hilo-gx)" || echo "apagado (archivo sin-hilo-gx)")$([ "${CHOYA_GX_HILO_COPIAR:-0}" = 1 ] && echo "; listas copiadas (archivo hilo-gx-copiar)")"
   echo "TEV: $([ "${CHOYA_GX_TEV:-}" = flotante ] && echo "en flotante (archivo tev-flotante)" || echo "exacto en enteros (para el de antes: archivo vacío tev-flotante)")"
   echo "memoria del juego: $([ "$CHOYA_PRESTAMOS" = 0 ] && echo "solo anota (archivo sin-prestamos)" || echo "un montón presta si a otro no le cabe un bloque (para solo anotar: archivo vacío sin-prestamos)")"
@@ -167,8 +172,10 @@ escribir_resumen() {
     grep -h "aurora: por cuadro" "$DIR/choya-gles.txt" 2>/dev/null | tail -6
     grep -hE "aurora: hilo GX (de Choya|apagado)" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | head -1
     grep -h "aurora: hilo GX:" "$DIR/choya-gles.txt" 2>/dev/null | tail -4
-    echo "--- motor de pantalla: cuadros por segundo y tiempo por cuadro dibujado (0.23.3)"
-    grep -h "motor: cuadros por segundo\|motor: tiempo por cuadro dibujado\|presentación: \|GL_EXT_disjoint_timer_query" "$DIR/choya-gles.txt" 2>/dev/null | tail -9
+    echo "--- motor de pantalla: cuadros por segundo, tiempo por cuadro dibujado, saltos y GPU por pase (0.24.0)"
+    grep -h "motor: midiendo el tiempo de GPU\|GL_EXT_disjoint_timer_query" "$DIR/choya-gles.txt" 2>/dev/null | head -2
+    grep -h "motor: cuadros por segundo\|motor: tiempo por cuadro dibujado\|presentación: \|motor: saltos:" "$DIR/choya-gles.txt" 2>/dev/null | tail -12
+    grep -h "motor: GPU por pase" "$DIR/choya-gles.txt" 2>/dev/null | tail -3
     echo "--- hilos y núcleos (cada 10 s: CPU de cada núcleo y de cada hilo, ms por cuadro del juego, espera de turno)"
     grep -h "^hilos" "$DIR/choya-gles.txt" 2>/dev/null | tail -9
     echo "--- núcleos"

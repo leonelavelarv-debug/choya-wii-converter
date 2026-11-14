@@ -355,6 +355,45 @@ std::atomic<uint64_t> g_lostCopies{0};      // copias únicas tiradas porque el 
 std::atomic<uint64_t> g_capturedFrames{0};  // 0.23.3: cuadros del juego que llegaron al motor (para mostrarse)
 std::atomic<uint64_t> g_skippedFrames{0};   // 0.23.3: cuadros que el motor no dibujó (los más nuevos rehacen sus copias)
 
+// --- Saltar cuadros en el motor (0.24.0) ------------------------------------------------------------------------
+// Si el motor va atrasado toma dos o más cuadros de la cola y antes los dibujaba todos para mostrar solo el último:
+// en la RG35XX H dibujaba 12.5 cuadros por segundo y mostraba 6. Ahora un cuadro viejo se salta si cada copia del EFB
+// que hace la rehace un cuadro más nuevo de la misma tanda o es una copia "de siempre": una que el juego rehace casi
+// cada cuadro (Wii Sports alterna dos juegos de copias, uno por cuadro, y por eso nunca era subconjunto del siguiente).
+// Las copias que el juego hace una vez (las caras de los Miis) no son de siempre: ese cuadro se dibuja aunque no se
+// muestre, como antes. CHOYA_GX_SALTAR=0 (archivo sin-saltar-cuadros) vuelve a dibujarlos todos.
+struct HistCopia {
+  uint64_t ultimo = 0;  // número del último grupo dibujado que la hizo
+  uint32_t veces = 0;
+};
+std::unordered_map<uint64_t, HistCopia> g_histCopias;  // solo en el hilo del motor
+uint64_t g_gruposDibujados = 0;                         // grupos que el motor dibujó (solo en el hilo del motor)
+struct SaltosMotor {
+  uint64_t tandas = 0, tandasVarias = 0, saltados = 0, porUnicas = 0, porSinBorrar = 0;
+  uint64_t ejemplo = 0;  // una copia que obligó a dibujar un cuadro viejo
+  uint32_t ejemploVeces = 0, ejemploW = 0, ejemploH = 0;
+} g_saltos;
+
+bool saltar_activo() {
+  static const bool on = [] {
+    const char* e = std::getenv("CHOYA_GX_SALTAR");
+    return e == nullptr || std::strcmp(e, "0") != 0;
+  }();
+  return on;
+}
+
+void copia_hecha(uint64_t id) {
+  HistCopia& h = g_histCopias[id];
+  h.ultimo = g_gruposDibujados;
+  if (h.veces < 1000000) ++h.veces;
+}
+
+// Copia que el juego rehace casi cada cuadro: hecha 3 veces o más y en uno de los últimos 3 grupos dibujados.
+bool copia_de_siempre(uint64_t id) {
+  const auto it = g_histCopias.find(id);
+  return it != g_histCopias.end() && it->second.veces >= 3 && g_gruposDibujados - it->second.ultimo <= 3;
+}
+
 std::mutex g_pipelineMutex;
 std::unordered_map<uint64_t, PipelineDesc> g_pipelines;
 std::unordered_map<uint64_t, ClearDesc> g_clears;
@@ -2419,6 +2458,157 @@ void gpu_tiempo_terminar() {
   g_gpu.actual = (g_gpu.actual + 1) % GpuTiempo::kN;
 }
 
+// --- Tiempo de GPU por pase (0.24.0) ----------------------------------------------------------------------------
+// Uno de cada 30 cuadros dibujados se mide por tramos (cada pase, cada copia del EFB y la copia a la pantalla) con
+// las mismas consultas de tiempo; ese cuadro no entra en "GPU ... ms por cuadro". Dice en qué pase y en qué se va la
+// GPU. Si la suma de los tramos sale muy por encima del cuadro entero, medir por tramos le cuesta a la Mali (las
+// consultas parten su trabajo) y los números valen para comparar entre pases, no como absolutos.
+// CHOYA_GX_GPU_PASES=0 lo apaga.
+constexpr int kGpuPases = 32;  // pases medidos uno por uno; el resto y lo de antes del primer pase van juntos
+struct GpuPases {
+  bool listo = false;
+  static constexpr int kQ = 160;
+  GLuint q[kQ] = {};
+  struct Tramo {
+    int16_t pase;
+    uint8_t tipo;  // 0 dibujos, 1 copias del EFB, 2 pantalla
+  } tramo[kQ] = {};
+  int n = 0;
+  bool midiendo = false, abierta = false, pendiente = false;
+  uint64_t cuenta = 0;
+  struct Info {
+    int w = 0, h = 0;
+    uint8_t borra = 0;  // 1 color, 2 profundidad
+    uint32_t dibujos = 0, copias = 0;
+  } info[kGpuPases + 1], infoCuadro[kGpuPases + 1];
+  double ms[kGpuPases + 1][3] = {};
+  uint32_t copias = 0;  // copias del EFB en los cuadros medidos
+  uint32_t cuadros = 0;
+  int paseActual = -1;
+} g_gpuPases;
+
+int gpu_pase_idx(int pase) { return pase < 0 || pase >= kGpuPases ? kGpuPases : pase; }
+
+void gpu_pases_init() {
+  if (!g_gpu.listo) return;
+  const char* env = std::getenv("CHOYA_GX_GPU_PASES");
+  if (env != nullptr && std::strcmp(env, "0") == 0) return;
+  g_gpu.GenQueries(GpuPases::kQ, g_gpuPases.q);
+  g_gpuPases.listo = true;
+  log_line("motor: midiendo el tiempo de GPU por pase en 1 de cada 30 cuadros (CHOYA_GX_GPU_PASES=0 lo apaga)");
+}
+
+void gpu_pases_recoger() {
+  auto& g = g_gpuPases;
+  if (!g.pendiente) return;
+  for (int i = 0; i < g.n; ++i) {
+    GLuint disponible = 0;
+    g_gpu.GetQueryObjectuiv(g.q[i], kQueryResultAvailableExt, &disponible);
+    if (!disponible) return;  // se vuelve a mirar en el siguiente cuadro
+  }
+  GLint disjoint = 0;
+  gl.GetIntegerv(kGpuDisjointExt, &disjoint);
+  g.pendiente = false;
+  double ms[kGpuPases + 1][3] = {};
+  for (int i = 0; i < g.n; ++i) {
+    unsigned long long ns = 0;
+    g_gpu.GetQueryObjectui64v(g.q[i], kQueryResultExt, &ns);
+    if (ns > 1000000000ull) return;  // medida rota: el cuadro no cuenta
+    ms[gpu_pase_idx(g.tramo[i].pase)][g.tramo[i].tipo % 3] += static_cast<double>(ns) / 1e6;
+  }
+  if (disjoint) return;
+  for (int p = 0; p <= kGpuPases; ++p) {
+    for (int t = 0; t < 3; ++t) g.ms[p][t] += ms[p][t];
+    g.info[p] = g.infoCuadro[p];
+  }
+  ++g.cuadros;
+}
+
+// Termina el tramo abierto y empieza otro (solo en los cuadros que se miden por pases).
+void gpu_pases_tramo(int pase, int tipo) {
+  auto& g = g_gpuPases;
+  if (!g.midiendo) return;
+  if (g.abierta) g_gpu.EndQuery(kTimeElapsedExt);
+  g.abierta = false;
+  if (g.n >= GpuPases::kQ) return;  // demasiados tramos: lo que sigue no se mide
+  g_gpu.BeginQuery(kTimeElapsedExt, g.q[g.n]);
+  g.tramo[g.n] = {static_cast<int16_t>(pase), static_cast<uint8_t>(tipo)};
+  ++g.n;
+  g.abierta = true;
+}
+
+// Al empezar un cuadro: o se mide entero (gpu_tiempo_empezar) o por tramos.
+void gpu_cuadro_terminar();
+void gpu_cuadro_empezar() {
+  auto& g = g_gpuPases;
+  if (g.midiendo) gpu_cuadro_terminar();  // un cuadro anterior salió antes de tiempo
+  if (g.listo) gpu_pases_recoger();
+  g.midiendo = g.listo && !g.pendiente && (++g.cuenta % 30 == 0);
+  if (!g.midiendo) {
+    gpu_tiempo_empezar();
+    return;
+  }
+  if (g_gpu.abierta) gpu_tiempo_terminar();
+  g.n = 0;
+  g.paseActual = -1;
+  for (auto& i : g.infoCuadro) i = GpuPases::Info{};
+  gpu_pases_tramo(-1, 0);
+}
+
+void gpu_cuadro_terminar() {
+  auto& g = g_gpuPases;
+  if (!g.midiendo) {
+    gpu_tiempo_terminar();
+    return;
+  }
+  if (g.abierta) g_gpu.EndQuery(kTimeElapsedExt);
+  g.abierta = false;
+  g.midiendo = false;
+  g.pendiente = g.n > 0;
+}
+
+void gpu_pases_informe() {
+  auto& g = g_gpuPases;
+  if (!g.listo || g.cuadros == 0) return;
+  const double n = g.cuadros;
+  double tipo[3] = {}, total = 0;
+  struct Fila {
+    int p;
+    double ms;
+  };
+  std::vector<Fila> filas;
+  for (int p = 0; p <= kGpuPases; ++p) {
+    double sum = 0;
+    for (int t = 0; t < 3; ++t) {
+      tipo[t] += g.ms[p][t] / n;
+      sum += g.ms[p][t] / n;
+    }
+    total += sum;
+    if (p < kGpuPases && sum > 0) filas.push_back({p, sum});
+  }
+  std::sort(filas.begin(), filas.end(), [](const Fila& a, const Fila& b) { return a.ms > b.ms; });
+  std::string detalle;
+  for (size_t i = 0; i < filas.size() && i < 8; ++i) {
+    const int p = filas[i].p;
+    const auto& in = g.info[p];
+    char buf[200];
+    std::snprintf(buf, sizeof(buf), "%spase %d (%dx%d%s, %u dibujos%s) %.1f ms (dibujos %.1f, copias %.1f%s)",
+                  i ? "; " : "", p, in.w, in.h,
+                  in.borra == 3 ? ", borra color y profundidad" : in.borra == 1 ? ", borra color"
+                                                              : in.borra == 2 ? ", borra profundidad" : ", sin borrar",
+                  in.dibujos, in.copias ? (", " + std::to_string(in.copias) + " copias").c_str() : "", filas[i].ms,
+                  g.ms[p][0] / n, g.ms[p][1] / n,
+                  g.ms[p][2] > 0 ? (", pantalla " + std::to_string(g.ms[p][2] / n).substr(0, 4)).c_str() : "");
+    detalle += buf;
+  }
+  log_line("motor: GPU por pase (%u cuadros medidos; suma %.1f ms por cuadro): dibujos %.1f, copias del EFB %.1f, "
+           "pantalla %.1f (antes del primer pase y pases de más de %d: %.1f); los más caros: %s",
+           g.cuadros, total, tipo[0], tipo[1], tipo[2], kGpuPases,
+           g.ms[kGpuPases][0] / n + g.ms[kGpuPases][1] / n + g.ms[kGpuPases][2] / n, detalle.c_str());
+  for (auto& row : g.ms) row[0] = row[1] = row[2] = 0;
+  g.cuadros = 0;
+}
+
 bool init_gl() {
   if (!load_gl()) return false;
   for (auto& r : g_ring) {
@@ -2455,6 +2645,7 @@ bool init_gl() {
     }
   }
   gpu_tiempo_init();
+  gpu_pases_init();
   log_line("motor: listo (alineación de UBO %d; búferes persistentes %s)", g_uboAlign,
            g_persistent ? "sí, como en Nebula" : "no, se suben los datos en cada cuadro");
   return true;
@@ -2718,6 +2909,7 @@ void run_copy(const Item& it) {
   gl.BindTexture(kTexture2D, g_efb.depth);
   gl.BindSampler(11, 0);
   gl.DrawArrays(kTriangles, 0, 3);
+  copia_hecha(c.tex);
   // Sin el EFB enlazado para muestrear mientras se vuelve a dibujar en él.
   gl.BindTexture(kTexture2D, 0);
   gl.ActiveTexture(kTexture0 + 10);
@@ -2841,6 +3033,7 @@ void run_palette_conv(const Item& it) {
   gl.BindTexture(kTexture2D, tlut->second.id);
   gl.BindSampler(11, 0);
   gl.DrawArrays(kTriangles, 0, 3);
+  copia_hecha(c.dst);
   gl.BindTexture(kTexture2D, 0);
   gl.ActiveTexture(kTexture0 + 10);
   gl.BindTexture(kTexture2D, 0);
@@ -3552,12 +3745,75 @@ bool draw_frame(int screenWidth, int screenHeight) noexcept {
     groups.swap(g_queue);
   }
   g_queueCv.notify_all();
-  std::vector<Frame> batch;
-  for (Group& g : groups) {
-    for (Frame& f : g.frames) batch.push_back(std::move(f));
+  // 0.24.0: los grupos viejos que no hace falta dibujar (ver saltar_activo) se saltan; el último siempre se dibuja.
+  std::vector<bool> saltar(groups.size(), false);
+  ++g_saltos.tandas;
+  if (groups.size() > 1) ++g_saltos.tandasVarias;
+  if (saltar_activo() && groups.size() > 1) {
+    std::vector<uint64_t> later = groups.back().copies, merged;
+    size_t siguiente = groups.size() - 1;  // el grupo que se dibuja después del que se revisa
+    for (size_t i = groups.size() - 1; i-- > 0;) {
+      const Group& old = groups[i];
+      bool ok = !old.frames.empty() && old.frames.back().present;  // los lotes de carga se dibujan siempre
+      for (uint64_t c : old.copies) {
+        if (!ok) break;
+        if (std::binary_search(later.begin(), later.end(), c) || copia_de_siempre(c)) continue;
+        ok = false;
+        ++g_saltos.porUnicas;
+        const auto h = g_histCopias.find(c);
+        g_saltos.ejemplo = c;
+        g_saltos.ejemploVeces = h != g_histCopias.end() ? h->second.veces : 0;
+        const auto ct = g_copyTextures.find(c);
+        g_saltos.ejemploW = ct != g_copyTextures.end() ? ct->second.width : 0;
+        g_saltos.ejemploH = ct != g_copyTextures.end() ? ct->second.height : 0;
+      }
+      if (ok) {
+        // El EFB sigue de un cuadro a otro: solo se salta si el que se dibuja después empieza borrando color y
+        // profundidad (si no, partiría de lo que dejó este).
+        const Item* primero = nullptr;
+        for (const Frame& f : groups[siguiente].frames) {
+          for (const Item& it : f.items) {
+            if (it.op == Op::Pass) {
+              primero = &it;
+              break;
+            }
+          }
+          if (primero != nullptr) break;
+        }
+        if (primero == nullptr || !primero->pass.clearColor || !primero->pass.clearDepth) {
+          ok = false;
+          ++g_saltos.porSinBorrar;
+        }
+      }
+      if (ok) {
+        saltar[i] = true;
+        ++g_saltos.saltados;
+        g_skippedFrames.fetch_add(old.frames.size(), std::memory_order_relaxed);
+      } else {
+        merged.clear();
+        std::set_union(later.begin(), later.end(), old.copies.begin(), old.copies.end(), std::back_inserter(merged));
+        later.swap(merged);
+        siguiente = i;
+      }
+    }
+  }
+  std::vector<Frame> batch, sobran;
+  std::vector<bool> empiezaGrupo;
+  for (size_t gi = 0; gi < groups.size(); ++gi) {
+    bool primero = true;
+    for (Frame& f : groups[gi].frames) {
+      if (saltar[gi]) {
+        sobran.push_back(std::move(f));
+        continue;
+      }
+      batch.push_back(std::move(f));
+      empiezaGrupo.push_back(primero);
+      primero = false;
+    }
   }
   bool drawn = false;
   for (size_t i = 0; i < batch.size(); ++i) {
+    if (empiezaGrupo[i]) ++g_gruposDibujados;  // las copias de este grupo quedan con este número
     drawn = draw_frame_locked(batch[i], screenWidth, screenHeight, i + 1 == batch.size());
   }
   {
@@ -3566,6 +3822,7 @@ bool draw_frame(int screenWidth, int screenHeight) noexcept {
       if (i + 1 == batch.size()) std::swap(g_last, batch[i]);  // el g_last anterior se recicla
       recycle(std::move(batch[i]));
     }
+    for (Frame& f : sobran) recycle(std::move(f));
   }
   return drawn;
 }
@@ -3617,8 +3874,10 @@ long mali_read() {
 bool mali_on() {
   if (g_mali.state == 0) {
     g_mali.state = -1;
+    // 0.24.0: apagada salvo CHOYA_GX_MALI=1 (archivo medir-mali): eran ~100 lecturas de debugfs por cuadro (1.7 ms
+    // del hilo de la pantalla) y la fuga de Golf que buscaba ya se arregló.
     const char* env = std::getenv("CHOYA_GX_MALI");
-    if (env != nullptr && std::strcmp(env, "0") == 0) return false;
+    if (env == nullptr || std::strcmp(env, "1") != 0) return false;
     for (const char* p : {"/sys/kernel/debug/mali0/gpu_memory", "/sys/kernel/debug/mali/gpu_memory"}) {
       g_mali.fd = ::open(p, O_RDONLY);
       g_mali.path = p;
@@ -3779,7 +4038,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   const auto cpuStart = std::chrono::steady_clock::now();
   g_tMarca = cpuStart;
   const double cpuHiloIni = cpu_hilo_ms();
-  gpu_tiempo_empezar();
+  gpu_cuadro_empezar();
   // Tamaño del EFB: el pase más grande del cuadro.
   int efbW = 1, efbH = 1;
   for (const Item& pass : f.items) {
@@ -3916,6 +4175,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     // La copia a pantalla (XFB) es el EFB al terminar el pase que se copia (GXCopyDisp u otra copia).
     if (passOpen && passResolves && present) {
       mali_mark(kMaliDibujos);
+      gpu_pases_tramo(passIndex, 2);
       present_efb(passCopy, screenWidth, screenHeight);
       mali_mark(kMaliPantalla);
       presented = true;
@@ -3929,6 +4189,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       mali_mark(kMaliDibujos);  // lo dibujado en el pase anterior
       end_pass();
       ++g_stats.passes;
+      gpu_pases_tramo(passIndex + 1, 0);
       passOpen = true;
       passResolves = it.pass.hasResolve != 0;
       passW = it.pass.width ? static_cast<int>(it.pass.width) : efbW;
@@ -3954,6 +4215,12 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       if (bits) gl.Clear(bits);
       mali_mark(kMaliPases);
       mali_pass_begin(++passIndex, passW, passH, it.pass.clearColor != 0, it.pass.clearDepth != 0);
+      if (g_gpuPases.midiendo) {
+        auto& in = g_gpuPases.infoCuadro[gpu_pase_idx(passIndex)];
+        in.w = passW;
+        in.h = passH;
+        in.borra = static_cast<uint8_t>((it.pass.clearColor ? 1 : 0) | (it.pass.clearDepth ? 2 : 0));
+      }
       set_enable(kScissorTest, S.scissorOn, true);
       scissorRect[0] = 0;
       scissorRect[1] = g_efb.height - passH;
@@ -3977,7 +4244,10 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     } break;
     case Op::Copy: {
       mali_mark(kMaliDibujos);
+      gpu_pases_tramo(passIndex, 1);
       if (copies_enabled()) run_copy(it);
+      if (g_gpuPases.midiendo) ++g_gpuPases.infoCuadro[gpu_pase_idx(passIndex)].copias;
+      gpu_pases_tramo(passIndex, 0);
       mali_mark(kMaliCopias);
       ((it.copy.fmt & 0x10) != 0 ? g_maliCopiedDepth : g_maliCopiedColor) = true;
       shadow_invalidate();  // la copia usó su propio programa, estado y unidades 10/11
@@ -3989,7 +4259,9 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     } break;
     case Op::PaletteConv: {
       mali_mark(kMaliDibujos);
+      gpu_pases_tramo(passIndex, 1);
       run_palette_conv(it);
+      gpu_pases_tramo(passIndex, 0);
       mali_mark(kMaliCopias);
       shadow_invalidate();  // usó su propio programa, estado y unidades 10/11
       set_viewport(viewportRect);
@@ -4092,6 +4364,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       }
       ++drawIndex;
       if (g_mali.curPass >= 0) ++g_mali.pass[g_mali.curPass].draws;
+      if (g_gpuPases.midiendo) ++g_gpuPases.infoCuadro[gpu_pase_idx(passIndex)].dibujos;
       gl.DrawElements(kTriangles, static_cast<GLsizei>(it.draw.indexCount), kUnsignedShort,
                       reinterpret_cast<const void*>(static_cast<uintptr_t>(it.draw.idxOffset)));
       ++g_stats.draws;
@@ -4102,6 +4375,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   mali_mark(kMaliDibujos);
   if (!presented && present) {
     // Ningún pase se copió: se muestra cómo quedó el último.
+    gpu_pases_tramo(passIndex, 2);
     present_efb(Rect{0, 0, passW, passH}, screenWidth, screenHeight);
     presented = true;
     mali_mark(kMaliPantalla);
@@ -4111,7 +4385,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   gl.ColorMask(1, 1, 1, 1);
   gl.DepthMask(1);
 
-  gpu_tiempo_terminar();
+  gpu_cuadro_terminar();
   res.fence = gl.FenceSync(0x9117 /* GL_SYNC_GPU_COMMANDS_COMPLETE */, 0);
   tiempo_parte(kParteCierre);
   g_tiempos.cpuHilo += cpu_hilo_ms() - cpuHiloIni;
@@ -4148,6 +4422,23 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       log_line("motor: cuadros por segundo: %.1f dibujados por el motor, %.1f del juego, %.1f que el motor no alcanzó "
                "(en %.0f s)", n / segundos, static_cast<double>(juego) / segundos,
                static_cast<double>(saltados) / segundos, segundos);
+      {  // 0.24.0: cuadros viejos que el motor se saltó en vez de dibujarlos sin mostrarlos
+        auto& z = g_saltos;
+        char ejemplo[128] = "";
+        if (z.porUnicas > 0) {
+          std::snprintf(ejemplo, sizeof(ejemplo), " (la última: copia %016llx de %ux%u, hecha %u veces)",
+                        static_cast<unsigned long long>(z.ejemplo), z.ejemploW, z.ejemploH, z.ejemploVeces);
+        }
+        log_line("motor: saltos: %s; %.1f tomas por s, %.0f %% con varios cuadros; %.1f cuadros viejos saltados por s; "
+                 "dibujados sin mostrarse por copias que no se repiten %.1f por s%s, porque el siguiente no borra al "
+                 "empezar %.1f por s",
+                 saltar_activo() ? "encendidos" : "apagados (sin-saltar-cuadros)",
+                 static_cast<double>(z.tandas) / segundos,
+                 z.tandas > 0 ? 100.0 * static_cast<double>(z.tandasVarias) / static_cast<double>(z.tandas) : 0.0,
+                 static_cast<double>(z.saltados) / segundos, static_cast<double>(z.porUnicas) / segundos, ejemplo,
+                 static_cast<double>(z.porSinBorrar) / segundos);
+        z = SaltosMotor{};
+      }
       g_tiempos = TiemposMotor{};
     }
     log_line("motor: KB por cuadro: vértices %.0f, uniformes %.0f, índices %.0f, arreglos %.0f; CPU del motor %.2f ms "
@@ -4245,6 +4536,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
              rssPages * 4 / 1024, rssAnon / 1024, rssFile / 1024, rssShmem / 1024, g_texBytes >> 20, groups,
              bindGroups, pipelines, pending, pendingBytes / 1024, kept, keptBytes >> 20);
     mali_report(n);
+    gpu_pases_informe();
     low_memory_relief();
     g_stats = Stats{.frames = g_stats.frames};
   }

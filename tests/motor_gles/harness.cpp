@@ -681,6 +681,39 @@ int main(int argc, char** argv) {
   const int rep = pixel(20, 470);
   if (rep != 0x00FF00) std::printf("copias repetidas: %06X\n", rep);
   ok = ok && rep == 0x00FF00;
+
+  // Cuadro 7 (0.24.0): el juego alterna dos copias, una por cuadro (610 y 611, como Wii Sports). Ya hechas varias
+  // veces son "de siempre": con el motor atrasado, un cuadro viejo que copia a la 610 se salta aunque el nuevo copie a
+  // la 611 (la 610 se queda con lo de antes: rojo, no azul). Un cuadro viejo con una copia nueva (630, como las caras
+  // de los Miis) se dibuja aunque no se muestre.
+  auto copy_frame = [&](uint64_t tex, const float* rgba) {
+    gx::capture_begin(v5.data(), v5.size(), u4.data(), u4.size(), (const uint8_t*)i5.data(), i5.size() * 2, nullptr, 0);
+    gx::capture_pass(640, 480, true, true, rgba, 0.f, false, gx::Rect{0, 0, 0, 0});
+    gx::capture_copy(tex, gx::Rect{0, 0, 640, 480}, 16, 16, 0x6, false);
+    gx::capture_pass(640, 480, true, true, black, 0.f, true, gx::Rect{0, 0, 640, 480});
+    gx::capture_end();
+  };
+  const float red7[4] = {1, 0, 0, 1}, blue7[4] = {0, 0, 1, 1};
+  for (int k = 0; k < 3; ++k) {
+    copy_frame(610, red7);
+    gx::draw_frame(640, 480);
+    copy_frame(611, green);
+    gx::draw_frame(640, 480);
+  }
+  copy_frame(610, blue7);  // viejo: se salta
+  copy_frame(630, red7);   // viejo con copia nueva: se dibuja
+  copy_frame(611, green);  // el que se muestra
+  gx::draw_frame(640, 480);
+  std::vector<uint8_t> rgba7;
+  uint32_t w7 = 0, h7 = 0;
+  const bool read7 = gx::debug_read_copy(610, rgba7, w7, h7) && rgba7.size() >= 4;
+  const bool skipped = read7 && rgba7[0] == 255 && rgba7[2] == 0;
+  const bool unique = gx::has_copy_texture(630);
+  if (!skipped || !unique) {
+    std::printf("saltos: 610 %d,%d,%d (debía seguir roja), 630 %s\n", read7 ? rgba7[0] : -1, read7 ? rgba7[1] : -1,
+                read7 ? rgba7[2] : -1, unique ? "hecha" : "sin hacer");
+  }
+  ok = ok && skipped && unique;
   std::puts(ok ? "PRUEBA OK" : "PRUEBA FALLÓ");
   return ok ? 0 : 1;
 }
