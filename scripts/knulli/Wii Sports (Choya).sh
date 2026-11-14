@@ -169,6 +169,8 @@ escribir_resumen() {
     grep -h "aurora: hilo GX:" "$DIR/choya-gles.txt" 2>/dev/null | tail -4
     echo "--- motor de pantalla: cuadros por segundo y tiempo por cuadro dibujado (0.23.3)"
     grep -h "motor: cuadros por segundo\|motor: tiempo por cuadro dibujado\|presentación: \|GL_EXT_disjoint_timer_query" "$DIR/choya-gles.txt" 2>/dev/null | tail -9
+    echo "--- hilos y núcleos (cada 10 s: CPU de cada núcleo y de cada hilo, ms por cuadro del juego, espera de turno)"
+    grep -h "^hilos" "$DIR/choya-gles.txt" 2>/dev/null | tail -9
     echo "--- núcleos"
     grep -h "motor: hilo del juego\|no pude fijar" "$DIR/choya-gles.txt" 2>/dev/null | tail -2
     echo "--- texturas sin datos en el motor (las primeras; tamaño y formato que dio aurora)"

@@ -26,6 +26,13 @@
 #include <string>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <algorithm>
+#include <atomic>
+#include <dirent.h>
+#include <map>
+#include <pthread.h>
+#include <sys/syscall.h>
+#include <vector>
 
 #include <SDL3/SDL.h>
 
@@ -295,7 +302,13 @@ std::condition_variable g_threadCv;
 uint64_t g_requested = 0;  // cuadros que el juego ya terminó
 bool g_threadStarted = false;
 
+std::atomic<int> g_tidPantalla{0};
+std::atomic<int> g_tidJuego{0};
+std::atomic<uint64_t> g_cuadrosJuego{0};  // choya_gles_frame: un cuadro del juego (para los ms por cuadro de cada hilo)
+
 void RenderThread() {
+    pthread_setname_np(pthread_self(), "choya-pantalla");
+    g_tidPantalla.store(static_cast<int>(syscall(SYS_gettid)));
     g.ok = Init();
     if (!g.ok) {
         Log("la pantalla de Choya quedó apagada; el juego sigue");
@@ -394,6 +407,191 @@ void CheckGamepads() {
 }
 } // namespace
 
+// --- Perfil de hilos y núcleos (0.23.4) ---------------------------------------------------------------------------
+// Cada 10 s (CHOYA_HILOS_CADA=segundos; CHOYA_HILOS=0 lo apaga): qué tan ocupado estuvo cada núcleo (/proc/stat) y
+// cada hilo del proceso (/proc/self/task/*/stat y schedstat): CPU usada, núcleo donde corrió y cuánto esperó turno
+// (listo para correr pero sin núcleo libre). El juego, el hilo GX y la pantalla van con su nombre; los demás (Mali,
+// audio, aurora) con el que les puso su programa.
+extern "C" __attribute__((weak)) int choya_gx_hilo_tid_gx();  // hilo GX de Choya (aurora)
+namespace {
+struct HiloAntes {
+    uint64_t ticks = 0, runNs = 0, waitNs = 0;
+};
+
+bool LeerArchivo(const char* path, char* buf, size_t size) {
+    const int fd = ::open(path, O_RDONLY);
+    if (fd < 0) return false;
+    const ssize_t n = ::read(fd, buf, size - 1);
+    ::close(fd);
+    if (n <= 0) return false;
+    buf[n] = 0;
+    return true;
+}
+
+// /proc/stat: tiempo ocupado y total de cada núcleo (en ticks).
+std::vector<std::pair<uint64_t, uint64_t>> LeerNucleos() {
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    FILE* f = std::fopen("/proc/stat", "r");
+    if (!f) return out;
+    char line[512];
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::strncmp(line, "cpu", 3) != 0 || line[3] < '0' || line[3] > '9') continue;
+        unsigned long long v[10] = {};
+        int idx = 0;
+        if (std::sscanf(line, "cpu%d %llu %llu %llu %llu %llu %llu %llu %llu", &idx, &v[0], &v[1], &v[2], &v[3], &v[4],
+                        &v[5], &v[6], &v[7]) < 5) {
+            continue;
+        }
+        const uint64_t idle = v[3] + v[4];
+        uint64_t total = 0;
+        for (int i = 0; i < 8; ++i) total += v[i];
+        if (idx >= static_cast<int>(out.size())) out.resize(idx + 1);
+        out[idx] = {total - idle, total};
+    }
+    std::fclose(f);
+    return out;
+}
+
+void PerfilHilos() {
+    pthread_setname_np(pthread_self(), "choya-hilos");
+    const char* off = std::getenv("CHOYA_HILOS");
+    if (off && std::strcmp(off, "0") == 0) return;
+    const char* cada = std::getenv("CHOYA_HILOS_CADA");
+    const int segundos = cada ? std::max(1, std::atoi(cada)) : 10;
+    const double hz = static_cast<double>(sysconf(_SC_CLK_TCK));
+    const int yo = static_cast<int>(syscall(SYS_gettid));
+    std::map<int, HiloAntes> antes;
+    auto nucleosAntes = LeerNucleos();
+    auto t0 = std::chrono::steady_clock::now();
+    uint64_t cuadrosAntes = g_cuadrosJuego.load();
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(segundos));
+        const auto t1 = std::chrono::steady_clock::now();
+        const double dt = std::chrono::duration<double>(t1 - t0).count();
+        t0 = t1;
+        const uint64_t cuadros = g_cuadrosJuego.load();
+        const double cuadrosPorSeg = static_cast<double>(cuadros - cuadrosAntes) / dt;
+        cuadrosAntes = cuadros;
+        // Núcleos.
+        const auto nucleos = LeerNucleos();
+        char cab[96];
+        std::snprintf(cab, sizeof(cab), "hilos (%d s, juego a %.1f cuadros/s): núcleos ocupados", segundos, cuadrosPorSeg);
+        std::string linea = cab;
+        for (size_t i = 0; i < nucleos.size(); ++i) {
+            if (i >= nucleosAntes.size()) break;
+            const double ocup = static_cast<double>(nucleos[i].first - nucleosAntes[i].first);
+            const double tot = static_cast<double>(nucleos[i].second - nucleosAntes[i].second);
+            char b[32];
+            std::snprintf(b, sizeof(b), "%s %zu: %.0f %%", i ? "," : "", i, tot > 0 ? 100.0 * ocup / tot : 0.0);
+            linea += b;
+        }
+        nucleosAntes = nucleos;
+        Log("%s", linea.c_str());
+        // Hilos.
+        struct Hilo {
+            int tid;
+            std::string nombre;
+            double cpu, espera;
+            int nucleo;
+        };
+        std::vector<Hilo> hilos;
+        std::map<int, HiloAntes> ahora;
+        if (DIR* d = ::opendir("/proc/self/task")) {
+            while (const dirent* e = ::readdir(d)) {
+                const int tid = std::atoi(e->d_name);
+                if (tid <= 0) continue;
+                char path[64], buf[1024];
+                std::snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+                if (!LeerArchivo(path, buf, sizeof(buf))) continue;
+                const char* abre = std::strchr(buf, '(');
+                const char* cierra = std::strrchr(buf, ')');
+                if (!abre || !cierra || cierra < abre) continue;
+                std::string nombre(abre + 1, cierra);
+                // Campos después de ")": 3 estado ... 14 utime, 15 stime ... 39 núcleo.
+                std::vector<unsigned long long> campos;
+                const char* c = cierra + 2;
+                while (*c) {
+                    while (*c == ' ') ++c;
+                    if (!*c) break;
+                    campos.push_back(std::strtoull(c, nullptr, 10));
+                    while (*c && *c != ' ') ++c;
+                }
+                if (campos.size() < 37) continue;
+                HiloAntes h;
+                h.ticks = campos[11] + campos[12];
+                const int nucleo = static_cast<int>(campos[36]);
+                std::snprintf(path, sizeof(path), "/proc/self/task/%d/schedstat", tid);
+                if (LeerArchivo(path, buf, sizeof(buf))) {
+                    unsigned long long run = 0, wait = 0;
+                    if (std::sscanf(buf, "%llu %llu", &run, &wait) == 2) {
+                        h.runNs = run;
+                        h.waitNs = wait;
+                    }
+                }
+                ahora[tid] = h;
+                const auto a = antes.find(tid);
+                if (a == antes.end()) continue;
+                const double cpu = 100.0 * static_cast<double>(h.ticks - a->second.ticks) / hz / dt;
+                const double espera = 100.0 * static_cast<double>(h.waitNs - a->second.waitNs) / 1e9 / dt;
+                hilos.push_back({tid, nombre, cpu, espera, nucleo});
+            }
+            ::closedir(d);
+        }
+        antes.swap(ahora);
+        if (hilos.empty()) continue;
+        const int tidJuego = g_tidJuego.load();
+        const int tidGx = choya_gx_hilo_tid_gx ? choya_gx_hilo_tid_gx() : 0;
+        const int tidPantalla = g_tidPantalla.load();
+        // CPU en ms por cuadro del juego (como un perfil por cuadro): % / 100 * 1000 / cuadros por segundo.
+        const double msPorCuadro = cuadrosPorSeg > 0.1 ? 10.0 / cuadrosPorSeg : 0.0;
+        auto describir = [msPorCuadro](const Hilo& h, const char* etiqueta) {
+            char b[192];
+            if (msPorCuadro > 0) {
+                std::snprintf(b, sizeof(b), "%s %.0f %% CPU (%.1f ms por cuadro) en el núcleo %d, esperó turno %.0f %%",
+                              etiqueta, h.cpu, h.cpu * msPorCuadro, h.nucleo, h.espera);
+            } else {
+                std::snprintf(b, sizeof(b), "%s %.0f %% CPU en el núcleo %d, esperó turno %.0f %%", etiqueta, h.cpu,
+                              h.nucleo, h.espera);
+            }
+            return std::string(b);
+        };
+        std::string principales = "hilos: ";
+        bool primero = true;
+        for (const auto& [tid, etiqueta] : {std::pair<int, const char*>{tidJuego, "juego"},
+                                            {tidGx, "hilo GX"},
+                                            {tidPantalla, "pantalla"}}) {
+            if (tid <= 0) continue;
+            for (const Hilo& h : hilos) {
+                if (h.tid != tid) continue;
+                principales += (primero ? "" : "; ") + describir(h, etiqueta);
+                primero = false;
+            }
+        }
+        if (!primero) Log("%s", principales.c_str());
+        std::sort(hilos.begin(), hilos.end(), [](const Hilo& a, const Hilo& b) { return a.cpu > b.cpu; });
+        std::string otros = "hilos: otros:";
+        int n = 0;
+        double resto = 0;
+        for (const Hilo& h : hilos) {
+            if (h.tid == tidJuego || h.tid == tidGx || h.tid == tidPantalla || h.tid == yo) continue;
+            if (n < 6 && h.cpu >= 0.5) {
+                char b[128];
+                std::snprintf(b, sizeof(b), "%s %s %.0f %% (núcleo %d, esperó %.0f %%)", n ? "," : "", h.nombre.c_str(),
+                              h.cpu, h.nucleo, h.espera);
+                otros += b;
+                ++n;
+            } else {
+                resto += h.cpu;
+            }
+        }
+        char b[64];
+        std::snprintf(b, sizeof(b), "%s el resto %.0f %%", n ? ";" : "", resto);
+        otros += b;
+        Log("%s", otros.c_str());
+    }
+}
+} // namespace
+
 // El motor pide dibujar sin un cuadro mostrado (pantalla de carga, cola llena): mismo aviso que un cuadro del juego.
 // Si el lote no se muestra, choya_gx_draw_frame devuelve false y no se presenta nada (no parpadea).
 extern "C" void choya_gles_wake() {
@@ -406,9 +604,12 @@ extern "C" void choya_gles_wake() {
 }
 
 extern "C" void choya_gles_frame() {
+    g_cuadrosJuego.fetch_add(1, std::memory_order_relaxed);
     CheckGamepads();
     if (!g.tried) {
         g.tried = true;
+        g_tidJuego.store(static_cast<int>(syscall(SYS_gettid)));  // lo llama el hilo del juego (VI)
+        std::thread(PerfilHilos).detach();
         const char* on = std::getenv("CHOYA_GLES");
         if (!on || std::strcmp(on, "1") != 0) return;
         g_threadStarted = true;

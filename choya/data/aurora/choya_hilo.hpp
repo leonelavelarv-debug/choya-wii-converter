@@ -74,6 +74,7 @@ extern "C" void choya_gx_procesar_lista(const uint8_t* data, uint32_t nbytes, bo
 // Para el runtime y aurora.cpp (sin incluir este archivo).
 extern "C" bool choya_gx_hilo_en_hilo();
 extern "C" bool choya_gx_hilo_activo();
+extern "C" int choya_gx_hilo_tid_gx();  // 0 si no hay hilo GX
 extern "C" void choya_gx_hilo_esperar();
 // El runtime dice dónde está la RAM del juego (banco 0: MEM1, 1: MEM2): las listas de ahí no se copian.
 extern "C" void choya_gx_hilo_memoria_juego(int banco, const void* base, uint64_t size);

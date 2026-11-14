@@ -436,6 +436,7 @@ int tid_gx() noexcept { return g_tidGx.load(); }
 
 extern "C" bool choya_gx_hilo_en_hilo() { return choya::hilo::en_hilo(); }
 extern "C" bool choya_gx_hilo_activo() { return choya::hilo::activo(); }
+extern "C" int choya_gx_hilo_tid_gx() { return choya::hilo::tid_gx(); }
 extern "C" void choya_gx_hilo_memoria_juego(int banco, const void* base, uint64_t size) {
   if (banco < 0 || banco > 1 || base == nullptr || size == 0) return;
   const auto ini = reinterpret_cast<uintptr_t>(base);
