@@ -62,6 +62,7 @@ class TestMotorGles(unittest.TestCase):
                 self.assertRegex(log, r"motor: GPU por pase \(\d+ cuadros medidos; suma [\d.]+ ms por cuadro\): "
                                       r"dibujos [\d.]+, copias del EFB [\d.]+, pantalla [\d.]+")
             self.assertRegex(log, r"motor: EFB sin recargar: (encendido|el driver no tiene); por cuadro: [\d.]+ borrados")
+            self.assertRegex(log, r"motor: TEV mixto: \d+ programas en flotante, \d+ exactos")
             self.assertNotIn("memoria de la Mali por partes", log)  # 0.24.0: apagada salvo CHOYA_GX_MALI=1
             # Caché de programas en disco: la primera vez compila y guarda, la segunda carga los binarios y dibuja igual.
             cache = os.path.join(d, "cache")
@@ -148,15 +149,18 @@ class TestMotorGles(unittest.TestCase):
                 self.assertIn(f"paleta {color} {color}", out.stdout, out.stdout + out.stderr)
 
             # TEV exacto (0.20.9): redondeo en enteros, desborde de 8 bits y resultado de la última etapa, matriz
-            # posterior de las coordenadas, niebla y textura indirecta. En flotante (CHOYA_GX_TEV=flotante) los dos primeros cambian.
-            for mode, exact, flot in ((0, "650000", "640000"), (1, "FEFEFE", None), (2, "FF0000", "FF0000"),
-                                      (3, "808080", "808080"), (4, "00FF00", "00FF00")):
-                out = subprocess.run([exe, "tev", str(mode)], env=env, capture_output=True, text=True)
-                self.assertIn(f"tev {mode} {exact}", out.stdout, out.stdout + out.stderr)
-                if flot:
-                    out = subprocess.run([exe, "tev", str(mode)], env=dict(env, CHOYA_GX_TEV="flotante"),
-                                         capture_output=True, text=True)
-                    self.assertIn(f"tev {mode} {flot}", out.stdout, out.stdout + out.stderr)
+            # posterior de las coordenadas, niebla y textura indirecta. 0.27.0: por defecto es mixto (flotante con
+            # desborde y última etapa; exacto si hay una etapa sin límite): el caso 0 da como en flotante y el 1 como
+            # exacto. CHOYA_GX_TEV=exacto cuenta todo exacto; CHOYA_GX_TEV=flotante todo en flotante.
+            for mode, exact, mixto, flot in ((0, "650000", "640000", "640000"), (1, "FEFEFE", "FEFEFE", None),
+                                             (2, "FF0000", "FF0000", "FF0000"), (3, "808080", "808080", "808080"),
+                                             (4, "00FF00", "00FF00", "00FF00")):
+                for tev, want in (("exacto", exact), ("", mixto), ("flotante", flot)):
+                    if want is None:
+                        continue
+                    e2 = dict(env, CHOYA_GX_TEV=tev) if tev else env
+                    out = subprocess.run([exe, "tev", str(mode)], env=e2, capture_output=True, text=True)
+                    self.assertIn(f"tev {mode} {want}", out.stdout, f"{tev or 'mixto'}: " + out.stdout + out.stderr)
 
             # Una copia hecha en un cuadro anterior (caras, texturas de luz) viaja en el volcado del siguiente.
             vieja = os.path.join(d, "vieja.bin")

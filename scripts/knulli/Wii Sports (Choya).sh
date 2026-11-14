@@ -98,9 +98,10 @@ if [ -f "$DIR/sin-prestamos" ]; then export CHOYA_PRESTAMOS=0; else export CHOYA
 # sin texturas no sirve para revisar colores (ocupa unos MB más mientras se juega). Un archivo vacío llamado
 # "volcados-sin-texturas" lo apaga.
 if [ -f "$DIR/volcados-sin-texturas" ]; then export CHOYA_GX_GUARDAR_TEXTURAS=0; else export CHOYA_GX_GUARDAR_TEXTURAS=1; fi
-# TEV exacto (0.20.9): la combinación de colores se cuenta en enteros de 8 bits como la Wii. Un archivo vacío llamado
-# "tev-flotante" junto al juego vuelve a la cuenta en flotante de antes (para comparar velocidad o colores).
-if [ -f "$DIR/tev-flotante" ]; then export CHOYA_GX_TEV=flotante; fi
+# TEV (0.27.0): por defecto "mixto": flotante (más rápido en la Mali) salvo los materiales donde el redondeo de 8 bits
+# de la Wii cambia el resultado, que se cuentan exactos. Un archivo vacío "tev-exacto" cuenta todo exacto en enteros
+# (como 0.20.9-0.26.0); "tev-flotante" todo en flotante.
+if [ -f "$DIR/tev-exacto" ]; then export CHOYA_GX_TEV=exacto; elif [ -f "$DIR/tev-flotante" ]; then export CHOYA_GX_TEV=flotante; fi
 # Hilo GX (0.23.0): aurora decodifica el GX (listas, registros, dibujos) en otro núcleo, como el doble núcleo de
 # Dolphin; el hilo del juego solo arma los comandos. Un archivo vacío llamado "sin-hilo-gx" junto al juego lo apaga
 # (todo en el hilo del juego, como antes).
@@ -140,7 +141,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "EFB sin recargar en la Mali: $([ "${CHOYA_GX_INVALIDAR:-1}" = 0 ] && echo "no (archivo sin-invalidar-efb)" || echo "sí (para apagarlo: archivo vacío sin-invalidar-efb)")"
   echo "saltar cuadros en el motor: $([ "${CHOYA_GX_SALTAR:-1}" = 0 ] && echo "no, se dibujan todos (archivo sin-saltar-cuadros)" || echo "sí (para dibujarlos todos: archivo vacío sin-saltar-cuadros)")"
   echo "hilo GX: $([ "$CHOYA_GX_HILO" = 1 ] && echo "encendido, el GX en otro núcleo (para apagarlo: archivo vacío sin-hilo-gx)" || echo "apagado (archivo sin-hilo-gx)")$([ "${CHOYA_GX_HILO_COPIAR:-0}" = 1 ] && echo "; listas copiadas (archivo hilo-gx-copiar)")"
-  echo "TEV: $([ "${CHOYA_GX_TEV:-}" = flotante ] && echo "en flotante (archivo tev-flotante)" || echo "exacto en enteros (para el de antes: archivo vacío tev-flotante)")"
+  echo "TEV: $(case "${CHOYA_GX_TEV:-}" in flotante) echo "todo en flotante (archivo tev-flotante)";; exacto) echo "todo exacto en enteros (archivo tev-exacto)";; *) echo "mixto: flotante salvo donde el redondeo cambia el resultado (todo exacto: archivo vacío tev-exacto)";; esac)"
   echo "memoria del juego: $([ "$CHOYA_PRESTAMOS" = 0 ] && echo "solo anota (archivo sin-prestamos)" || echo "un montón presta si a otro no le cabe un bloque (para solo anotar: archivo vacío sin-prestamos)")"
   echo "volcados con texturas (MENU + R1): $([ "${CHOYA_GX_GUARDAR_TEXTURAS:-0}" = 1 ] && echo "sí (para quitarlas: archivo vacío volcados-sin-texturas)" || echo "no (archivo volcados-sin-texturas)")"
   echo "recursos convertidos: $([ "$CHOYA_PAQUETE" = 0 ] && echo "no (texturas del disco)" || echo "$CHOYA_PAQUETE ($(du -h "$CHOYA_PAQUETE" 2>/dev/null | cut -f1))")"
@@ -176,9 +177,9 @@ escribir_resumen() {
     grep -h "aurora: por cuadro" "$DIR/choya-gles.txt" 2>/dev/null | tail -6
     grep -hE "aurora: hilo GX (de Choya|apagado)" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | head -1
     grep -h "aurora: hilo GX:" "$DIR/choya-gles.txt" 2>/dev/null | tail -4
-    echo "--- motor de pantalla: cuadros por segundo, tiempo por cuadro dibujado, saltos, EFB sin recargar y GPU por pase (0.26.0)"
+    echo "--- motor de pantalla: cuadros por segundo, tiempo por cuadro dibujado, saltos, EFB sin recargar, TEV y GPU por pase (0.27.0)"
     grep -h "motor: midiendo el tiempo de GPU\|GL_EXT_disjoint_timer_query" "$DIR/choya-gles.txt" 2>/dev/null | head -2
-    grep -h "motor: cuadros por segundo\|motor: tiempo por cuadro dibujado\|presentación: \|motor: saltos:\|motor: EFB sin recargar" "$DIR/choya-gles.txt" 2>/dev/null | tail -15
+    grep -h "motor: cuadros por segundo\|motor: tiempo por cuadro dibujado\|presentación: \|motor: saltos:\|motor: EFB sin recargar\|motor: TEV " "$DIR/choya-gles.txt" 2>/dev/null | tail -18
     grep -h "motor: GPU por pase" "$DIR/choya-gles.txt" 2>/dev/null | tail -3
     echo "--- hilos y núcleos (cada 10 s: CPU de cada núcleo y de cada hilo, ms por cuadro del juego, espera de turno)"
     grep -h "^hilos" "$DIR/choya-gles.txt" 2>/dev/null | tail -9

@@ -864,14 +864,44 @@ std::string uvec(u32 word) { return "uv4(" + num(word) + ")"; }
 char swz(u8 ch) { return "rgba"[ch & 3]; }
 
 // --- TEV (0.20.9: exacto como aurora, en enteros de 8 bits con desborde) ---
-// CHOYA_GX_TEV=flotante vuelve a la cuenta en flotante de antes (para comparar velocidad o colores).
-bool tev_float() {
-  static const bool on = [] {
+// 0.27.0: en la Mali-G31 el TEV exacto costaba ~25 ms de GPU por cuadro de Wii Sports (76-84 ms exacto, 51-53 en
+// flotante). Por defecto ahora es "mixto": cada programa se cuenta en flotante, con el desborde de 8 bits al leer los
+// registros y el resultado de la última etapa (lo exacto que sí cambia lo que se ve), salvo los programas donde el
+// redondeo de cada etapa puede cambiar el resultado: una etapa sin límite (lo que sale se lee luego con desborde),
+// una comparación del TEV, o la prueba de alfa igual/distinto. Esos siguen exactos. La diferencia en el resto es de
+// un paso de 8 bits como mucho. CHOYA_GX_TEV=exacto (archivo tev-exacto) cuenta todo exacto; CHOYA_GX_TEV=flotante
+// (archivo tev-flotante) todo en flotante, como antes de la 0.20.9.
+enum class TevModo { Flotante, Exacto, Mixto };
+TevModo tev_modo() {
+  static const TevModo m = [] {
     const char* v = std::getenv("CHOYA_GX_TEV");
-    return v != nullptr && std::strcmp(v, "flotante") == 0;
+    if (v != nullptr && std::strcmp(v, "flotante") == 0) return TevModo::Flotante;
+    if (v != nullptr && std::strcmp(v, "exacto") == 0) return TevModo::Exacto;
+    return TevModo::Mixto;
   }();
-  return on;
+  return m;
 }
+bool tev_float() { return tev_modo() == TevModo::Flotante; }
+
+// Por qué un programa necesita el TEV exacto en el modo mixto (0 = no): 1 etapa sin límite, 2 comparación del TEV,
+// 4 prueba de alfa igual/distinto.
+int tev_necesita_exacto(const PipelineDesc& cfg) {
+  int r = 0;
+  const u32 n = std::min<u32>(cfg.tevStageCount, 16);
+  for (u32 i = 0; i < n; ++i) {
+    const auto& st = cfg.stages[i];
+    if (!st.cclamp || !st.aclamp) r |= 1;
+    if (st.cop > GX_TEV_SUB || st.aop > GX_TEV_SUB) r |= 2;
+  }
+  auto eq = [](u8 c) { return c == GX_EQUAL || c == GX_NEQUAL; };
+  if (cfg.alphaComp0 != GX_ALWAYS || cfg.alphaComp1 != GX_ALWAYS) {
+    if (eq(cfg.alphaComp0) || eq(cfg.alphaComp1)) r |= 4;
+  }
+  return r;
+}
+struct TevCuenta {
+  uint64_t flotante = 0, exacto = 0, sinLimite = 0, comparacion = 0, pruebaAlfa = 0;
+} g_tevCuenta;
 
 std::string tev_kc(u8 sel) {
   if (sel <= GX_TEV_KCSEL_1_8) return "vec3(" + std::to_string(8 - sel) + ".0 / 8.0)";
@@ -1126,7 +1156,19 @@ ivec4 iv4(uint w) { return ivec4(u[w >> 2u]); }
 void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
   const auto& e = cfg.ext;
   const bool ex = e.valid != 0;
-  const bool exact = !tev_float();
+  const TevModo tevModo = tev_modo();
+  const int porQue = tevModo == TevModo::Mixto ? tev_necesita_exacto(cfg) : 0;
+  const bool exact = tevModo == TevModo::Exacto || porQue != 0;
+  const bool mixto = tevModo == TevModo::Mixto && !exact;  // flotante con desborde y última etapa
+  const bool xf8 = tevModo != TevModo::Flotante;          // colores del XF por 8 bits
+  if (exact) {
+    ++g_tevCuenta.exacto;
+    if (porQue & 1) ++g_tevCuenta.sinLimite;
+    if (porQue & 2) ++g_tevCuenta.comparacion;
+    if (porQue & 4) ++g_tevCuenta.pruebaAlfa;
+  } else {
+    ++g_tevCuenta.flotante;
+  }
   // ---------------- vertex shader ----------------
   vs = "#version 320 es\nprecision highp float;\nprecision highp int;\n"
        "uniform highp usampler2D vbuf;\nuniform highp usampler2D abuf;\n"
@@ -1210,7 +1252,7 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
       const std::string amb = cc.ambSrc == GX_SRC_VTX ? vc + ".rgb" : uvec(lay.amb[ch]) + ".rgb";
       rgb = "gx_light(" + num(lay.lights) + ", uw(" + num(lay.lights + 160u + ch) + "), mv.xyz, mv_nrm, " + amb + ", " +
             rgb + ", " + std::to_string(chan_diff_fn(cc)) + ", " + std::to_string(chan_attn_fn(cc)) + ", false)";
-    } else if (exact) {
+    } else if (xf8) {
       rgb = q8(rgb, false);
     }
     if (litA) {
@@ -1218,7 +1260,7 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
       a = "gx_light(" + num(lay.lights) + ", uw(" + num(lay.lights + 162u + ch) + "), mv.xyz, mv_nrm, vec3(" + amb +
           "), vec3(" + a + "), " + std::to_string(chan_diff_fn(cca)) + ", " + std::to_string(chan_attn_fn(cca)) +
           ", true).x";
-    } else if (exact) {
+    } else if (xf8) {
       a = q8(a, true);
     }
     vs += "  " + out + " = vec4(" + rgb + ", " + a + ");\n";
@@ -1446,7 +1488,16 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
                       ac = tev_alpha_arg(cfg, s, i, s.ac), ad = tev_alpha_arg(cfg, s, i, s.ad);
     // Las dos operaciones leen los registros de antes de la etapa.
     fs += "  {\n";
-    if (!exact) {
+    if (mixto) {
+      // 0.27.0: en flotante, pero los registros se leen con el desborde de 8 bits (como en exacto).
+      auto m3 = [&](u8 a, const std::string& x) { return a <= GX_CC_A2 ? "ovf3(" + x + ")" : x; };
+      auto m1 = [&](u8 a, const std::string& x) { return a <= GX_CA_A2 ? "ovf1(" + x + ")" : x; };
+      const std::string ma = m3(s.ca, ca), mb = m3(s.cb, cb), mc = m3(s.cc, cc);
+      fs += "    vec3 c_out = " + tev_op_float(false, s.cop, s.cbias, s.cscale, s.cclamp, ma, mb, mc, cd, ma, mb) + ";\n";
+      fs += "    float a_out = " +
+            tev_op_float(true, s.aop, s.abias, s.ascale, s.aclamp, m1(s.aa, aa), m1(s.ab, ab), m1(s.ac, ac), ad, ma, mb) +
+            ";\n";
+    } else if (!exact) {
       fs += "    vec3 c_out = " + tev_op_float(false, s.cop, s.cbias, s.cscale, s.cclamp, ca, cb, cc, cd, ca, cb) + ";\n";
       fs += "    float a_out = " + tev_op_float(true, s.aop, s.abias, s.ascale, s.aclamp, aa, ab, ac, ad, ca, cb) + ";\n";
     } else {
@@ -1472,7 +1523,7 @@ void build_sources(const PipelineDesc& cfg, std::string& vs, std::string& fs) {
     fs += std::string("    ") + tev_reg(s.cout) + ".rgb = c_out;\n    " + tev_reg(s.aout) + ".a = a_out;\n  }\n";
   }
   // El resultado del TEV es el de la última etapa aunque no escriba en prev.
-  if (exact && cfg.tevStageCount > 0) {
+  if ((exact || mixto) && cfg.tevStageCount > 0) {
     const auto& last = cfg.stages[std::min<u32>(cfg.tevStageCount, 16) - 1];
     if (last.cout != GX_TEVPREV) fs += "  prev.rgb = " + std::string(tev_reg(last.cout)) + ".rgb;\n";
     if (last.aout != GX_TEVPREV) fs += "  prev.a = " + std::string(tev_reg(last.aout)) + ".a;\n";
@@ -4585,6 +4636,16 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
         g_invalTotal.cuadros += v.cuadros;
         g_invalTotal.copias += v.copias;
         v = Invalidaciones{};
+      }
+      {  // 0.27.0: cómo se arma el TEV de los programas (desde el inicio)
+        const auto& t = g_tevCuenta;
+        const TevModo m = tev_modo();
+        log_line("motor: TEV %s: %llu programas en flotante, %llu exactos (%llu con una etapa sin límite, %llu con "
+                 "comparación, %llu con prueba de alfa igual/distinto)",
+                 m == TevModo::Mixto ? "mixto" : m == TevModo::Exacto ? "exacto (tev-exacto)" : "flotante (tev-flotante)",
+                 static_cast<unsigned long long>(t.flotante), static_cast<unsigned long long>(t.exacto),
+                 static_cast<unsigned long long>(t.sinLimite), static_cast<unsigned long long>(t.comparacion),
+                 static_cast<unsigned long long>(t.pruebaAlfa));
       }
       g_tiempos = TiemposMotor{};
     }
