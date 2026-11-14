@@ -1133,6 +1133,19 @@ EDITS = [
      "extern \"C\" __attribute__((weak)) void choya_gx_hilo_memoria_juego(int banco, const void* base, uint64_t size);\n"
      "void InstallAuroraHooks() {\n",
      "hilo GX (RAM del juego, declaración)"),
+    # 0.23.2: con el hilo GX la copia ya va después de lo dibujado (FIFO en orden): GXDrawDone aquí solo hacía esperar
+    # al juego, una vez por copia.
+    ("src/hle/gx/gx_copy.cpp",
+     "    // Match GX FIFO ordering: texture copies observe all prior draws.\n    GXDrawDone();\n",
+     "    // Match GX FIFO ordering: texture copies observe all prior draws.\n"
+     "    // choya: con el hilo GX el FIFO ya da ese orden; GXDrawDone solo haría esperar al juego.\n"
+     "    if (choya_gx_hilo_activo == nullptr || !choya_gx_hilo_activo()) GXDrawDone();\n",
+     "hilo GX (GXCopyTex sin GXDrawDone)"),
+    ("src/hle/gx/gx_copy.cpp",
+     "extern \"C\" void GX__CopyTex_8016fd74(uint32_t da, uint32_t c) {\n",
+     "extern \"C\" __attribute__((weak)) bool choya_gx_hilo_activo();  // choya: hilo GX (aurora)\n"
+     "extern \"C\" void GX__CopyTex_8016fd74(uint32_t da, uint32_t c) {\n",
+     "hilo GX (GXCopyTex sin GXDrawDone, declaración)"),
     ("src/hle/gx/gx_copy.cpp", '#include "runtime_log.h"\n',
      '#include "runtime_log.h"\n'
      'extern "C" bool choya_gx_copias_solo_gpu();  // choya: motor de Choya con Dawn en Null (lib/choya/choya_gx.cpp)\n'
@@ -1737,6 +1750,52 @@ AURORA_EDITS = [
      "    aurora::gfx::texture_replacement::load_tlut(obj_, idx);\n"
      "  }\n",
      "hilo GX (cargar paleta)"),
+    # Copias del EFB sin esperar al hilo GX (0.23.2): en Wii Sports son 19 por cuadro y cada una hacía esperar al juego
+    # a que el hilo GX terminara lo entregado (~4 ms por cuadro). Los cambios del estado de las copias van al hilo GX
+    # en el punto ya entregado (como antes, que cambiaban el estado al momento) y la copia, después de lo dibujado.
+    ("lib/dolphin/gx/GXFrameBuffer.cpp",
+     'void GXSetTexCopySrc(u16 left, u16 top, u16 wd, u16 ht) {\n',
+     'void GXSetTexCopySrc(u16 left, u16 top, u16 wd, u16 ht) {\n  if (::choya::hilo::asincrono()) {  // choya: hilo GX, sin esperar (en el punto ya entregado, como antes)\n    ::choya::hilo::diferir([left, top, wd, ht] { GXSetTexCopySrc(left, top, wd, ht); });\n    return;\n  }\n  CHOYA_HILO_EXCLUSIVO();  // choya: procesador tomado (hilo GX)\n',
+     'hilo GX (copias: GXSetTexCopySrc)'),
+    ("lib/dolphin/gx/GXFrameBuffer.cpp",
+     'void GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap) {\n',
+     'void GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap) {\n  if (::choya::hilo::asincrono()) {  // choya: hilo GX, sin esperar (en el punto ya entregado, como antes)\n    ::choya::hilo::diferir([wd, ht, fmt, mipmap] { GXSetTexCopyDst(wd, ht, fmt, mipmap); });\n    return;\n  }\n  CHOYA_HILO_EXCLUSIVO();  // choya: procesador tomado (hilo GX)\n',
+     'hilo GX (copias: GXSetTexCopyDst)'),
+    ("lib/dolphin/gx/GXFrameBuffer.cpp",
+     'void GXSetDispCopyFrame2Field(u32 mode) {\n',
+     'void GXSetDispCopyFrame2Field(u32 mode) {\n  if (::choya::hilo::asincrono()) {  // choya: hilo GX, sin esperar (en el punto ya entregado, como antes)\n    ::choya::hilo::diferir([mode] { GXSetDispCopyFrame2Field(mode); });\n    return;\n  }\n  CHOYA_HILO_EXCLUSIVO();  // choya: procesador tomado (hilo GX)\n',
+     'hilo GX (copias: GXSetDispCopyFrame2Field)'),
+    ("lib/dolphin/gx/GXFrameBuffer.cpp",
+     'void GXSetCopyClamp(GXFBClamp clamp) {\n',
+     'void GXSetCopyClamp(GXFBClamp clamp) {\n  if (::choya::hilo::asincrono()) {  // choya: hilo GX, sin esperar (en el punto ya entregado, como antes)\n    ::choya::hilo::diferir([clamp] { GXSetCopyClamp(clamp); });\n    return;\n  }\n  CHOYA_HILO_EXCLUSIVO();  // choya: procesador tomado (hilo GX)\n',
+     'hilo GX (copias: GXSetCopyClamp)'),
+    ("lib/dolphin/gx/GXFrameBuffer.cpp",
+     'void GXSetDispCopyGamma(GXGamma gamma) {\n',
+     'void GXSetDispCopyGamma(GXGamma gamma) {\n  if (::choya::hilo::asincrono()) {  // choya: hilo GX, sin esperar (en el punto ya entregado, como antes)\n    ::choya::hilo::diferir([gamma] { GXSetDispCopyGamma(gamma); });\n    return;\n  }\n  CHOYA_HILO_EXCLUSIVO();  // choya: procesador tomado (hilo GX)\n',
+     'hilo GX (copias: GXSetDispCopyGamma)'),
+    ("lib/dolphin/gx/GXFrameBuffer.cpp",
+     'void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) {\n',
+     'void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) {\n  if (::choya::hilo::asincrono()) {  // choya: hilo GX, sin esperar\n    ::choya::hilo::diferir([left, top, wd, ht] { g_gxState.dispCopySrc = {left, top, wd, ht}; });\n    GX_WRITE_RAS_REG(0x49000000u | ((static_cast<u32>(top) & 0x3ffu) << 10) | (static_cast<u32>(left) & 0x3ffu));\n    GX_WRITE_RAS_REG(0x4a000000u | (((static_cast<u32>(ht) - 1u) * 0x400u) & 0x000ffc00u) |\n                     ((static_cast<u32>(wd) - 1u) & 0x3ffu));\n    return;\n  }\n  CHOYA_HILO_EXCLUSIVO();  // choya: procesador tomado (hilo GX)\n',
+     'hilo GX (copias: GXSetDispCopySrc)'),
+    ("lib/dolphin/gx/GXFrameBuffer.cpp",
+     'void GXSetDispCopyDst(u16 wd, u16 ht) {\n',
+     'void GXSetDispCopyDst(u16 wd, u16 ht) {\n  if (::choya::hilo::asincrono()) {  // choya: hilo GX, sin esperar\n    ::choya::hilo::diferir([wd, ht] {\n      g_gxState.dispCopyDstWidth = wd;\n      g_gxState.dispCopyDstHeight = ht;\n    });\n    GX_WRITE_RAS_REG(0x4d000000u | ((((static_cast<u32>(wd) & 0x7fffu) << 1) >> 5) & 0x3ffu));\n    return;\n  }\n  CHOYA_HILO_EXCLUSIVO();  // choya: procesador tomado (hilo GX)\n',
+     'hilo GX (copias: GXSetDispCopyDst)'),
+    ("lib/dolphin/gx/GXFrameBuffer.cpp",
+     'void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[7]) {\n',
+     'void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[7]) {\n  if (::choya::hilo::asincrono() && (sample_pattern != nullptr || !aa) && (vfilter != nullptr || !vf)) {\n    // choya: hilo GX, sin esperar. Todo sale de los argumentos: el estado va al hilo GX y los registros al FIFO.\n    struct Filtro {\n      GXBool aa;\n      GXBool vf;\n      decltype(g_gxState.copyFilterSamplePattern) sp;\n      decltype(g_gxState.copyFilterVFilter) v;\n    } f{aa, vf, {}, {}};\n    for (size_t i = 0; i < f.sp.size(); ++i) {\n      if (aa) {\n        f.sp[i][0] = sample_pattern[i][0];\n        f.sp[i][1] = sample_pattern[i][1];\n      } else {\n        f.sp[i] = {6, 6};\n      }\n    }\n    if (vf) {\n      for (size_t i = 0; i < f.v.size(); ++i) f.v[i] = vfilter[i];\n    } else {\n      f.v = {0, 0, 21, 22, 21, 0, 0};\n    }\n    ::choya::hilo::diferir([f] {\n      g_gxState.copyFilterAa = f.aa;\n      g_gxState.copyFilterVf = f.vf;\n      g_gxState.copyFilterSamplePattern = f.sp;\n      g_gxState.copyFilterVFilter = f.v;\n    });\n    GX_WRITE_RAS_REG(pack_copy_filter_samples(0x01, f.sp, 0));\n    GX_WRITE_RAS_REG(pack_copy_filter_samples(0x02, f.sp, 6));\n    GX_WRITE_RAS_REG(pack_copy_filter_samples(0x03, f.sp, 12));\n    GX_WRITE_RAS_REG(pack_copy_filter_samples(0x04, f.sp, 18));\n    GX_WRITE_RAS_REG(pack_copy_filter0(f.v));\n    GX_WRITE_RAS_REG(pack_copy_filter1(f.v));\n    __gx->bpSent = 0;\n    return;\n  }\n  CHOYA_HILO_EXCLUSIVO();  // choya: procesador tomado (hilo GX)\n',
+     'hilo GX (copias: GXSetCopyFilter)'),
+    ("lib/dolphin/gx/GXFrameBuffer.cpp",
+     'void GXCopyTex(void* dest, GXBool clear) {\n',
+     'void GXCopyTex(void* dest, GXBool clear) {\n  if (::choya::hilo::asincrono()) {  // choya: hilo GX, sin esperar: la copia va después de lo dibujado (FIFO cerrado)\n    ::choya::hilo::diferir_tras_fifo([dest, clear] { GXCopyTex(dest, clear); });\n    return;\n  }\n  CHOYA_HILO_EXCLUSIVO();  // choya: procesador tomado (hilo GX)\n',
+     'hilo GX (copias: GXCopyTex)'),
+    ("lib/dolphin/gx/GXFrameBuffer.cpp",
+     "  // Texture copies must see all earlier draws and state changes.\n"
+     "  if (aurora::gx::fifo::get_buffer_size() != 0) {\n",
+     "  // Texture copies must see all earlier draws and state changes.\n"
+     "  // choya: en el hilo GX ya se procesó lo anterior; el FIFO de la API es del hilo del juego.\n"
+     "  if (!::choya::hilo::en_hilo() && aurora::gx::fifo::get_buffer_size() != 0) {\n",
+     "hilo GX (copias: GXCopyTex en el hilo GX)"),
     ("lib/aurora.cpp", 'extern "C" bool choya_gx_sin_gpu();  // choya: motor GLES encendido y Dawn sin dibujar (lib/choya/choya_gx.cpp)\n',
      'extern "C" bool choya_gx_sin_gpu();  // choya: motor GLES encendido y Dawn sin dibujar (lib/choya/choya_gx.cpp)\n'
      '#include "choya/choya_hilo.hpp"  // choya: hilo GX\n',
@@ -1766,10 +1825,10 @@ AURORA_EDITS = [
 # entrar toman el procesador (CHOYA_HILO_EXCLUSIVO: esperan a que el hilo GX termine lo entregado) y corren como
 # antes en el hilo del juego. (archivo, cabecera tras la que va el include, funciones)
 AURORA_EXCLUSIVOS = [
+    # 0.23.2: las copias del EFB y su estado ya no toman el procesador (ver AURORA_EDITS); GXSetCopyClear solo escribe
+    # el FIFO.
     ("lib/dolphin/gx/GXFrameBuffer.cpp", '../../choya/choya_hilo.hpp',
-     ["GXSetDispCopySrc", "GXSetTexCopySrc", "GXSetDispCopyDst", "GXSetTexCopyDst", "GXSetDispCopyFrame2Field",
-      "GXSetCopyClamp", "GXSetDispCopyYScale", "GXSetCopyClear", "GXSetCopyFilter", "GXSetDispCopyGamma",
-      "GXCopyDisp", "GXCopyTex", "GXClearBoundingBox", "GXReadBoundingBox"]),
+     ["GXSetDispCopyYScale", "GXCopyDisp", "GXClearBoundingBox", "GXReadBoundingBox"]),
     ("lib/dolphin/gx/GXCpu2Efb.cpp", '../../choya/choya_hilo.hpp', ["GXPeekZ"]),
     ("lib/dolphin/gx/GXAurora.cpp", '../../choya/choya_hilo.hpp',
      ["AuroraSetViewportPolicy", "AuroraSetViewportFixedAspect", "AuroraGetRenderSize", "AuroraGetPictureSize",
@@ -1887,6 +1946,8 @@ AURORA_STRIPS = [("lib/gfx/common.cpp", s) for s in _capture_payloads()] + [
     ("cmake/aurora_gx.cmake", "        lib/choya/choya_gx_core.cpp\n"),
     ("cmake/aurora_gx.cmake", "        lib/choya/choya_gx.cpp\n"),
     ("cmake/aurora_gx.cmake", "        lib/choya/choya_hilo.cpp\n"),
+    # 0.23.0-0.23.1 tomaban el procesador en todas las funciones de copias; AURORA_EXCLUSIVOS lo vuelve a poner donde sigue.
+    ("lib/dolphin/gx/GXFrameBuffer.cpp", "\n  CHOYA_HILO_EXCLUSIVO();  // choya: hilo GX"),
 ]
 
 

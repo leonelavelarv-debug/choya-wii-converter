@@ -69,7 +69,14 @@ class AuroraTest(unittest.TestCase):
             cp = leer("lib/gx/command_processor.cpp")
             self.assertIn("::choya::hilo::bp(reg, value);", cp)
             self.assertIn('extern "C" void choya_gx_aplicar_bp(', cp)
-            for rel, nombre in [("lib/dolphin/gx/GXFrameBuffer.cpp", "void GXCopyTex(void* dest, GXBool clear) {"),
+            fb = leer("lib/dolphin/gx/GXFrameBuffer.cpp")  # 0.23.2: las copias del EFB no esperan al hilo GX
+            i = fb.index("void GXCopyTex(void* dest, GXBool clear) {")
+            self.assertIn("::choya::hilo::diferir_tras_fifo([dest, clear] { GXCopyTex(dest, clear); });", fb[i:i + 300])
+            i = fb.index("void GXSetTexCopySrc(u16 left, u16 top, u16 wd, u16 ht) {")
+            self.assertIn("::choya::hilo::diferir([left, top, wd, ht]", fb[i:i + 300])
+            self.assertIn("GX_WRITE_RAS_REG(pack_copy_filter0(f.v));", fb)
+            self.assertNotIn("CHOYA_HILO_EXCLUSIVO();  // choya: hilo GX\n  g_gxState.texCopySrc", fb)
+            for rel, nombre in [("lib/dolphin/gx/GXFrameBuffer.cpp", "void GXCopyDisp(void* dest, GXBool clear) {"),
                                 ("lib/dolphin/gx/GXManage.cpp", "void GXDrawDone() {"),
                                 ("lib/gx/command_processor.cpp", "bool submit_raw_draw("),
                                 ("lib/aurora.cpp", "bool aurora_begin_frame() {")]:
@@ -117,6 +124,7 @@ class AuroraTest(unittest.TestCase):
 class RuntimeTest(unittest.TestCase):
     def test_ediciones_del_runtime(self):
         for rel, marca in [("src/hle/gx/gx_stubs.cpp", "choya_gx_hilo_esperar();"),
+                           ("src/hle/gx/gx_copy.cpp", "if (choya_gx_hilo_activo == nullptr || !choya_gx_hilo_activo()) GXDrawDone();"),
                            ("src/hle/gx/gx_guest_write_hooks.cpp", "choya_gx_hilo_memoria_juego(i, ")]:
             with open(os.path.join(RUNTIME, rel), encoding="utf-8") as f:
                 text = f.read()

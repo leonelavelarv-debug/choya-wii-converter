@@ -38,6 +38,15 @@ inline void diferir(const F& f) noexcept {
   static_assert(alignof(F) <= 16, "alineación de más");
   cierre([](const void* d) { (*static_cast<const F*>(d))(); }, &f, sizeof(F));
 }
+// Trabajo del procesador que va después de lo dibujado hasta ahora (como GXCopyTex, que antes vaciaba el FIFO
+// primero): cierra el tramo pendiente del FIFO y se encola detrás.
+void cierre_tras_fifo(Cierre fn, const void* datos, size_t size) noexcept;
+template <class F>
+inline void diferir_tras_fifo(const F& f) noexcept {
+  static_assert(std::is_trivially_copyable_v<F>, "el cierre se copia byte a byte");
+  static_assert(alignof(F) <= 16, "alineación de más");
+  cierre_tras_fifo([](const void* d) { (*static_cast<const F*>(d))(); }, &f, sizeof(F));
+}
 
 // Toma el procesador para el hilo del juego: entrega lo cerrado, espera a que el hilo GX termine y deja que el código
 // de aurora corra como antes (drain() procesa en este hilo) hasta el fin del alcance.
@@ -64,6 +73,7 @@ extern "C" void choya_gx_aplicar_bp(uint8_t reg, uint32_t value);
 extern "C" void choya_gx_procesar_lista(const uint8_t* data, uint32_t nbytes, bool bigEndian);
 // Para el runtime y aurora.cpp (sin incluir este archivo).
 extern "C" bool choya_gx_hilo_en_hilo();
+extern "C" bool choya_gx_hilo_activo();
 extern "C" void choya_gx_hilo_esperar();
 // El runtime dice dónde está la RAM del juego (banco 0: MEM1, 1: MEM2): las listas de ahí no se copian.
 extern "C" void choya_gx_hilo_memoria_juego(int banco, const void* base, uint64_t size);

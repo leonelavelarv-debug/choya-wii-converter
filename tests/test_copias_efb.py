@@ -66,7 +66,7 @@ class TestCopiasEfb(unittest.TestCase):
             src = f.read()
         changes = []
         out = R.apply_edits(src, "src/hle/gx/gx_copy.cpp", changes)
-        self.assertEqual([c.kind for c in changes], ["edicion"] * 4)
+        self.assertEqual([c.kind for c in changes], ["edicion"] * 6)  # 4 de las copias y 2 del hilo GX (0.23.2)
         with tempfile.TemporaryDirectory() as d:
             cpp = os.path.join(d, "t.cpp")
             exe = os.path.join(d, "t")
@@ -99,7 +99,7 @@ class TestCopiasEfb(unittest.TestCase):
             saved, saved_ex = R.AURORA_EDITS, R.AURORA_EXCLUSIVOS
             R.AURORA_EXCLUSIVOS = []
             try:
-                R.AURORA_EDITS = [e for e in saved if e[0] == rel]
+                R.AURORA_EDITS = [e for e in saved if e[0] == rel and not e[3].startswith("hilo GX")]
                 self.assertEqual(len(R.AURORA_EDITS), 2)
                 changes = []
                 R.patch_aurora(d, changes)

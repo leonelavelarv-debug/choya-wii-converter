@@ -357,6 +357,12 @@ void cierre(Cierre fn, const void* datos, size_t size) noexcept {
   obra().tramos.push_back(Tramo{Tipo::Cierre, 0, off, static_cast<uint32_t>(size), fn, nullptr});
 }
 
+void cierre_tras_fifo(Cierre fn, const void* datos, size_t size) noexcept {
+  cerrar_fifo();
+  cierre(fn, datos, size);
+  tal_vez_entregar();
+}
+
 Exclusivo::Exclusivo(const char* quien) noexcept {
   if (!activo() || t_enHilo || !es_productor()) return;
   tomado_ = true;
@@ -429,6 +435,7 @@ int tid_gx() noexcept { return g_tidGx.load(); }
 } // namespace choya::hilo
 
 extern "C" bool choya_gx_hilo_en_hilo() { return choya::hilo::en_hilo(); }
+extern "C" bool choya_gx_hilo_activo() { return choya::hilo::activo(); }
 extern "C" void choya_gx_hilo_memoria_juego(int banco, const void* base, uint64_t size) {
   if (banco < 0 || banco > 1 || base == nullptr || size == 0) return;
   const auto ini = reinterpret_cast<uintptr_t>(base);

@@ -7,6 +7,7 @@
 #include <dolphin/gx.h>
 #include <dolphin/mtx.h>
 
+#include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <cmath>
@@ -166,7 +167,8 @@ void estado_inicial() {
   GXSetProjection(proj, GX_PERSPECTIVE);
 }
 
-bool g_reemplazos = false;  // BANCO_REEMPLAZOS=1: el reemplazo de texturas de aurora encendido (el runtime lo enciende)
+bool g_reemplazos = false;
+int g_copias = 0;  // BANCO_COPIAS=19: copias del EFB por cuadro, como Wii Sports  // BANCO_REEMPLAZOS=1: el reemplazo de texturas de aurora encendido (el runtime lo enciende)
 
 // Un cuadro del "juego". noinline para que callgrind --toggle-collect lo encuentre.
 __attribute__((noinline)) void banco_cuadro(int frame) {
@@ -184,6 +186,17 @@ __attribute__((noinline)) void banco_cuadro(int frame) {
       const auto fin = std::chrono::steady_clock::now() + std::chrono::nanoseconds(static_cast<int64_t>(juegoUs * 1000));
       while (std::chrono::steady_clock::now() < fin) {
       }
+    }
+    if (g_copias > 0 && m % (1350 / g_copias) == 0) {  // BANCO_COPIAS: copias del EFB entre dibujos (iconos)
+      static u8 destinos[32][64 * 64 * 4] __attribute__((aligned(32)));
+      static u8 muestras[12][2] = {{6, 6}, {6, 6}, {6, 6}, {6, 6}, {6, 6}, {6, 6},
+                                   {6, 6}, {6, 6}, {6, 6}, {6, 6}, {6, 6}, {6, 6}};
+      static u8 vertical[7] = {0, 0, 21, 22, 21, 0, 0};
+      GXSetTexCopySrc(static_cast<u16>((m * 7) % 512), 64, 64, 64);
+      GXSetTexCopyDst(64, 64, GX_TF_RGBA8, GX_FALSE);
+      GXSetCopyFilter(GX_FALSE, muestras, GX_TRUE, vertical);
+      GXCopyTex(destinos[(m / (1350 / g_copias)) % 32], GX_FALSE);
+      GXSetCopyFilter(GX_FALSE, muestras, GX_FALSE, vertical);
     }
     GXLoadTexObj(&g_texObjs[(m + frame) % 40], GX_TEXMAP0);
     GXApplyBPReg(0x0F, 0);  // como el runtime con un registro BP suelto (máscara indirecta: sin efecto aquí)
@@ -255,6 +268,7 @@ int main(int argc, char** argv) {
   config.logCallback = log_cb;
   config.logLevel = LOG_WARNING;
   g_reemplazos = std::getenv("BANCO_REEMPLAZOS") != nullptr;
+  g_copias = std::getenv("BANCO_COPIAS") ? std::min(std::atoi(std::getenv("BANCO_COPIAS")), 1350) : 0;
   config.allowTextureReplacements = g_reemplazos;
   aurora_initialize(argc, argv, &config);
   static u8 fifo[1 << 20] __attribute__((aligned(32)));
