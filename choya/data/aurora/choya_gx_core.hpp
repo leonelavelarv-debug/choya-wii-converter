@@ -108,6 +108,9 @@ void debug_skip_draw(int index) noexcept;
 bool debug_read_copy(uint64_t id, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height) noexcept;
 // Desde el inicio: grupos de lotes sin mostrarse, esperas con la cola llena, copias únicas perdidas (pruebas).
 void queue_stats(uint64_t out[3]) noexcept;
+// 0.25.0 (pruebas): borrados avisados al driver sin leer el color, sin leer la profundidad, cuadros que terminan sin
+// guardar el EFB, borrados que no se pudieron avisar (algo lee fuera de la zona borrada). Desde el inicio.
+void efb_invalidation_stats(uint64_t out[4]) noexcept;
 // ¿El motor ya hizo esa copia del EFB? (solo desde el hilo que dibuja; pruebas)
 bool has_copy_texture(uint64_t id) noexcept;
 void set_gl_loader(ProcFn fn) noexcept;

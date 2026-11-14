@@ -714,6 +714,42 @@ int main(int argc, char** argv) {
                 read7 ? rgba7[2] : -1, unique ? "hecha" : "sin hacer");
   }
   ok = ok && skipped && unique;
+
+  // Cuadro 8 (0.25.0): EFB sin recargar. El EFB es más alto que la pantalla (640x528, como el 674x556 de Wii Sports)
+  // y el borrado tapa solo los 640x480 de arriba. Si lo que sigue lee adentro (una copia y la pantalla), el borrado se
+  // avisa al driver; si una copia lee la franja de abajo (fuera del borrado), no, y esa copia sale roja.
+  gx::register_clear(500, gx::ClearDesc{1, 1, 1, 0});
+  uint64_t inv0[4];
+  gx::efb_invalidation_stats(inv0);
+  const float red8[4] = {1, 0, 0, 1};
+  auto frame8 = [&](bool leeFuera) {
+    gx::capture_begin(v5.data(), v5.size(), u4.data(), u4.size(), (const uint8_t*)i5.data(), i5.size() * 2, nullptr, 0);
+    gx::capture_pass(640, 528, true, true, red8, 0.f, false, gx::Rect{0, 0, 0, 0});
+    gx::capture_copy(640, gx::Rect{0, 0, 640, 480}, 16, 16, 0x6, false);
+    gx::capture_pass(640, 528, false, false, black, 0.f, false, gx::Rect{0, 0, 0, 0});
+    gx::capture_clear(500, blue7, 0.25f, true, gx::Rect{0, 0, 640, 480});
+    gx::capture_copy(641, leeFuera ? gx::Rect{0, 480, 32, 32} : gx::Rect{0, 0, 32, 32}, 16, 16, 0x6, false);
+    gx::capture_pass(640, 528, false, false, black, 0.f, true, gx::Rect{0, 0, 640, 480});
+    gx::capture_end();
+    gx::draw_frame(640, 480);
+  };
+  frame8(false);
+  uint64_t inv1[4];
+  gx::efb_invalidation_stats(inv1);
+  frame8(true);
+  uint64_t inv2[4];
+  gx::efb_invalidation_stats(inv2);
+  std::vector<uint8_t> rgba8;
+  uint32_t w8 = 0, h8 = 0;
+  const bool rojo = gx::debug_read_copy(641, rgba8, w8, h8) && rgba8.size() >= 4 && rgba8[0] == 255 && rgba8[2] == 0;
+  const bool seguro = inv1[0] == inv0[0] + 1 && inv1[1] == inv0[1] + 1 && inv1[2] == inv0[2] + 1 && inv1[3] == inv0[3];
+  const bool noSeguro = inv2[0] == inv1[0] && inv2[1] == inv1[1] && inv2[3] == inv1[3] + 1 && inv2[2] == inv1[2] + 1;
+  std::printf("invalidar: seguro %llu %llu %llu %llu; lee fuera %llu %llu %llu %llu; copia de abajo %s\n",
+              (unsigned long long)(inv1[0] - inv0[0]), (unsigned long long)(inv1[1] - inv0[1]),
+              (unsigned long long)(inv1[2] - inv0[2]), (unsigned long long)(inv1[3] - inv0[3]),
+              (unsigned long long)(inv2[0] - inv1[0]), (unsigned long long)(inv2[1] - inv1[1]),
+              (unsigned long long)(inv2[2] - inv1[2]), (unsigned long long)(inv2[3] - inv1[3]), rojo ? "roja" : "mal");
+  if (std::getenv("CHOYA_GX_INVALIDAR") == nullptr) ok = ok && seguro && noSeguro && rojo;
   std::puts(ok ? "PRUEBA OK" : "PRUEBA FALLÓ");
   return ok ? 0 : 1;
 }

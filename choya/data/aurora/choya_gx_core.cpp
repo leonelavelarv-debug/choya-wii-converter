@@ -179,6 +179,7 @@ struct Gl {
   // Opcionales: caché de programas en disco (GLES 3.0, como el caché de shaders que galaxy-vita trae listo).
   void (*GetProgramBinary)(GLuint, GLsizei, GLsizei*, GLenum*, void*);
   void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);  // opcional: volcados
+  void (*InvalidateFramebuffer)(GLenum, GLsizei, const GLenum*);  // opcional (GLES 3.0): EFB sin recargar
   void (*ProgramBinary)(GLuint, GLenum, const void*, GLsizei);
   void (*ProgramParameteri)(GLuint, GLenum, GLint);
   const unsigned char* (*GetString)(GLenum);
@@ -278,6 +279,8 @@ bool load_gl() {
     gl.ProgramParameteri = reinterpret_cast<decltype(gl.ProgramParameteri)>(g_loader("glProgramParameteri"));
     gl.GetString = reinterpret_cast<decltype(gl.GetString)>(g_loader("glGetString"));
     gl.ReadPixels = reinterpret_cast<decltype(gl.ReadPixels)>(g_loader("glReadPixels"));
+    gl.InvalidateFramebuffer =
+        reinterpret_cast<decltype(gl.InvalidateFramebuffer)>(g_loader("glInvalidateFramebuffer"));
   }
   return ok;
 }
@@ -392,6 +395,71 @@ void copia_hecha(uint64_t id) {
 bool copia_de_siempre(uint64_t id) {
   const auto it = g_histCopias.find(id);
   return it != g_histCopias.end() && it->second.veces >= 3 && g_gruposDibujados - it->second.ultimo <= 3;
+}
+
+// --- EFB sin recargar (0.25.0) ----------------------------------------------------------------------------------
+// La Mali dibuja por mosaicos: cada vez que el motor deja el EFB (una copia del EFB, la copia a la pantalla) guarda
+// el color y la profundidad en la memoria (674x556: unos 3 MB) y al volver los vuelve a leer. Wii Sports hace 19
+// copias por cuadro, y casi todas las que empiezan una escena van seguidas de un borrado de toda la zona útil: el
+// driver lee el EFB entero para luego pintarlo encima. Si el motor le avisa antes (glInvalidateFramebuffer), no lo
+// lee. Solo se avisa cuando es seguro: el grupo de cuadros empieza borrando el EFB (como la Wii, cada cuadro), y
+// nada de lo que queda del cuadro lee fuera de la zona borrada (copias del EFB y copia a la pantalla). Al terminar el
+// cuadro tampoco hace falta guardar el EFB (el siguiente lo borra al empezar). CHOYA_GX_INVALIDAR=0 (archivo
+// sin-invalidar-efb) lo apaga.
+bool invalidar_activo() {
+  static const bool on = [] {
+    const char* e = std::getenv("CHOYA_GX_INVALIDAR");
+    return e == nullptr || std::strcmp(e, "0") != 0;
+  }();
+  return on && gl.InvalidateFramebuffer != nullptr;
+}
+bool g_grupoBorra = false;  // el grupo del cuadro que se dibuja empieza borrando color y profundidad (draw_frame)
+struct Invalidaciones {
+  uint64_t color = 0, profundidad = 0, finCuadro = 0, noSeguro = 0, cuadros = 0;
+} g_inval, g_invalTotal;  // g_invalTotal: lo de los informes anteriores (para las pruebas)
+
+bool empieza_borrando(const Frame& f) {
+  for (const Item& it : f.items) {
+    if (it.op == Op::Pass) return it.pass.clearColor && it.pass.clearDepth;
+  }
+  return false;
+}
+
+bool rect_dentro(const Rect& a, const Rect& c) {
+  return a.x >= c.x && a.y >= c.y && a.x + a.width <= c.x + c.width && a.y + a.height <= c.y + c.height;
+}
+
+// Para cada borrado del cuadro (con su zona), qué se puede avisar al driver: 1 color, 2 profundidad.
+void planear_invalidaciones(const Frame& f, std::vector<uint8_t>& plan) {
+  plan.assign(f.items.size(), 0);
+  if (!invalidar_activo() || !f.present || !g_grupoBorra) return;
+  for (size_t i = 0; i < f.items.size(); ++i) {
+    const Item& c = f.items[i];
+    if (c.op != Op::Clear || !c.clear.useScissor) continue;
+    const Rect zona = c.clear.scissor;
+    bool leeColorFuera = false, leeAlgoFuera = false;
+    int passW = 0, passH = 0;
+    for (size_t j = i + 1; j < f.items.size() && !leeAlgoFuera; ++j) {
+      const Item& it = f.items[j];
+      if (it.op == Op::Pass) {
+        if (it.pass.clearColor && it.pass.clearDepth) break;  // borra todo el EFB: lo de antes ya no se lee
+        passW = static_cast<int>(it.pass.width);
+        passH = static_cast<int>(it.pass.height);
+        if (it.pass.hasResolve) {
+          const Rect r = it.pass.copy.width > 0 && it.pass.copy.height > 0 ? it.pass.copy : Rect{0, 0, passW, passH};
+          if (!rect_dentro(r, zona)) leeColorFuera = leeAlgoFuera = true;
+        }
+      } else if (it.op == Op::Copy) {
+        if (!rect_dentro(it.copy.rect, zona)) {
+          leeAlgoFuera = true;
+          if ((it.copy.fmt & 0x10) == 0) leeColorFuera = true;
+        }
+      }
+    }
+    // La profundidad vieja fuera de la zona decide qué se pinta ahí: cualquier lectura de afuera la necesita.
+    plan[i] = static_cast<uint8_t>((leeColorFuera ? 0 : 1) | (leeAlgoFuera ? 0 : 2));
+    if (leeAlgoFuera) ++g_inval.noSeguro;
+  }
 }
 
 std::mutex g_pipelineMutex;
@@ -2528,6 +2596,9 @@ void gpu_pases_recoger() {
 void gpu_pases_tramo(int pase, int tipo) {
   auto& g = g_gpuPases;
   if (!g.midiendo) return;
+  // 0.25.0: los tramos se parten solo donde el motor cambia de framebuffer (copias, paletas, pantalla): partirlos
+  // en cada pase le costaba a la Mali (la suma salía 3 veces el cuadro). Lo dibujado se anota al pase en que termina.
+  if (g.abierta && g.n > 0 && g.tramo[g.n - 1].tipo == 0) g.tramo[g.n - 1].pase = static_cast<int16_t>(g.paseActual);
   if (g.abierta) g_gpu.EndQuery(kTimeElapsedExt);
   g.abierta = false;
   if (g.n >= GpuPases::kQ) return;  // demasiados tramos: lo que sigue no se mide
@@ -2561,6 +2632,7 @@ void gpu_cuadro_terminar() {
     gpu_tiempo_terminar();
     return;
   }
+  if (g.abierta && g.n > 0 && g.tramo[g.n - 1].tipo == 0) g.tramo[g.n - 1].pase = static_cast<int16_t>(g.paseActual);
   if (g.abierta) g_gpu.EndQuery(kTimeElapsedExt);
   g.abierta = false;
   g.midiendo = false;
@@ -2902,11 +2974,14 @@ void run_copy(const Item& it) {
   gl.Uniform4f(g_copyProgram.size, static_cast<float>(g_efb.width), static_cast<float>(g_efb.height),
                static_cast<float>(c.texW), static_cast<float>(c.texH));
   gl.Uniform4f(g_copyProgram.mode, static_cast<float>(c.fmt), c.opaque ? 1.f : 0.f, g_reversedZ ? 1.f : 0.f, 0.f);
+  // 0.25.0: cada copia enlaza solo lo que lee (antes el color y la profundidad del EFB siempre): una profundidad
+  // enlazada sin usarse puede obligar al driver a dejarla lista para leerse como textura.
+  const bool deProfundidad = (c.fmt & 0x10) != 0;
   gl.ActiveTexture(kTexture0 + 10);
-  gl.BindTexture(kTexture2D, g_efb.color);
+  gl.BindTexture(kTexture2D, deProfundidad ? g_whiteTexture : g_efb.color);
   gl.BindSampler(10, 0);
   gl.ActiveTexture(kTexture0 + 11);
-  gl.BindTexture(kTexture2D, g_efb.depth);
+  gl.BindTexture(kTexture2D, deProfundidad ? g_efb.depth : g_whiteTexture);
   gl.BindSampler(11, 0);
   gl.DrawArrays(kTriangles, 0, 3);
   copia_hecha(c.tex);
@@ -3065,6 +3140,12 @@ void queue_stats(uint64_t out[3]) noexcept {
   out[0] = g_openFlushes.load();
   out[1] = g_queueWaits.load();
   out[2] = g_lostCopies.load();
+}
+void efb_invalidation_stats(uint64_t out[4]) noexcept {
+  out[0] = g_invalTotal.color + g_inval.color;
+  out[1] = g_invalTotal.profundidad + g_inval.profundidad;
+  out[2] = g_invalTotal.finCuadro + g_inval.finCuadro;
+  out[3] = g_invalTotal.noSeguro + g_inval.noSeguro;
 }
 void set_gl_loader(ProcFn fn) noexcept { g_loader = fn; }
 void set_reversed_z(bool reversed) noexcept { g_reversedZ = reversed; }
@@ -3813,6 +3894,13 @@ bool draw_frame(int screenWidth, int screenHeight) noexcept {
   }
   bool drawn = false;
   for (size_t i = 0; i < batch.size(); ++i) {
+    if (empiezaGrupo[i]) {
+      // Dos grupos seguidos que empiezan borrando: el juego borra el EFB en cada cuadro (ver invalidar_activo).
+      static bool anteriorBorra = false;
+      const bool borra = empieza_borrando(batch[i]);
+      g_grupoBorra = borra && anteriorBorra;
+      anteriorBorra = borra;
+    }
     if (empiezaGrupo[i]) ++g_gruposDibujados;  // las copias de este grupo quedan con este número
     drawn = draw_frame_locked(batch[i], screenWidth, screenHeight, i + 1 == batch.size());
   }
@@ -4183,13 +4271,17 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     }
   };
   int debugDrawIndex = 0;
-  for (const Item& it : f.items) {
+  static std::vector<uint8_t> plan;
+  planear_invalidaciones(f, plan);
+  ++g_inval.cuadros;
+  for (size_t itemIndex = 0; itemIndex < f.items.size(); ++itemIndex) {
+    const Item& it = f.items[itemIndex];
     switch (it.op) {
     case Op::Pass: {
       mali_mark(kMaliDibujos);  // lo dibujado en el pase anterior
       end_pass();
       ++g_stats.passes;
-      gpu_pases_tramo(passIndex + 1, 0);
+      g_gpuPases.paseActual = passIndex + 1;  // 0.25.0: sin partir aquí (no cambia el framebuffer)
       passOpen = true;
       passResolves = it.pass.hasResolve != 0;
       passW = it.pass.width ? static_cast<int>(it.pass.width) : efbW;
@@ -4285,6 +4377,20 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       set_color_mask(cc.color != 0, cc.alpha != 0);
       set_depth_mask(cc.depth != 0);
       mali_mark(kMaliDibujos);
+      {  // 0.25.0: el driver no recarga lo que este borrado va a tapar (ver planear_invalidaciones)
+        GLenum att[2];
+        GLsizei na = 0;
+        const uint8_t pl = plan[itemIndex];
+        if ((pl & 1) && cc.color && cc.alpha) {
+          att[na++] = kColorAttachment0;
+          ++g_inval.color;
+        }
+        if ((pl & 2) && cc.depth) {
+          att[na++] = kDepthStencilAttachment;
+          ++g_inval.profundidad;
+        }
+        if (na > 0) gl.InvalidateFramebuffer(kFramebuffer, na, att);
+      }
       if ((cc.color || cc.alpha || cc.depth) && clear_by_draw()) {
         const GLint full[4] = {0, 0, g_efb.width, g_efb.height};
         set_viewport(full);  // gl_FragDepth no depende del rango de profundidad: no se toca
@@ -4380,6 +4486,12 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     presented = true;
     mali_mark(kMaliPantalla);
   }
+  if (invalidar_activo() && f.present && g_grupoBorra) {
+    // 0.25.0: el siguiente grupo empieza borrando el EFB: no hace falta guardarlo en la memoria.
+    const GLenum att[2] = {kColorAttachment0, kDepthStencilAttachment};
+    gl.InvalidateFramebuffer(kFramebuffer, 2, att);
+    ++g_inval.finCuadro;
+  }
   gl.BindFramebuffer(kFramebuffer, 0);
   gl.Disable(kScissorTest);
   gl.ColorMask(1, 1, 1, 1);
@@ -4438,6 +4550,23 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
                  static_cast<double>(z.saltados) / segundos, static_cast<double>(z.porUnicas) / segundos, ejemplo,
                  static_cast<double>(z.porSinBorrar) / segundos);
         z = SaltosMotor{};
+      }
+      {  // 0.25.0
+        auto& v = g_inval;
+        const double c = std::max<double>(static_cast<double>(v.cuadros), 1.0);
+        log_line("motor: EFB sin recargar: %s; por cuadro: %.1f borrados sin leer el color, %.1f sin leer la "
+                 "profundidad, %.1f no se pudo (algo lee fuera del borrado); el EFB sin guardar al terminar en el "
+                 "%.0f %% de los cuadros",
+                 invalidar_activo() ? "encendido" : (gl.InvalidateFramebuffer ? "apagado (sin-invalidar-efb)"
+                                                                               : "el driver no tiene glInvalidateFramebuffer"),
+                 static_cast<double>(v.color) / c, static_cast<double>(v.profundidad) / c,
+                 static_cast<double>(v.noSeguro) / c, 100.0 * static_cast<double>(v.finCuadro) / c);
+        g_invalTotal.color += v.color;
+        g_invalTotal.profundidad += v.profundidad;
+        g_invalTotal.finCuadro += v.finCuadro;
+        g_invalTotal.noSeguro += v.noSeguro;
+        g_invalTotal.cuadros += v.cuadros;
+        v = Invalidaciones{};
       }
       g_tiempos = TiemposMotor{};
     }

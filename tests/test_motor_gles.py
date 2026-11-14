@@ -61,6 +61,7 @@ class TestMotorGles(unittest.TestCase):
             if "GL_EXT_disjoint_timer_query)" in log and "midiendo el tiempo de GPU por pase" in log:
                 self.assertRegex(log, r"motor: GPU por pase \(\d+ cuadros medidos; suma [\d.]+ ms por cuadro\): "
                                       r"dibujos [\d.]+, copias del EFB [\d.]+, pantalla [\d.]+")
+            self.assertRegex(log, r"motor: EFB sin recargar: (encendido|el driver no tiene); por cuadro: [\d.]+ borrados")
             self.assertNotIn("memoria de la Mali por partes", log)  # 0.24.0: apagada salvo CHOYA_GX_MALI=1
             # Caché de programas en disco: la primera vez compila y guarda, la segunda carga los binarios y dibuja igual.
             cache = os.path.join(d, "cache")
