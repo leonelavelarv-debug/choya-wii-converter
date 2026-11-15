@@ -20,6 +20,7 @@ WC="${1:-$HOME/BrawlRecompiled/wiicompiled}"
 LOG="$HOME/choya-build-arm64.log"
 IMG=choya-wiicompiled-arm64
 BUILD=build-wiisports-arm64
+VERSION_CHOYA=$(grep -m1 '^version' "$CHOYA/pyproject.toml" | cut -d'"' -f2)
 OPT_MODO="${CHOYA_OPT:-}"
 OPT_FLAGS=""
 OPT_ENLACE=""
@@ -92,7 +93,7 @@ echo "Memoria ${MEM_GB} GB → ${JOBS} trabajos a la vez" | tee -a "$LOG"
 # KNULLI no tiene X11, Wayland ni /dev/dri: SDL3 se compila "de consola" (ventana offscreen por ahora).
 rm -rf "$WC/$BUILD/_deps/dawn-"*
 # 0.30.0: el binario lleva el modo (sale en el log de la consola aunque falte compilado.txt).
-COMPILADO="$OPT_MODO${SELLO_PGO:+ (perfil $SELLO_PGO)}"
+COMPILADO="$OPT_MODO${SELLO_PGO:+ (perfil $SELLO_PGO)}; Choya $VERSION_CHOYA"
 docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$WC":"$WC" -w "$WC" "$IMG" bash -c "
   cmake -S runtime-wiisports -B $BUILD -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE=/opt/choya/aarch64-clang.cmake \
@@ -175,8 +176,13 @@ case "$OPT_MODO" in
   pgo|pgo-O3) echo "$OPT_MODO (perfil $(cat "$WC/$BUILD/choya-perfil.txt" 2>/dev/null))" ;;
   *) echo "$OPT_MODO" ;;
 esac > "$PORT/wiisports-choya/compilado.txt"
+# 0.31.2: qué versión es el port y cuándo se armó (el resumen de la consola lo muestra en la primera línea, y
+# scripts/copiar-a-consola.ps1 lo compara después de copiar).
+echo "Choya $VERSION_CHOYA, armado el $(date '+%d/%m/%Y %H:%M:%S')" > "$PORT/wiisports-choya/version.txt"
 ls -la "$PORT/wiisports-choya" "$PORT/wiisports-choya/lib" | tee -a "$LOG"
 du -sh "$PORT" | tee -a "$LOG"
 rm -rf /mnt/c/Users/Public/choya-port && cp -r "$PORT" /mnt/c/Users/Public/choya-port \
   && echo "Listo: C:\\Users\\Public\\choya-port" | tee -a "$LOG"
 cp "$LOG" /mnt/c/Users/Public/choya-build-arm64.log 2>/dev/null
+echo "Para pasarlo a la consola (PowerShell, con la tarjeta en la PC):"
+echo "  powershell -ExecutionPolicy Bypass -File \$HOME\\choya-wii-converter\\scripts\\copiar-a-consola.ps1"

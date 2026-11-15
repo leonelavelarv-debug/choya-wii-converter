@@ -4,6 +4,7 @@
 # Modo diagnóstico (3 min, perfil, volcados de cuadros; MENU + R1 vuelca el cuadro que se ve): "Wii Sports (Choya) - diagnostico.sh" o CHOYA_MODO=diagnostico.
 # Deja run.log y resumen.txt en la carpeta wiisports-choya.
 
+LANZADOR_VERSION="0.31.2"  # sube con cada versión de Choya (tests/test_opt_traducido.py lo revisa)
 DIR="$(cd "$(dirname "$0")" && pwd)/wiisports-choya"
 cd "$DIR" || exit 1
 rm -f "$DIR/resumen.txt"  # que nunca quede uno viejo de otra corrida
@@ -162,6 +163,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
 
 escribir_resumen() {
   {
+    echo "choya: lanzador $LANZADOR_VERSION; port $(cat "$DIR/version.txt" 2>/dev/null || echo "sin version.txt (anterior a 0.31.2)")"
     echo "modo: $MODO"
     echo "codigo de salida: ${STATUS:-sigue corriendo} (124 = siguio corriendo hasta el limite del modo diagnostico)"
     [ -f "$DIR/perfil.txt" ] && echo "perfil.txt: $(grep -m1 '^muestras' "$DIR/perfil.txt"), escrito el $(date -r "$DIR/perfil.txt" '+%d/%m %H:%M' 2>/dev/null), hilo del juego $(awk '/^hilo_juego/{print $2}' "$DIR/perfil.txt")"

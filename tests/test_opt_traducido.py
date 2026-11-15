@@ -192,3 +192,27 @@ class GuardadoDelPerfil(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VersionEnLaConsola(unittest.TestCase):
+    """0.31.2: el resumen dice qué lanzador y qué port hay en la consola, y hay un script que copia y comprueba."""
+
+    def test_lanzador_con_la_version_del_paquete(self):
+        import re
+        version = re.search(r'^version = "([^"]+)"', leer(os.path.join(RAIZ, "pyproject.toml")), re.M).group(1)
+        self.assertIn(f'LANZADOR_VERSION="{version}"', leer(LANZADOR))
+        self.assertIn('echo "choya: lanzador $LANZADOR_VERSION; port', leer(LANZADOR))
+
+    def test_port_con_version_txt(self):
+        texto = leer(SCRIPT)
+        self.assertIn('> "$PORT/wiisports-choya/version.txt"', texto)
+        self.assertIn("Choya $VERSION_CHOYA", texto)
+
+    def test_script_de_copia(self):
+        ruta = os.path.join(RAIZ, "scripts", "copiar-a-consola.ps1")
+        with open(ruta, "rb") as f:
+            datos = f.read()
+        self.assertTrue(datos.startswith(b"\xef\xbb\xbf"))  # con BOM: PowerShell 5 lo lee como UTF-8
+        texto = datos.decode("utf-8-sig")
+        for algo in ("/IS /IT", "Get-FileHash", "wiisports-choya\\version.txt", "Wii Sports (Choya).sh"):
+            self.assertIn(algo, texto)
