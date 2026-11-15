@@ -126,6 +126,9 @@ if [ "${CHOYA_PAQUETE:-}" != "0" ] && [ -f "$DIR/assets.wlpk" ]; then
 else
   export CHOYA_PAQUETE=0
 fi
+# PGO (0.29.0): solo la compilación CHOYA_OPT=pgo-generar escribe perfiles (en wiisports-choya/pgo, cada 20 s); en
+# las demás esta variable no hace nada. Los .profraw se copian a la PC para compilar con CHOYA_OPT=pgo.
+export LLVM_PROFILE_FILE="$DIR/pgo/wiisports-%p.profraw"
 mkdir -p "$CHOYA_GX_CACHE"
 rm -f "$DIR/choya-gles.txt" "$DIR/procesador.txt" "$DIR/ultimo-cierre.tar.gz"
 
@@ -134,6 +137,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "--- procesador"
   echo "gobernador: $(cat $CPUF/scaling_governor 2>/dev/null)  MHz actual/max: $(( $(cat $CPUF/scaling_cur_freq 2>/dev/null || echo 0) / 1000 ))/$(( $(cat $CPUF/cpuinfo_max_freq 2>/dev/null || echo 0) / 1000 ))"
   echo "juego: $GAME"
+  echo "código traducido compilado con: $(cat "$DIR/compilado.txt" 2>/dev/null || echo "O2 (port anterior a 0.29.0)")$([ -d "$DIR/pgo" ] && echo "; perfiles PGO guardados: $(ls "$DIR/pgo" 2>/dev/null | wc -l)")"
   echo "PortMaster: ${controlfolder:-no encontrado}  dispositivo: ${DEVICE_NAME:-?}  CFW: ${CFW_NAME:-?}"
   echo "mapeo del mando: ${SDL_GAMECONTROLLERCONFIG:-ninguno}" | cut -c1-200
   echo "efectos de audio: $([ "${CHOYA_SIN_REVERB:-0}" = 1 ] && echo "apagados (para oírlos: archivo con-reverb)" || echo "encendidos (archivo con-reverb)")"
@@ -181,6 +185,7 @@ escribir_resumen() {
     grep -h "motor: midiendo el tiempo de GPU\|GL_EXT_disjoint_timer_query" "$DIR/choya-gles.txt" 2>/dev/null | head -2
     grep -h "motor: cuadros por segundo\|motor: tiempo por cuadro dibujado\|presentación: \|motor: saltos:\|motor: EFB sin recargar\|motor: TEV \|motor: copias del EFB:" "$DIR/choya-gles.txt" 2>/dev/null | tail -21
     grep -h "motor: GPU por pase" "$DIR/choya-gles.txt" 2>/dev/null | tail -3
+    grep -hE "pgo: " "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | sort -u | tail -3
     echo "--- hilos y núcleos (cada 10 s: CPU de cada núcleo y de cada hilo, ms por cuadro del juego, espera de turno)"
     grep -h "^hilos" "$DIR/choya-gles.txt" 2>/dev/null | tail -9
     echo "--- núcleos"

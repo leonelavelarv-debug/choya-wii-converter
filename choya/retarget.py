@@ -1172,6 +1172,18 @@ EDITS = [
     ("cmake/PublicProducts.cmake", "    set(MKW_BASELINE_ARCH_FLAG -mcpu=native)",
      "    set(MKW_BASELINE_ARCH_FLAG -mcpu=cortex-a53)  # choya: RG35XX H (Allwinner H700, Cortex-A53)",
      "procesador de la consola"),
+    # Optimización del código traducido (CHOYA_OPT en build-wiisports-arm64.sh): opciones extra al final, así
+    # -O3 gana sobre -O2; con PGO van -fprofile-generate o -fprofile-use. Vacío = igual que WiiCompiled.
+    ("cmake/PublicProducts.cmake", "        -O2 ${MKW_TRANSLATED_PPC_FP_OPTIONS} -fno-slp-vectorize -w -pipe)\n",
+     "        -O2 ${MKW_TRANSLATED_PPC_FP_OPTIONS} -fno-slp-vectorize -w -pipe\n"
+     "        ${CHOYA_OPT_TRADUCIDO})  # choya: -O3 o PGO para el código traducido\n",
+     "optimización del código traducido (CHOYA_OPT)"),
+    ("cmake/PublicProducts.cmake", "mkw_configure_product(WiiCompiled)\n",
+     "mkw_configure_product(WiiCompiled)\n"
+     "if(CHOYA_ENLACE_EXTRA)  # choya: runtime de perfiles (PGO) para el binario de la consola\n"
+     "    target_link_libraries(WiiCompiled PRIVATE ${CHOYA_ENLACE_EXTRA})\n"
+     "endif()\n",
+     "enlace del runtime de perfiles (PGO)"),
 ]
 
 

@@ -31,6 +31,7 @@
 #include <dirent.h>
 #include <map>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <vector>
 
@@ -41,6 +42,8 @@
 extern "C" bool choya_gx_draw_frame(int screenWidth, int screenHeight);  // motor de Choya (aurora)
 extern "C" void choya_gx_request_dump();  // volcado del siguiente cuadro (aurora)
 extern "C" int choya_medir_empezar(int seconds);  // medición por tramos (choya_perfil.cpp)
+// Runtime de perfiles de Clang: solo existe en la compilación CHOYA_OPT=pgo-generar (si no, es nulo).
+extern "C" int __llvm_profile_write_file(void) __attribute__((weak));
 
 namespace {
 
@@ -603,6 +606,27 @@ extern "C" void choya_gles_wake() {
     g_threadCv.notify_one();
 }
 
+// PGO (CHOYA_OPT=pgo-generar): el juego casi nunca sale por exit(), así que el perfil se escribe cada 20 s en
+// LLVM_PROFILE_FILE (el lanzador lo pone en wiisports-choya/pgo/). Cada escritura reemplaza a la anterior con los
+// contadores acumulados, así que basta con jugar y salir de cualquier forma.
+static void EscribirPerfilPgo() {
+    pthread_setname_np(pthread_self(), "choya-pgo");
+    const char* archivo = std::getenv("LLVM_PROFILE_FILE");
+    std::string dir = archivo ? archivo : "";
+    const size_t barra = dir.rfind('/');
+    dir = barra == std::string::npos ? std::string() : dir.substr(0, barra);
+    if (!dir.empty()) mkdir(dir.c_str(), 0755);
+    const char* cada = std::getenv("CHOYA_PGO_CADA");
+    const int segundos = cada ? std::max(5, std::atoi(cada)) : 20;
+    Log("pgo: compilación que toma el perfil; se guarda cada %s s en %s", std::to_string(segundos).c_str(),
+        archivo ? archivo : "default.profraw");
+    for (int n = 1;; ++n) {
+        std::this_thread::sleep_for(std::chrono::seconds(segundos));
+        const int r = __llvm_profile_write_file();
+        if (n == 1 || r != 0) Log("pgo: perfil guardado (%s)", r == 0 ? "bien" : "falló");
+    }
+}
+
 extern "C" void choya_gles_frame() {
     g_cuadrosJuego.fetch_add(1, std::memory_order_relaxed);
     CheckGamepads();
@@ -610,6 +634,7 @@ extern "C" void choya_gles_frame() {
         g.tried = true;
         g_tidJuego.store(static_cast<int>(syscall(SYS_gettid)));  // lo llama el hilo del juego (VI)
         std::thread(PerfilHilos).detach();
+        if (__llvm_profile_write_file) std::thread(EscribirPerfilPgo).detach();
         const char* on = std::getenv("CHOYA_GLES");
         if (!on || std::strcmp(on, "1") != 0) return;
         g_threadStarted = true;
