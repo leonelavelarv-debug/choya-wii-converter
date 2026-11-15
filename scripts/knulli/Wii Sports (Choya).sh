@@ -119,12 +119,10 @@ if [ -f "$DIR/sin-saltar-cuadros" ]; then export CHOYA_GX_SALTAR=0; fi
 # EFB sin recargar (0.25.0): antes de un borrado que tapa lo que se va a leer, el motor le avisa a la Mali que no lea
 # el EFB de la memoria (y al terminar el cuadro, que no lo guarde). Un archivo vacío "sin-invalidar-efb" lo apaga.
 if [ -f "$DIR/sin-invalidar-efb" ]; then export CHOYA_GX_INVALIDAR=0; fi
-# Copias rotadas (0.30.0): cada copia del EFB escribe en otra de 3 texturas, así no espera a que la GPU termine de
-# leer la anterior. Un archivo vacío "sin-rotar-copias" vuelve a una sola textura por copia.
-if [ -f "$DIR/sin-rotar-copias" ]; then export CHOYA_GX_ROTAR_COPIAS=0; fi
-# Copias directas (0.31.0): la zona del EFB se copia sin salir de él (glCopyTexSubImage2D) y la conversión de formato
-# se hace después, todas juntas. Un archivo vacío "copias-dibujadas" vuelve a dibujar cada copia leyendo el EFB.
-if [ -f "$DIR/copias-dibujadas" ]; then export CHOYA_GX_COPIA_DIRECTA=0; fi
+# Copias rotadas (0.30.0) y directas (0.31.0): apagadas desde la 0.31.1 (en la Mali no ayudaron y las directas
+# hicieron el cuadro más lento). Para probarlas: archivos vacíos "rotar-copias" y "copias-directas".
+if [ -f "$DIR/rotar-copias" ]; then export CHOYA_GX_ROTAR_COPIAS=1; fi
+if [ -f "$DIR/copias-directas" ]; then export CHOYA_GX_COPIA_DIRECTA=1; fi
 # Recursos convertidos por el conversor de Choya (assets.wlpk junto al juego): texturas en ETC2/EAC ya reducidas.
 # CHOYA_PAQUETE=0 usa solo las del disco.
 if [ "${CHOYA_PAQUETE:-}" != "0" ] && [ -f "$DIR/assets.wlpk" ]; then
@@ -150,8 +148,8 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "efectos de audio: $([ "${CHOYA_SIN_REVERB:-0}" = 1 ] && echo "apagados (para oírlos: archivo con-reverb)" || echo "encendidos (archivo con-reverb)")"
   echo "memoria de la Mali por partes del cuadro: $([ "${CHOYA_GX_MALI:-0}" = 1 ] && echo "se mide (archivo medir-mali)" || echo "no se mide (para medirla: archivo vacío medir-mali)")"
   echo "EFB sin recargar en la Mali: $([ "${CHOYA_GX_INVALIDAR:-1}" = 0 ] && echo "no (archivo sin-invalidar-efb)" || echo "sí (para apagarlo: archivo vacío sin-invalidar-efb)")"
-  echo "copias del EFB directas (sin salir del EFB): $([ "${CHOYA_GX_COPIA_DIRECTA:-1}" = 0 ] && echo "no (archivo copias-dibujadas)" || echo "sí (para dibujarlas como antes: archivo vacío copias-dibujadas)")"
-  echo "copias del EFB rotadas en 3 texturas: $([ "${CHOYA_GX_ROTAR_COPIAS:-1}" = 0 ] && echo "no (archivo sin-rotar-copias)" || echo "sí (para apagarlo: archivo vacío sin-rotar-copias)")"
+  echo "copias del EFB directas (sin salir del EFB): $([ "${CHOYA_GX_COPIA_DIRECTA:-0}" = 1 ] && echo "sí (archivo copias-directas)" || echo "no (para probarlas: archivo vacío copias-directas)")"
+  echo "copias del EFB rotadas en 3 texturas: $([ "${CHOYA_GX_ROTAR_COPIAS:-0}" = 1 ] && echo "sí (archivo rotar-copias)" || echo "no (para probarlas: archivo vacío rotar-copias)")"
   echo "saltar cuadros en el motor: $([ "${CHOYA_GX_SALTAR:-1}" = 0 ] && echo "no, se dibujan todos (archivo sin-saltar-cuadros)" || echo "sí (para dibujarlos todos: archivo vacío sin-saltar-cuadros)")"
   echo "hilo GX: $([ "$CHOYA_GX_HILO" = 1 ] && echo "encendido, el GX en otro núcleo (para apagarlo: archivo vacío sin-hilo-gx)" || echo "apagado (archivo sin-hilo-gx)")$([ "${CHOYA_GX_HILO_COPIAR:-0}" = 1 ] && echo "; listas copiadas (archivo hilo-gx-copiar)")"
   echo "TEV: $(case "${CHOYA_GX_TEV:-}" in flotante) echo "todo en flotante (archivo tev-flotante)";; exacto) echo "todo exacto en enteros (archivo tev-exacto)";; *) echo "mixto: flotante salvo donde el redondeo cambia el resultado (todo exacto: archivo vacío tev-exacto)";; esac)"

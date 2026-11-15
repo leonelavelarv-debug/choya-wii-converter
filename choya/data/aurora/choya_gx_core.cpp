@@ -3067,11 +3067,12 @@ bool copies_enabled() {
   return on;
 }
 
-// 0.30.0: copias rotadas (ver CopyTexture). CHOYA_GX_ROTAR_COPIAS=0 vuelve a una sola textura por copia.
+// 0.30.0: copias rotadas (ver CopyTexture). 0.31.1: apagadas salvo CHOYA_GX_ROTAR_COPIAS=1 (en la consola no
+// cambiaron el tiempo de las copias, gastan memoria y son sospechosas de un parpadeo).
 bool rotar_copias() {
   static const bool on = [] {
     const char* e = std::getenv("CHOYA_GX_ROTAR_COPIAS");
-    return e == nullptr || std::strcmp(e, "0") != 0;
+    return e != nullptr && std::strcmp(e, "1") == 0;
   }();
   return on;
 }
@@ -3201,11 +3202,13 @@ void run_copy(const Item& it) {
 // copia con glCopyTexSubImage2D sin salir del EFB (el driver la hace dentro del pase) a una textura intermedia, y la
 // conversión al formato de la copia (I8, A8, escala...) se hace después, todas juntas: cuando un dibujo va a leer esa
 // copia, antes de otra copia que no se pueda hacer así (profundidad) o de una paleta, y al terminar el cuadro.
-// CHOYA_GX_COPIA_DIRECTA=0 vuelve a la copia de antes.
+// 0.31.1: apagadas salvo CHOYA_GX_COPIA_DIRECTA=1. En la Mali-G31 fueron peores: el cuadro pasó de ~61 a ~100 ms
+// (glCopyTexSubImage2D también espera, y cada tanda de conversiones vuelve a cambiar de framebuffer), con cientos de
+// intermedias en memoria y un parpadeo sospechoso. Se quedan para probar en otros drivers.
 bool copia_directa_activa() {
   static const bool on = [] {
     const char* e = std::getenv("CHOYA_GX_COPIA_DIRECTA");
-    return e == nullptr || std::strcmp(e, "0") != 0;
+    return e != nullptr && std::strcmp(e, "1") == 0;
   }();
   return on && gl.CopyTexSubImage2D != nullptr;
 }
@@ -3236,6 +3239,18 @@ size_t intermedia_tomar(int w, int h) {
     if (!m.ocupada && m.w == w && m.h == h && m.libreDesde + 3 <= g_cuadroIntermedias) {
       m.ocupada = true;
       return i;
+    }
+  }
+  if (g_intermedias.size() >= 96) {  // 0.31.1: tope (en la consola llegaron a 700): borra las libres más viejas
+    for (size_t i = 0; i < g_intermedias.size() && g_intermedias.size() >= 64;) {
+      Intermedia& v = g_intermedias[i];
+      if (!v.ocupada && v.libreDesde + 3 <= g_cuadroIntermedias) {
+        gl.DeleteTextures(1, &v.tex);
+        g_intermedias[i] = g_intermedias.back();
+        g_intermedias.pop_back();
+      } else {
+        ++i;
+      }
     }
   }
   Intermedia m;
@@ -4995,7 +5010,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
         log_line("motor: copias por dentro (por cuadro): %.1f copias; cambio a la textura %.1f ms, dibujo %.1f, vuelta "
                  "al EFB %.1f (CPU %.1f); %s; texturas nuevas %llu",
                  static_cast<double>(tc.copias) / n, tc.cambio / n, tc.dibujo / n, tc.vuelta / n, tc.cpu / n,
-                 rotar_copias() ? "rotadas en 3 versiones" : "sin rotar (CHOYA_GX_ROTAR_COPIAS=0)",
+                 rotar_copias() ? "rotadas en 3 versiones (CHOYA_GX_ROTAR_COPIAS=1)" : "sin rotar",
                  static_cast<unsigned long long>(tc.nuevas));
       }
       if (g_dir.directas > 0 || g_tCopias.copias > 0) {  // 0.31.0
@@ -5007,7 +5022,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
                    g_intermedias.size(), static_cast<unsigned long long>(g_dir.nuevas));
         } else {
           log_line("motor: copias directas: apagadas (%s); cada copia dibuja leyendo el EFB",
-                   gl.CopyTexSubImage2D == nullptr ? "el driver no da glCopyTexSubImage2D" : "CHOYA_GX_COPIA_DIRECTA=0");
+                   gl.CopyTexSubImage2D == nullptr ? "el driver no da glCopyTexSubImage2D" : "CHOYA_GX_COPIA_DIRECTA=1 las prende");
         }
       }
       g_dir = CopiasDirectas{};
