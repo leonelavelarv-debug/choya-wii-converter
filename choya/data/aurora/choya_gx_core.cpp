@@ -470,8 +470,8 @@ std::unordered_map<uint64_t, PipelineDesc> g_pipelines;
 std::unordered_map<uint64_t, ClearDesc> g_clears;
 
 struct Stats {
-  uint64_t frames = 0, draws = 0, clears = 0, skippedLine = 0, skippedConfig = 0, skippedAlign = 0,
-           skippedProgram = 0, passes = 0;
+  uint64_t frames = 0, draws = 0, clears = 0, skippedLine = 0, skippedCull = 0, skippedInstanced = 0, skippedConfig = 0,
+           skippedAlign = 0, skippedProgram = 0, passes = 0;
   uint64_t bytesVerts = 0, bytesUniforms = 0, bytesIndices = 0, bytesStorage = 0;
   uint64_t texUploads = 0, missingTextures = 0, copies = 0, paletteConvs = 0, paletteMissing = 0;
   uint64_t interval = 0;  // cuadros desde el último informe
@@ -2490,7 +2490,7 @@ void bind_textures(uint64_t bindGroup) {
 struct ResolvedPipe {
   const Program* prog = nullptr;
   StateBlock state{};
-  bool skipLine = false, noWrite = false;
+  bool skipLine = false, cullAll = false, noWrite = false;  // 0.33.0: líneas/puntos y "cull todo" por separado
 };
 std::unordered_map<uint64_t, ResolvedPipe> g_resolvedPipes;
 
@@ -2500,11 +2500,12 @@ const ResolvedPipe* resolve_pipe(uint64_t ref) {
   PipelineDesc pc;
   if (!find_pipeline(ref, pc)) return nullptr;  // todavía sin registrar: no se guarda
   ResolvedPipe r;
-  r.skipLine = pc.lineMode != 0 || pc.cullMode == GX_CULL_ALL;
+  r.skipLine = pc.lineMode != 0;
+  r.cullAll = pc.cullMode == GX_CULL_ALL;  // GX no pinta ningún triángulo: saltarlo es lo correcto
   r.state = make_state(pc, UINT32_MAX);
   // Un dibujo que no escribe color, alfa ni profundidad no cambia nada en el EFB (GX no tiene estencil).
   r.noWrite = !r.state.colorMask && !r.state.alphaMask && !r.state.depthMask;
-  if (!r.skipLine && !r.noWrite) {
+  if (!r.skipLine && !r.cullAll && !r.noWrite) {
     r.prog = &program_for(pc);
     S.program = ~0u;  // compilar o cargar un programa lo deja en uso (glUseProgram en setup_program)
   }
@@ -4829,8 +4830,17 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
         ++g_stats.skippedConfig;
         break;
       }
-      if (rp->skipLine || it.draw.instanceCount != 1) {
+      // 0.33.0: tres causas que antes se contaban juntas como "líneas/puntos".
+      if (rp->cullAll) {
+        ++g_stats.skippedCull;
+        break;
+      }
+      if (rp->skipLine) {
         ++g_stats.skippedLine;
+        break;
+      }
+      if (it.draw.instanceCount != 1) {
+        ++g_stats.skippedInstanced;
         break;
       }
       if (rp->noWrite) {
@@ -5057,10 +5067,12 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
              static_cast<unsigned long long>(g_openFlushes.load()), static_cast<unsigned long long>(g_queueWaits.load()),
              static_cast<unsigned long long>(g_lostCopies.load()));
     log_line("motor: %llu cuadros, por cuadro: %.1f dibujos, %.1f borrados, %.1f pases; saltados: %llu sin config, "
-         "%llu líneas/puntos, %llu alineación, %llu sin programa; programas %zu; error GL 0x%04X",
+         "%llu líneas/puntos, %llu cull todo (no pintan), %llu instanciados, %llu alineación, %llu sin programa; "
+         "programas %zu; error GL 0x%04X",
          static_cast<unsigned long long>(g_stats.frames), g_stats.draws / n, g_stats.clears / n,
          g_stats.passes / n, static_cast<unsigned long long>(g_stats.skippedConfig),
-         static_cast<unsigned long long>(g_stats.skippedLine), static_cast<unsigned long long>(g_stats.skippedAlign),
+         static_cast<unsigned long long>(g_stats.skippedLine), static_cast<unsigned long long>(g_stats.skippedCull),
+         static_cast<unsigned long long>(g_stats.skippedInstanced), static_cast<unsigned long long>(g_stats.skippedAlign),
          static_cast<unsigned long long>(g_stats.skippedProgram), g_programs.size(), gl.GetError());
     {
       const double st = static_cast<double>(g_stats.stateSkipped + g_stats.stateApplied);

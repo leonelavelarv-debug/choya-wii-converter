@@ -4,7 +4,7 @@
 # Modo diagnóstico (3 min, perfil, volcados de cuadros; MENU + R1 vuelca el cuadro que se ve): "Wii Sports (Choya) - diagnostico.sh" o CHOYA_MODO=diagnostico.
 # Deja run.log y resumen.txt en la carpeta wiisports-choya.
 
-LANZADOR_VERSION="0.32.0"  # sube con cada versión de Choya (tests/test_opt_traducido.py lo revisa)
+LANZADOR_VERSION="0.33.0"  # sube con cada versión de Choya (tests/test_opt_traducido.py lo revisa)
 DIR="$(cd "$(dirname "$0")" && pwd)/wiisports-choya"
 cd "$DIR" || exit 1
 rm -f "$DIR/resumen.txt"  # que nunca quede uno viejo de otra corrida
@@ -65,6 +65,16 @@ cd "$DIR" || exit 1  # por si control.txt cambió de carpeta
 export XDG_DATA_HOME="$DIR/userdata"
 CFG="$XDG_DATA_HOME/WiiCompiled/Config.toml"
 mkdir -p "$(dirname "$CFG")"
+# Resolución interna (0.33.0): cuántas líneas dibuja el juego antes de escalar a la pantalla (480 x el valor). Con 1
+# el EFB es de 674x556; con 0.75, de unos 506x417 (44 % menos píxeles): menos trabajo de la GPU en los dibujos y en
+# cada copia del EFB (la Mali guarda y vuelve a leer el EFB entero en cada una), a cambio de una imagen más suave.
+# Archivo vacío "resolucion-075" = 0.75, "resolucion-05" = 0.5; CHOYA_RESOLUCION=1|0.75|0.5 manda sobre los archivos.
+if [ -z "${CHOYA_RESOLUCION:-}" ]; then
+  if [ -f "$DIR/resolucion-05" ]; then CHOYA_RESOLUCION=0.5
+  elif [ -f "$DIR/resolucion-075" ]; then CHOYA_RESOLUCION=0.75
+  else CHOYA_RESOLUCION=1; fi
+fi
+case "$CHOYA_RESOLUCION" in 1|0.75|0.5) ;; *) CHOYA_RESOLUCION=1 ;; esac  # los valores que acepta WiiCompiled
 cat > "$CFG" <<CONF
 [paths]
 dvd_root = "$GAME"
@@ -73,7 +83,7 @@ dvd_root = "$GAME"
 graphics_api = "null"
 widescreen = false
 force_16_9 = false
-resolution_multiplier = 1
+resolution_multiplier = $CHOYA_RESOLUCION
 CONF
 
 export LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"
@@ -153,6 +163,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "EFB sin recargar en la Mali: $([ "${CHOYA_GX_INVALIDAR:-1}" = 0 ] && echo "no (archivo sin-invalidar-efb)" || echo "sí (para apagarlo: archivo vacío sin-invalidar-efb)")"
   echo "copias del EFB directas (sin salir del EFB): $([ "${CHOYA_GX_COPIA_DIRECTA:-0}" = 1 ] && echo "sí (archivo copias-directas)" || echo "no (para probarlas: archivo vacío copias-directas)")"
   echo "copias del EFB rotadas en 3 texturas: $([ "${CHOYA_GX_ROTAR_COPIAS:-0}" = 1 ] && echo "sí (archivo rotar-copias)" || echo "no (para probarlas: archivo vacío rotar-copias)")"
+  echo "resolución interna: $CHOYA_RESOLUCION ($(awk -v r="$CHOYA_RESOLUCION" 'BEGIN{printf "%d", 480*r}') líneas)$([ "$CHOYA_RESOLUCION" = 1 ] && echo " (para probar menos: archivo vacío resolucion-075 o resolucion-05)" || echo " (archivo resolucion-075 o resolucion-05; bórralo para volver a 1)")"
   echo "saltar cuadros en el motor: $([ "${CHOYA_GX_SALTAR:-1}" = 0 ] && echo "no, se dibujan todos (archivo sin-saltar-cuadros)" || echo "sí (para dibujarlos todos: archivo vacío sin-saltar-cuadros)")"
   echo "hilo GX: $([ "$CHOYA_GX_HILO" = 1 ] && echo "encendido, el GX en otro núcleo (para apagarlo: archivo vacío sin-hilo-gx)" || echo "apagado (archivo sin-hilo-gx)")$([ "${CHOYA_GX_HILO_COPIAR:-0}" = 1 ] && echo "; listas copiadas (archivo hilo-gx-copiar)")"
   echo "TEV: $(case "${CHOYA_GX_TEV:-}" in flotante) echo "todo en flotante (archivo tev-flotante)";; exacto) echo "todo exacto en enteros (archivo tev-exacto)";; *) echo "mixto: flotante salvo donde el redondeo cambia el resultado (todo exacto: archivo vacío tev-exacto)";; esac)"
@@ -171,6 +182,7 @@ escribir_resumen() {
     [ -f "$DIR/perfil.txt" ] && echo "perfil.txt: $(grep -m1 '^muestras' "$DIR/perfil.txt"), escrito el $(date -r "$DIR/perfil.txt" '+%d/%m %H:%M' 2>/dev/null), hilo del juego $(awk '/^hilo_juego/{print $2}' "$DIR/perfil.txt")"
     cat "$DIR/cpu.txt"
     grep -h -m1 "compilado: código traducido" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | head -1
+    grep -h "motor: EFB de" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | tail -1  # 0.33.0: tamaño del EFB
     cat "$DIR/procesador.txt" 2>/dev/null
     echo "--- cuadros volcados"
     ls -la "$DIR"/cuadro-*.bin 2>/dev/null || echo "ninguno"
