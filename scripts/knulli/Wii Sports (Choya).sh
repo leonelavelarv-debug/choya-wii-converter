@@ -177,9 +177,9 @@ escribir_resumen() {
     grep -h "aurora: por cuadro" "$DIR/choya-gles.txt" 2>/dev/null | tail -6
     grep -hE "aurora: hilo GX (de Choya|apagado)" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | head -1
     grep -h "aurora: hilo GX:" "$DIR/choya-gles.txt" 2>/dev/null | tail -4
-    echo "--- motor de pantalla: cuadros por segundo, tiempo por cuadro dibujado, saltos, EFB sin recargar, TEV y GPU por pase (0.27.0)"
+    echo "--- motor de pantalla: cuadros por segundo, tiempo por cuadro dibujado, saltos, EFB sin recargar, TEV, copias y GPU por pase (0.28.0)"
     grep -h "motor: midiendo el tiempo de GPU\|GL_EXT_disjoint_timer_query" "$DIR/choya-gles.txt" 2>/dev/null | head -2
-    grep -h "motor: cuadros por segundo\|motor: tiempo por cuadro dibujado\|presentación: \|motor: saltos:\|motor: EFB sin recargar\|motor: TEV " "$DIR/choya-gles.txt" 2>/dev/null | tail -18
+    grep -h "motor: cuadros por segundo\|motor: tiempo por cuadro dibujado\|presentación: \|motor: saltos:\|motor: EFB sin recargar\|motor: TEV \|motor: copias del EFB:" "$DIR/choya-gles.txt" 2>/dev/null | tail -21
     grep -h "motor: GPU por pase" "$DIR/choya-gles.txt" 2>/dev/null | tail -3
     echo "--- hilos y núcleos (cada 10 s: CPU de cada núcleo y de cada hilo, ms por cuadro del juego, espera de turno)"
     grep -h "^hilos" "$DIR/choya-gles.txt" 2>/dev/null | tail -9

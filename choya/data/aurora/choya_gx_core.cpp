@@ -2863,18 +2863,18 @@ void main() {
 const char* kCopyFs = R"(#version 300 es
 precision highp float;
 precision highp int;
-uniform sampler2D u_color;
+uniform mediump sampler2D u_color;
 uniform highp sampler2D u_depth;
-uniform vec4 u_rect;   // zona del pase: x, y (arriba), ancho, alto
-uniform vec4 u_size;   // ancho y alto del EFB, ancho y alto de la textura
-uniform vec4 u_mode;   // formato (GXTexFmt), alfa opaco, Z invertida
+uniform highp vec4 u_rect;   // zona del pase: x, y (arriba), ancho, alto
+uniform highp vec4 u_size;   // ancho y alto del EFB, ancho y alto de la textura
+uniform highp vec4 u_mode;   // formato (GXTexFmt), alfa opaco, Z invertida
 out vec4 o_color;
 float inten(vec3 c) { return dot(c, vec3(0.257, 0.504, 0.098)) + 16.0 / 255.0; }
 float q4(float v) { return floor(v * 16.0) / 15.0; }
 void main() {
-  vec2 t = gl_FragCoord.xy / u_size.zw;
-  vec2 p = u_rect.xy + t * u_rect.zw;
-  vec2 uv = vec2(p.x / u_size.x, 1.0 - p.y / u_size.y);
+  highp vec2 t = gl_FragCoord.xy / u_size.zw;
+  highp vec2 p = u_rect.xy + t * u_rect.zw;
+  highp vec2 uv = vec2(p.x / u_size.x, 1.0 - p.y / u_size.y);
   int fmt = int(u_mode.x + 0.5);
   vec4 r;
   if ((fmt & 0x10) != 0) {
@@ -2916,14 +2916,51 @@ struct CopyProgram {
   GLuint id = 0;
   GLint rect = -1, size = -1, mode = -1;
   bool tried = false;
-} g_copyProgram;
+};
 
-bool copy_program() {
-  if (g_copyProgram.tried) return g_copyProgram.id != 0;
-  g_copyProgram.tried = true;
+// 0.28.0: un programa de copia por formato (con el formato fijo al compilar, sin la cadena de ifs de todos los
+// formatos) y, en los que solo eligen canales (RGBA8, A8, R8, ...), con precisión media: la Mali-G31 hace el doble de
+// cuentas por ciclo en 16 bits, y un valor de 8 bits cabe exacto. En la 0.27.x las copias eran ~60 % del tiempo de GPU
+// del cuadro. CHOYA_GX_COPIA_GENERICA=1 vuelve al programa único de antes.
+bool copia_generica() {
+  static const bool on = [] {
+    const char* e = std::getenv("CHOYA_GX_COPIA_GENERICA");
+    return e != nullptr && std::strcmp(e, "1") == 0;
+  }();
+  return on;
+}
+bool copia_solo_canales(uint32_t fmt) {
+  switch (fmt) {
+    case 0x4: case 0x23: case 0x27: case 0x28: case 0x29: case 0x2A: case 0x2B: case 0x2C:
+      return true;
+    default:
+      return (fmt & 0x10) == 0 && fmt != 0x0 && fmt != 0x1 && fmt != 0x2 && fmt != 0x3 && fmt != 0x20 && fmt != 0x22;
+  }
+}
+std::string copia_fuente(uint32_t fmt, bool generica) {
+  std::string src = kCopyFs;
+  if (generica) return src;
+  const std::string fijo = "  const int fmt = " + std::to_string(fmt) + ";";
+  const std::string viejo = "  int fmt = int(u_mode.x + 0.5);";
+  src.replace(src.find(viejo), viejo.size(), fijo);
+  if (copia_solo_canales(fmt)) {
+    const std::string alta = "precision highp float;\nprecision highp int;\n";
+    src.replace(src.find(alta), alta.size(), "precision mediump float;\nprecision mediump int;\n");
+  }
+  return src;
+}
+std::unordered_map<uint32_t, CopyProgram> g_copyPrograms;
+uint64_t g_copyProgramsHechos = 0;
+
+CopyProgram* copy_program(uint32_t fmt) {
+  const bool generica = copia_generica();
+  CopyProgram& cp = g_copyPrograms[generica ? 0xFFFFFFFFu : fmt];
+  if (cp.tried) return cp.id != 0 ? &cp : nullptr;
+  cp.tried = true;
   std::string err;
   const GLuint v = compile(kVertexShader, kCopyVs, err);
-  const GLuint f = v ? compile(kFragmentShader, kCopyFs, err) : 0;
+  const std::string fs = copia_fuente(fmt, generica);
+  const GLuint f = v ? compile(kFragmentShader, fs.c_str(), err) : 0;
   if (v && f) {
     const GLuint prog = gl.CreateProgram();
     gl.AttachShader(prog, v);
@@ -2932,13 +2969,14 @@ bool copy_program() {
     GLint ok = 0;
     gl.GetProgramiv(prog, kLinkStatus, &ok);
     if (ok) {
-      g_copyProgram.id = prog;
+      cp.id = prog;
       gl.UseProgram(prog);
       gl.Uniform1i(gl.GetUniformLocation(prog, "u_color"), 10);
       gl.Uniform1i(gl.GetUniformLocation(prog, "u_depth"), 11);
-      g_copyProgram.rect = gl.GetUniformLocation(prog, "u_rect");
-      g_copyProgram.size = gl.GetUniformLocation(prog, "u_size");
-      g_copyProgram.mode = gl.GetUniformLocation(prog, "u_mode");
+      cp.rect = gl.GetUniformLocation(prog, "u_rect");
+      cp.size = gl.GetUniformLocation(prog, "u_size");
+      cp.mode = gl.GetUniformLocation(prog, "u_mode");
+      ++g_copyProgramsHechos;
     } else {
       GLint len = 0;
       gl.GetProgramiv(prog, kInfoLogLength, &len);
@@ -2948,8 +2986,8 @@ bool copy_program() {
   }
   if (v) gl.DeleteShader(v);
   if (f) gl.DeleteShader(f);
-  if (g_copyProgram.id == 0) log_line("motor: no compila el programa de copias del EFB: %s", err.c_str());
-  return g_copyProgram.id != 0;
+  if (cp.id == 0) log_line("motor: no compila el programa de copias del EFB (formato 0x%x): %s", fmt, err.c_str());
+  return cp.id != 0 ? &cp : nullptr;
 }
 
 // --- Borrados dentro del pase como un dibujo -------------------------------------------------------------------
@@ -3022,7 +3060,8 @@ bool copies_enabled() {
 void run_copy(const Item& it) {
   const auto& c = it.copy;
   if (c.texW == 0 || c.texH == 0 || c.texW > 4096 || c.texH > 4096 || c.rect.width <= 0 || c.rect.height <= 0) return;
-  if (!copy_program()) return;
+  CopyProgram* cprog = copy_program(c.fmt);
+  if (cprog == nullptr) return;
   CopyTexture& ct = g_copyTextures[c.tex];
   if (ct.tex == 0 || ct.width != c.texW || ct.height != c.texH) {
     if (ct.fbo != 0) gl.DeleteFramebuffers(1, &ct.fbo);
@@ -3052,12 +3091,12 @@ void run_copy(const Item& it) {
   gl.Disable(kBlend);
   gl.Disable(kCullFace);
   gl.ColorMask(1, 1, 1, 1);
-  gl.UseProgram(g_copyProgram.id);
-  gl.Uniform4f(g_copyProgram.rect, static_cast<float>(c.rect.x), static_cast<float>(c.rect.y),
+  gl.UseProgram(cprog->id);
+  gl.Uniform4f(cprog->rect, static_cast<float>(c.rect.x), static_cast<float>(c.rect.y),
                static_cast<float>(c.rect.width), static_cast<float>(c.rect.height));
-  gl.Uniform4f(g_copyProgram.size, static_cast<float>(g_efb.width), static_cast<float>(g_efb.height),
+  gl.Uniform4f(cprog->size, static_cast<float>(g_efb.width), static_cast<float>(g_efb.height),
                static_cast<float>(c.texW), static_cast<float>(c.texH));
-  gl.Uniform4f(g_copyProgram.mode, static_cast<float>(c.fmt), c.opaque ? 1.f : 0.f, g_reversedZ ? 1.f : 0.f, 0.f);
+  gl.Uniform4f(cprog->mode, static_cast<float>(c.fmt), c.opaque ? 1.f : 0.f, g_reversedZ ? 1.f : 0.f, 0.f);
   // 0.25.0: cada copia enlaza solo lo que lee (antes el color y la profundidad del EFB siempre): una profundidad
   // enlazada sin usarse puede obligar al driver a dejarla lista para leerse como textura.
   const bool deProfundidad = (c.fmt & 0x10) != 0;
@@ -4667,6 +4706,15 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
                  static_cast<unsigned long long>(t.flotante), static_cast<unsigned long long>(t.exacto),
                  static_cast<unsigned long long>(t.sinLimite), static_cast<unsigned long long>(t.comparacion),
                  static_cast<unsigned long long>(t.pruebaAlfa));
+      }
+      {  // 0.28.0
+        unsigned medios = 0;
+        for (const auto& [fmt, cp] : g_copyPrograms) {
+          if (cp.id != 0 && fmt != 0xFFFFFFFFu && copia_solo_canales(fmt)) ++medios;
+        }
+        log_line("motor: copias del EFB: %s, %llu programas hechos (%u con precisión media)",
+                 copia_generica() ? "programa único (CHOYA_GX_COPIA_GENERICA=1)" : "un programa por formato",
+                 static_cast<unsigned long long>(g_copyProgramsHechos), medios);
       }
       g_tiempos = TiemposMotor{};
     }
