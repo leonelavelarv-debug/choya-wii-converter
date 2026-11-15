@@ -13,6 +13,7 @@
 #                wiisports-choya/pgo/*.profraw a C:\Users\Public\choya-pgo (CHOYA_PGO_DIR=otra carpeta)
 #   pgo          compilación guiada por ese perfil (-O2 + -fprofile-use)
 #   pgo-O3       igual, con -O3
+#   pgo-lto      PGO + ThinLTO (0.35.0): las funciones traducidas se pueden integrar entre archivos al enlazar
 #
 # Fiabilidad (0.32.0; detalle en el README, "Compilación fiable del port"):
 #   - recomp-native se detiene si un parche obligatorio no se aplica o un objeto del SDK no mide lo esperado.
@@ -45,7 +46,9 @@ case "$OPT_MODO" in
                OPT_ENLACE="$PGO/runtime/libclang_rt.profile-aarch64.a;-Wl,-u,__llvm_profile_runtime" ;;
   pgo) BUILD="$BUILD-pgo"; OPT_FLAGS="$PGO_USO" ;;
   pgo-O3|pgo-o3) OPT_MODO="pgo-O3"; BUILD="$BUILD-pgo3"; OPT_FLAGS="-O3;$PGO_USO" ;;
-  *) echo "CHOYA_OPT=$OPT_MODO no existe (usa O3, pgo-generar, pgo o pgo-O3)"; exit 1 ;;
+  # 0.35.0: el código traducido como bitcode ThinLTO; el enlace (lld) lo optimiza junto (opciones en el paso 4).
+  pgo-lto|pgo-LTO) OPT_MODO="pgo-lto"; BUILD="$BUILD-pgolto"; OPT_FLAGS="$PGO_USO;-flto=thin"; LTO=1 ;;
+  *) echo "CHOYA_OPT=$OPT_MODO no existe (usa O3, pgo-generar, pgo, pgo-O3 o pgo-lto)"; exit 1 ;;
 esac
 PORT="$HOME/choya-port"
 NUEVO="$PORT.nuevo"
@@ -99,7 +102,7 @@ if [ "$OPT_MODO" = pgo-generar ] && [ ! -f "$PGO/runtime/libclang_rt.profile-aar
     bash /choya-scripts/pgo-runtime-aarch64.sh "$PGO/runtime" >>"$LOG" 2>&1 || falla "runtime de perfiles (PGO)"
 fi
 PGO_META=""
-if [ "$OPT_MODO" = pgo ] || [ "$OPT_MODO" = pgo-O3 ]; then
+if [ "$OPT_MODO" = pgo ] || [ "$OPT_MODO" = pgo-O3 ] || [ "$OPT_MODO" = pgo-lto ]; then
   # Los perfiles que tomó la consola (wiisports-choya/pgo/*.profraw) se juntan en uno solo.
   CRUDOS="${CHOYA_PGO_DIR:-/mnt/c/Users/Public/choya-pgo}"
   if [ "${CHOYA_PGO_REUSAR:-0}" != 1 ]; then
@@ -129,6 +132,12 @@ paso "4/6 Compilar para aarch64 (Cortex-A53)"
 MEM_GB=$(awk '/MemTotal/{print int($2/1024/1024)}' /proc/meminfo)
 JOBS=$(( MEM_GB * 2 / 3 )); [ "$JOBS" -lt 1 ] && JOBS=1; [ "$JOBS" -gt "$(nproc)" ] && JOBS=$(nproc)
 echo "Memoria ${MEM_GB} GB → ${JOBS} trabajos a la vez" | tee -a "$LOG"
+if [ "${LTO:-0}" = 1 ]; then
+  # ThinLTO: lld optimiza el bitcode en JOBS hilos (cada uno como un archivo grande al compilar) y guarda lo que no
+  # cambió en una caché para la próxima vez.
+  OPT_ENLACE="-flto=thin;-Wl,--thinlto-jobs=$JOBS;-Wl,--thinlto-cache-dir=$WC/$BUILD/thinlto-cache"
+  echo "ThinLTO: el enlace tarda más (optimiza todo el código traducido junto)" | tee -a "$LOG"
+fi
 # Sin Dawn (0.22.0): el motor GLES de Choya dibuja todo, así que aurora se compila con el WebGPU nulo de Choya
 # (proveedor "choya", lib/choya/sin_dawn): ni la biblioteca de Dawn ni su paquete. Lo que quedó de Dawn en la carpeta
 # de compilación se borra para que CMake no lo vuelva a usar.
@@ -213,7 +222,7 @@ cp "$CHOYA/scripts/knulli/Wii Sports (Choya).sh" "$CHOYA/scripts/knulli/Wii Spor
 echo "Copia aquí la carpeta DATA de tu disco (la que tiene files y sys)." > "$NUEVO/wiisports-choya/game/LEEME.txt"
 case "$OPT_MODO" in
   pgo-generar) echo "pgo-generar (toma el perfil: va más lento; los perfiles quedan en wiisports-choya/pgo)" ;;
-  pgo|pgo-O3) echo "$OPT_MODO (perfil $SELLO_PGO)" ;;
+  pgo|pgo-O3|pgo-lto) echo "$OPT_MODO (perfil $SELLO_PGO)" ;;
   *) echo "$OPT_MODO" ;;
 esac > "$NUEVO/wiisports-choya/compilado.txt"
 # 0.32.0: los perfiles que tome esta versión llevan en el nombre la identidad del código traducido.

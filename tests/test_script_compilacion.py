@@ -264,6 +264,22 @@ class TestScriptDeCompilacion(unittest.TestCase):
         self.assertEqual(open(perfil, "rb").read(), antes_perfil)
         self.assertEqual(huellas.huella_carpeta(self.port), antes_port)
 
+    def test_pgo_lto_pasa_thinlto_al_compilar_y_enlazar(self):
+        crudos = os.path.join(self.t, "choya-pgo")
+        os.makedirs(crudos)
+        with open(os.path.join(crudos, "wiisports-1.profraw"), "wb") as f:
+            f.write(struct.pack("<QQ", 0xFF6C70726F667281, 10) + b"z" * 32)
+        code, out = self.compilar(CHOYA_OPT="pgo-lto", CHOYA_PGO_DIR=crudos, CHOYA_SIN_PAQUETE="1")
+        self.assertEqual(code, 0, out[-3000:])
+        m = json.load(open(os.path.join(self.port, manifiesto.MANIFIESTO)))
+        self.assertEqual(m["compilacion"]["modo"], "pgo-lto")
+        self.assertEqual(m["compilacion"]["carpeta"], "build-wiisports-arm64-pgolto")
+        self.assertTrue(m["compilacion"]["flags_codigo_traducido"].endswith(";-flto=thin"))
+        self.assertIn("-Wl,--thinlto-cache-dir=", m["compilacion"]["enlace_extra"])
+        self.assertIn("--thinlto-jobs=", m["compilacion"]["cmake"]["CHOYA_ENLACE_EXTRA"])
+        self.assertTrue(m["pgo"]["sha256"])
+        self.assertIn("pgo-lto (perfil", open(os.path.join(self.port, "wiisports-choya", "compilado.txt")).read())
+
     def test_parche_obligatorio_fallido_detiene(self):
         ruta = os.path.join(self.wc, "runtime", "src", "keybinds.cpp")
         _r, old, _n, _l = next(e for e in R.EDITS if e[0] == "src/keybinds.cpp")

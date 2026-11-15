@@ -79,6 +79,12 @@ class ScriptDeCompilacion(unittest.TestCase):
         self.assertTrue(flags.startswith("-fprofile-use=/wc/choya-pgo/wiisports.profdata;"))
         self.assertTrue(self.modo("pgo-O3")[2].startswith("-O3;-fprofile-use="))
         self.assertNotEqual(self.modo("rapidisimo")[0], 0)
+        # 0.35.0: PGO + ThinLTO en su propia carpeta (las opciones de enlace se ponen en el paso 4, con los trabajos)
+        cod, build, flags, enlace, modo = self.modo("pgo-lto")
+        self.assertEqual((cod, build, modo), (0, "build-wiisports-arm64-pgolto", "pgo-lto"))
+        self.assertTrue(flags.startswith("-fprofile-use=/wc/choya-pgo/wiisports.profdata;"))
+        self.assertTrue(flags.endswith(";-flto=thin"))
+        self.assertIn('OPT_ENLACE="-flto=thin;-Wl,--thinlto-jobs=$JOBS;', leer(SCRIPT))
 
     def test_pasa_las_opciones_a_cmake(self):
         texto = leer(SCRIPT)
