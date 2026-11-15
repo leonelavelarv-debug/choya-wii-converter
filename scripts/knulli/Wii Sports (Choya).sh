@@ -4,7 +4,7 @@
 # Modo diagnóstico (3 min, perfil, volcados de cuadros; MENU + R1 vuelca el cuadro que se ve): "Wii Sports (Choya) - diagnostico.sh" o CHOYA_MODO=diagnostico.
 # Deja run.log y resumen.txt en la carpeta wiisports-choya.
 
-LANZADOR_VERSION="0.31.2"  # sube con cada versión de Choya (tests/test_opt_traducido.py lo revisa)
+LANZADOR_VERSION="0.32.0"  # sube con cada versión de Choya (tests/test_opt_traducido.py lo revisa)
 DIR="$(cd "$(dirname "$0")" && pwd)/wiisports-choya"
 cd "$DIR" || exit 1
 rm -f "$DIR/resumen.txt"  # que nunca quede uno viejo de otra corrida
@@ -134,7 +134,9 @@ fi
 # PGO (0.29.0): solo la compilación CHOYA_OPT=pgo-generar escribe perfiles (en wiisports-choya/pgo, cada 20 s); en
 # las demás esta variable no hace nada. Los .profraw se copian a la PC para compilar con CHOYA_OPT=pgo.
 # 0.31.0: %m = un solo archivo que suma todas las partidas (con %p cada escritura se agregaba al final).
-export LLVM_PROFILE_FILE="$DIR/pgo/wiisports-%m.profraw"
+# 0.32.0: el nombre lleva la identidad del código traducido (pgo-id.txt) para saber de qué compilación es cada perfil.
+PGO_ID=$(head -c 12 "$DIR/pgo-id.txt" 2>/dev/null | tr -cd '0-9a-f')
+export LLVM_PROFILE_FILE="$DIR/pgo/wiisports-${PGO_ID:+$PGO_ID-}%m.profraw"
 mkdir -p "$CHOYA_GX_CACHE"
 rm -f "$DIR/choya-gles.txt" "$DIR/procesador.txt" "$DIR/ultimo-cierre.tar.gz"
 

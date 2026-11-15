@@ -32,7 +32,11 @@ echo "clang $(clang --version | head -1 | grep -o '[0-9]*\.[0-9]*\.[0-9]*' | hea
 paso "2/7 Preparar el proyecto (recomp-prep + recomp-native)"
 cd "$CHOYA"
 corre python3 -m choya recomp-prep "$DOL" "$WC" || falla "recomp-prep"
-python3 -m choya recomp-native "$WC" 2>&1 | tee -a "$LOG" | grep -E "AVISO|Entrada|Estructuras|otros juegos|Sin resolver" || true
+python3 -m choya recomp-native "$WC" >>"$LOG" 2>&1
+RN=$?
+grep -E "^Parches:|AVISO|Entrada|Estructuras|otros juegos|Sin resolver" "$LOG" | tail -12
+# 0.32.0: un parche obligatorio sin aplicar o un objeto del SDK de otro tamaño detienen la compilación.
+[ "$RN" -eq 0 ] || { grep -A4 "^ERROR" "$LOG" | head -40; falla "recomp-native (ver projects/wiisports/retarget.md)"; }
 # recomp-prep otra vez para que recomp.yml apunte ya a runtime-wiisports
 corre python3 -m choya recomp-prep "$DOL" "$WC" || falla "recomp-prep"
 

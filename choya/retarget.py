@@ -215,7 +215,8 @@ def _fmt(old_text: str, value: int) -> str:
 class Change:
     file: str
     line: int
-    kind: str           # registro | desactivado | duplicado | funcion | dato | sin_resolver
+    kind: str           # registro | desactivado | duplicado | funcion | dato | sin_resolver | edicion | parche
+    #                     | parche_omitido (opcional, no aplica) | parche_fallido (obligatorio, detiene la compilación)
     old: int
     new: int | None
     name: str
@@ -1994,61 +1995,167 @@ def patch_aurora(wiicompiled: str, changes: list[Change]) -> None:
     files: dict[str, list] = {}
     for edit in AURORA_EDITS:
         files.setdefault(edit[0], []).append(edit)
+    # 0.32.0: cada archivo se edita en memoria (cambios de AURORA_EDITS y de AURORA_EXCLUSIVOS juntos) y se escribe una
+    # sola vez, solo si cambió. Antes GXFrameBuffer.cpp se reescribía dos veces en cada corrida (sin y con las marcas
+    # del hilo GX) y se recompilaba siempre. Si al final el archivo queda igual que estaba, todos sus parches estaban
+    # ya aplicados (aunque se hayan quitado y vuelto a poner por AURORA_STRIPS).
+    textos: dict[str, tuple[str, str]] = {}   # rel → (original, texto)
+    propios: dict[str, list[Change]] = {}
+
+    def abrir(rel: str) -> str | None:
+        if rel not in textos:
+            path = os.path.join(base, rel)
+            if not os.path.isfile(path):
+                return None
+            with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
+                original = f.read()
+            textos[rel] = (original, original)
+        return textos[rel][1]
+
+    def anotar(rel: str, c: Change) -> None:
+        changes.append(c)
+        propios.setdefault(rel, []).append(c)
+
     for rel, edits in files.items():
-        path = os.path.join(base, rel)
         shown = "aurora-main/" + rel
-        if not os.path.isfile(path):
+        text = abrir(rel)
+        if text is None:
             for _r, _o, _n, label in edits:
-                changes.append(Change(shown, 0, "parche_fallido", 0, None, label, "no encontré el archivo"))
+                changes.append(_no_aplicado(shown, label, "no encontré el archivo (¿cambió aurora?)"))
             continue
-        with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
-            original = f.read()
-        text = original
         for strip_rel, payload in AURORA_STRIPS:
             if strip_rel == rel:
                 text = text.replace(payload, "")
         for _r, old, new, label in edits:
             if new in text:
-                changes.append(Change(shown, _line_of(text, text.index(new)), "edicion", 0, None, label,
-                                      label + " (ya estaba)"))
+                anotar(rel, Change(shown, _line_of(text, text.index(new)), "edicion", 0, None, label,
+                                   label + " (ya estaba)"))
                 continue
-            if text.count(old) != 1:
-                changes.append(Change(shown, 0, "parche_fallido", 0, None, label, "texto no encontrado (¿cambió aurora?)"))
+            n = text.count(old)
+            if n != 1:
+                changes.append(_no_aplicado(shown, label, "texto no encontrado (¿cambió aurora?)" if n == 0
+                                            else f"el texto aparece {n} veces (el parche necesita un lugar único)"))
                 continue
             line = _line_of(text, text.index(old))
             text = text.replace(old, new, 1)
-            changes.append(Change(shown, line, "edicion", 0, None, label, label))
-        if text != original:
-            with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
-                f.write(text)
+            anotar(rel, Change(shown, line, "edicion", 0, None, label, label))
+        textos[rel] = (textos[rel][0], text)
     for rel, header, names in AURORA_EXCLUSIVOS:
-        path = os.path.join(base, rel)
         shown = "aurora-main/" + rel
-        if not os.path.isfile(path):
-            changes.append(Change(shown, 0, "parche_fallido", 0, None, "hilo GX (procesador tomado)", "no encontré el archivo"))
+        text = abrir(rel)
+        if text is None:
+            changes.append(_no_aplicado(shown, "hilo GX (procesador tomado)", "no encontré el archivo (¿cambió aurora?)"))
             continue
-        with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
-            original = f.read()
-        text, res = aplicar_exclusivos(original, rel, header, names)
+        text, res = aplicar_exclusivos(text, rel, header, names)
         for name, line, what in res:
             label = f"hilo GX (procesador tomado en {name})"
             if what in ("edicion", "ya estaba"):
-                changes.append(Change(shown, line, "edicion", 0, None, label, label + (" (ya estaba)" if what == "ya estaba" else "")))
+                anotar(rel, Change(shown, line, "edicion", 0, None, label,
+                                   label + (" (ya estaba)" if what == "ya estaba" else "")))
             else:
-                changes.append(Change(shown, 0, "parche_fallido", 0, None, label, what))
+                changes.append(_no_aplicado(shown, label, f"{what} la función (¿cambió aurora?)" if what == "no encontré"
+                                            else f"la función {what} (el parche necesita un lugar único)"))
+        textos[rel] = (textos[rel][0], text)
+    for rel, (original, text) in textos.items():
         if text != original:
-            with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            with open(os.path.join(base, rel), "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
                 f.write(text)
+        else:
+            for c in propios.get(rel, []):
+                if not c.text.endswith("(ya estaba)"):
+                    c.text += " (ya estaba)"
+
+
+# 0.32.0: cada parche es obligatorio salvo los de esta lista. Uno obligatorio que no se aplica detiene recomp-native
+# (y la compilación): el port saldría con un runtime a medias. Los opcionales solo cambian textos o el log, y el juego
+# funciona igual sin ellos; si no se aplican se anotan como "opcional no aplicable" y se sigue.
+PARCHES_OPCIONALES = {
+    "pantalla de inicio": "solo cambia los textos de la pantalla de inicio",
+    "log de OSSetPowerCallback solo al cambiar": "solo evita repetir una línea del log en cada cuadro",
+}
+
+# Los cuatro estados de un parche (informe retarget.md, parches.json y el manifiesto del port).
+ESTADOS_PARCHE = ("aplicado", "ya_aplicado", "opcional_no_aplicable", "obligatorio_fallido")
+
+
+def estado_parche(c: Change) -> str | None:
+    """aplicado | ya_aplicado | opcional_no_aplicable | obligatorio_fallido (None si el cambio no es un parche)."""
+    if c.kind in ("edicion", "parche"):
+        return "ya_aplicado" if c.text.endswith("(ya estaba)") else "aplicado"
+    if c.kind == "parche_omitido":
+        return "opcional_no_aplicable"
+    if c.kind == "parche_fallido":
+        return "obligatorio_fallido"
+    return None
+
+
+def accion_parche(c: Change) -> str:
+    """Qué hacer con un parche obligatorio que no se aplicó."""
+    t = c.text
+    if "recomp-prep" in t:
+        return "corre primero: python3 -m choya recomp-prep <disco> <WiiCompiled>"
+    if "disco" in t:
+        return "comprueba que el disco sea Wii Sports USA Rev 1 (python3 -m choya scan <disco>) y vuelve a correr recomp-prep"
+    if "veces" in t:
+        return "el texto aparece varias veces: hay que darle al parche un ancla única en choya/retarget.py"
+    return ("tu WiiCompiled/aurora no es la revisión con la que Choya probó sus parches: vuelve a la revisión fijada "
+            "(choya-dependencias.lock y dependencias.json) o actualiza el parche en choya/retarget.py")
+
+
+def estructuras_incompatibles(r: "RetargetResult") -> list[tuple]:
+    """Objetos del SDK que se pudieron medir y no miden lo que el runtime espera (el runtime los leería mal)."""
+    return [s for s in r.structs if s[2] is not None and s[2] != s[1]]
+
+
+def fallidos_obligatorios(r: "RetargetResult") -> list[Change]:
+    return [c for c in r.changes if c.kind == "parche_fallido"]
+
+
+def resultado_parches(r: "RetargetResult") -> dict:
+    """Resultado de los parches y las estructuras del SDK, para parches.json y el manifiesto del port."""
+    lista, cuenta = [], Counter()
+    for c in r.changes:
+        e = estado_parche(c)
+        if e is None or c.text == "motor de Choya (archivo)":
+            continue
+        cuenta[e] += 1
+        item = {"archivo": c.file, "parche": c.name, "estado": e, "linea": c.line or None,
+                "obligatorio": c.name not in PARCHES_OPCIONALES and c.kind != "parche_omitido"}
+        if e in ("opcional_no_aplicable", "obligatorio_fallido"):
+            item["motivo"] = c.text
+        if e == "obligatorio_fallido":
+            item["accion"] = accion_parche(c)
+        lista.append(item)
+    est = [{"objeto": n, "espera": want, "mide": got, "que": what,
+            "estado": "igual" if got == want else ("sin_medir" if got is None else "incompatible")}
+           for n, want, got, what in r.structs]
+    malas = estructuras_incompatibles(r)
+    return {"ok": not cuenta["obligatorio_fallido"] and not malas,
+            "resumen": {e: cuenta[e] for e in ESTADOS_PARCHE},
+            "estructuras_incompatibles": len(malas),
+            "parches": lista, "estructuras": est}
+
+
+def _no_aplicado(rel: str, label: str, why: str) -> Change:
+    """Un parche que no se pudo aplicar: si es opcional queda como 'parche_omitido' (no detiene nada), si no como
+    'parche_fallido' (recomp-native termina con error)."""
+    if label in PARCHES_OPCIONALES:
+        return Change(rel, 0, "parche_omitido", 0, None, label, f"{why}; opcional: {PARCHES_OPCIONALES[label]}")
+    return Change(rel, 0, "parche_fallido", 0, None, label, why)
 
 
 def apply_edits(text: str, rel: str, changes: list[Change]) -> str:
     for file, old, new, label in EDITS:
         if file != rel:
             continue
+        if new in text:
+            # 0.32.0: ya aplicado (por ejemplo, WiiCompiled trae el mismo cambio): compatible, no se toca.
+            changes.append(Change(rel, _line_of(text, text.index(new)), "edicion", 0, None, label, label + " (ya estaba)"))
+            continue
         n = text.count(old)
         if n != 1:
-            changes.append(Change(rel, 0, "parche_fallido", 0, None, label,
-                                  "texto no encontrado (¿cambió WiiCompiled?)" if n == 0 else f"aparece {n} veces"))
+            changes.append(_no_aplicado(rel, label, "texto no encontrado (¿cambió WiiCompiled?)" if n == 0
+                                        else f"el texto aparece {n} veces (el parche necesita un lugar único)"))
             continue
         line = _line_of(text, text.index(old))
         text = text.replace(old, new, 1)
@@ -2108,9 +2215,11 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
     result.structs = struct_checks(res.ws)
     patch_aurora(wiicompiled, result.changes)
     # Cambios de código fuera de src/ e include/ (CMake).
+    vistos: set[str] = set()
     for rel in sorted({e[0] for e in EDITS if not e[0].startswith(("src/", "include/"))}):
         path = os.path.join(out, rel)
         if os.path.isfile(path):
+            vistos.add(rel)
             with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
                 text = f.read()
             new = apply_edits(text, rel, result.changes)
@@ -2132,6 +2241,7 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
     for sub in ("src", "include"):
         for path in source_files(os.path.join(out, sub)):
             rel = os.path.relpath(path, out).replace("\\", "/")
+            vistos.add(rel)
             with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
                 text = f.read()
             new = apply_edits(text, rel, result.changes)
@@ -2140,6 +2250,17 @@ def retarget(wiicompiled: str, simbolos: str | None = None, rehacer: bool = Fals
             if new != text:
                 with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
                     f.write(new)
+    # 0.32.0: un parche cuyo archivo ya no existe tampoco se aplicó (antes pasaba sin aviso).
+    for rel, _old, _new, label in EDITS:
+        if rel not in vistos:
+            result.changes.append(_no_aplicado(rel, label, "no encontré el archivo (¿cambió WiiCompiled?)"))
+    for p in PATCHES:
+        if p.file not in vistos:
+            if p.optional:
+                result.changes.append(Change(p.file, 0, "parche_omitido", 0, None, p.label, "no hace falta en Wii Sports"))
+            else:
+                result.changes.append(Change(p.file, 0, "parche_fallido", 0, None, p.label,
+                                             "no encontré el archivo (¿cambió WiiCompiled?)"))
     with open(os.path.join(out, MISSING_FILE), "w", encoding="utf-8", newline="\n") as f:
         f.write(missing_stubs(sorted(res.missing)))
     with open(os.path.join(out, HLE_FILE), "w", encoding="utf-8", newline="\n") as f:
@@ -2264,12 +2385,21 @@ def report_markdown(r: RetargetResult) -> str:
     if r.structs:
         L += ["## Estructuras del SDK de 2006", "", "| Objeto | El runtime espera | Wii Sports | |", "|---|---|---|---|"]
         for name, want, got, what in r.structs:
-            ok = "✓" if got == want else "✗ revisar"
+            ok = "✓" if got == want else ("sin medir" if got is None else "✗ incompatible (detiene la compilación)")
             L.append(f"| {name} ({what}) | 0x{want:X} | {'—' if got is None else f'0x{got:X}'} | {ok} |")
         L.append("")
+    rp = resultado_parches(r)
+    L += ["## Estado de los parches", "", "| Estado | Cantidad |", "|---|---:|"]
+    L += [f"| {e.replace('_', ' ')} | {n} |" for e, n in rp["resumen"].items()]
+    L.append("")
     if by["parche_fallido"]:
-        L += ["## Parches no aplicados", "", "| Archivo | Parche | Motivo |", "|---|---|---|"]
-        L += [f"| {c.file} | {c.name} | {c.text} |" for c in by["parche_fallido"]]
+        L += ["## Parches obligatorios no aplicados (detienen la compilación)", "",
+              "| Archivo | Parche | Motivo | Qué hacer |", "|---|---|---|---|"]
+        L += [f"| {c.file} | {c.name} | {c.text} | {accion_parche(c)} |" for c in by["parche_fallido"]]
+        L.append("")
+    if by["parche_omitido"]:
+        L += ["## Parches opcionales no aplicables", "", "| Archivo | Parche | Motivo |", "|---|---|---|"]
+        L += [f"| {c.file} | {c.name} | {c.text} |" for c in by["parche_omitido"]]
         L.append("")
     if by["ausente"]:
         L += ["## Funciones de otros juegos sin equivalente", "",

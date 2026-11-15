@@ -297,10 +297,15 @@ class TestRetargetWiiSports(unittest.TestCase):
             self.assertIn("gpr[13] - 0x63a8u, 0)", misc)                      # mismo desfase sin comentario
             self.assertIn("r13 - 0x7adcu) /* axDspSlaveLength */", misc)
             self.assertIn("func_800EE9DC", misc)                               # vecinos → OSSaveContext
-            failed = {c.name for c in r.changes if c.kind == "parche_fallido"}
             # solo fallan los parches cuyo código no está en estos archivos de prueba
+            presentes = set(self.FILES)
+            failed = {c.name for c in r.changes if c.kind == "parche_fallido" and c.file in presentes}
             self.assertEqual(failed, {"fabricante y revision (boot.bin)", "ID del juego para OSGetAppGamename",
                                       "GXTokenInterruptHandler", "__savedGXdata", "OldCPUFifo"})
+            # 0.32.0: los de archivos que no existen también se anotan (antes pasaban sin aviso)
+            faltan = {c.name for c in r.changes if c.kind == "parche_fallido" and c.file not in presentes}
+            self.assertIn("botón B en el mando", faltan)
+            self.assertIn("pantalla de inicio", {c.name for c in r.changes if c.kind == "parche_omitido"})
             self.assertEqual(r.count("vecinos"), 1)
             self.assertEqual(r.count("sda"), 4)
             self.assertIn("✓", R.report_markdown(r))

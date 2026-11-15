@@ -13,6 +13,17 @@
 #                wiisports-choya/pgo/*.profraw a C:\Users\Public\choya-pgo (CHOYA_PGO_DIR=otra carpeta)
 #   pgo          compilación guiada por ese perfil (-O2 + -fprofile-use)
 #   pgo-O3       igual, con -O3
+#
+# Fiabilidad (0.32.0; detalle en el README, "Compilación fiable del port"):
+#   - recomp-native se detiene si un parche obligatorio no se aplica o un objeto del SDK no mide lo esperado.
+#   - WiiCompiled queda fijado en <WiiCompiled>/choya-dependencias.lock; si cambia, se detiene
+#     (CHOYA_DEPS_ACTUALIZAR=1 acepta la revisión nueva).
+#   - El perfil PGO se junta y valida en un temporal; si falla, se detiene (CHOYA_PGO_REUSAR=1 usa el anterior a
+#     propósito).
+#   - assets.wlpk se reutiliza solo si coinciden conversor, opciones, perfil y contenido del disco; si no se puede
+#     convertir, se detiene (CHOYA_SIN_PAQUETE=1 arma sin él, y el manifiesto lo dice).
+#   - El port se arma en una carpeta aparte con manifiesto.json (SHA-256 de cada archivo) y solo reemplaza al anterior
+#     si quedó completo y verificado.
 set -uo pipefail
 
 CHOYA="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -37,6 +48,9 @@ case "$OPT_MODO" in
   *) echo "CHOYA_OPT=$OPT_MODO no existe (usa O3, pgo-generar, pgo o pgo-O3)"; exit 1 ;;
 esac
 PORT="$HOME/choya-port"
+NUEVO="$PORT.nuevo"
+WIN="/mnt/c/Users/Public/choya-port"
+EST="$WC/$BUILD.choya"   # lo que cada paso deja para el manifiesto (dependencias, identidad, recursos)
 : > "$LOG"
 
 paso() { echo; echo "=== $* ===" | tee -a "$LOG"; }
@@ -46,13 +60,35 @@ paso "1/6 Revisar"
 [ -f "$WC/generated/build_shards/shards.cmake" ] || falla "falta generated/: corre primero build-wiisports-wsl.sh"
 command -v docker >/dev/null || falla "no encuentro docker (¿integración WSL de Docker Desktop apagada?)"
 docker info >/dev/null 2>&1 || falla "Docker no responde: abre Docker Desktop"
+rm -rf "$EST" && mkdir -p "$EST"
+# 0.32.0: la revisión de WiiCompiled (con aurora adentro) queda fijada; si cambió, se detiene y dice qué hacer.
+(cd "$CHOYA" && python3 -m choya dependencias "$WC" --json "$EST/dependencias.json" \
+   $([ "${CHOYA_DEPS_ACTUALIZAR:-0}" = 1 ] && echo --actualizar)) 2>&1 | tee -a "$LOG"
+[ "${PIPESTATUS[0]}" -eq 0 ] || falla "WiiCompiled no es la revisión fijada (ver arriba)"
 
 paso "2/6 Ajustar el runtime (recomp-native)"
-cd "$CHOYA" && python3 -m choya recomp-native "$WC" >>"$LOG" 2>&1 || falla "recomp-native"
-grep -E "AVISO|Estructuras" "$LOG" | tail -5
+cd "$CHOYA" && python3 -m choya recomp-native "$WC" > "$EST/recomp-native.txt" 2>&1
+RN=$?
+cat "$EST/recomp-native.txt" >> "$LOG"
+grep -E "^Parches:|AVISO|Estructuras" "$EST/recomp-native.txt" | tail -6
+if [ "$RN" -ne 0 ]; then
+  # 0.32.0: un parche obligatorio sin aplicar deja un runtime a medias que compila y parece correcto: se detiene.
+  grep -A4 "^ERROR" "$EST/recomp-native.txt" | head -40
+  cp "$LOG" /mnt/c/Users/Public/choya-build-arm64.log 2>/dev/null
+  falla "recomp-native (parches obligatorios o estructuras del SDK; detalle en $WC/projects/wiisports/retarget.md)"
+fi
+# Los cambios locales se clasifican después de recomp-native, con los parches de aurora de esta versión ya puestos.
+python3 -m choya dependencias "$WC" --json "$EST/dependencias-cambios.json" >>"$LOG" 2>&1 || falla "dependencias"
+python3 -m choya identidad-codigo "$WC" --json "$EST/identidad.json" 2>&1 | tee -a "$LOG"
+[ "${PIPESTATUS[0]}" -eq 0 ] || falla "identidad del código traducido"
+CODIGO_ID=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['huella'][:12])" "$EST/identidad.json")
 
 paso "3/6 Imagen de Docker (la primera vez tarda: baja Clang 21 y las bibliotecas arm64)"
 docker build -t "$IMG" "$CHOYA/docker/wiicompiled-arm64" >>"$LOG" 2>&1 || falla "docker build"
+IMAGEN_ID=$(docker image inspect -f '{{.Id}}' "$IMG" 2>/dev/null)
+CLANG_VER=$(docker run --rm "$IMG" clang-21 --version 2>/dev/null | head -1)
+[ -n "$CLANG_VER" ] || falla "no pude leer la versión de Clang de la imagen $IMG"
+echo "Compilador: $CLANG_VER (imagen ${IMAGEN_ID:7:12})" | tee -a "$LOG"
 
 echo "Código traducido: $OPT_MODO (carpeta $BUILD)" | tee -a "$LOG"
 if [ "$OPT_MODO" = pgo-generar ] && [ ! -f "$PGO/runtime/libclang_rt.profile-aarch64.a" ]; then
@@ -62,24 +98,30 @@ if [ "$OPT_MODO" = pgo-generar ] && [ ! -f "$PGO/runtime/libclang_rt.profile-aar
   docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$WC":"$WC" -v "$CHOYA/scripts":/choya-scripts:ro "$IMG" \
     bash /choya-scripts/pgo-runtime-aarch64.sh "$PGO/runtime" >>"$LOG" 2>&1 || falla "runtime de perfiles (PGO)"
 fi
+PGO_META=""
 if [ "$OPT_MODO" = pgo ] || [ "$OPT_MODO" = pgo-O3 ]; then
   # Los perfiles que tomó la consola (wiisports-choya/pgo/*.profraw) se juntan en uno solo.
   CRUDOS="${CHOYA_PGO_DIR:-/mnt/c/Users/Public/choya-pgo}"
-  ls "$CRUDOS"/*.profraw >/dev/null 2>&1 || falla "no hay perfiles en $CRUDOS: compila con CHOYA_OPT=pgo-generar, juega en la consola y copia wiisports-choya/pgo/*.profraw ahí"
-  # 0.31.0: sin los vacíos, y de los que traen varios perfiles seguidos (0.29.0/0.30.x) solo el último (el total).
-  rm -rf "$PGO/crudos"
-  python3 "$CHOYA/scripts/pgo-preparar.py" "$CRUDOS" "$PGO/crudos" 2>&1 | tee -a "$LOG"
-  ls "$PGO/crudos"/*.profraw >/dev/null 2>&1 || falla "ningún perfil utilizable en $CRUDOS (¿vacíos?)"
-  echo "Perfiles de la consola: $(ls "$PGO/crudos" | wc -l) archivos ($(du -sh "$PGO/crudos" | cut -f1))" | tee -a "$LOG"
-  docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$WC":"$WC" "$IMG" bash -c "
-    llvm-profdata-21 merge -o '$PERFIL.tmp' '$PGO'/crudos/*.profraw && mv '$PERFIL.tmp' '$PERFIL' &&
-    llvm-profdata-21 show '$PERFIL' | tail -3" 2>&1 | tee -a "$LOG"
-  [ -f "$PERFIL" ] || falla "llvm-profdata merge (¿los .profraw son de esta versión de Clang?)"
+  if [ "${CHOYA_PGO_REUSAR:-0}" != 1 ]; then
+    ls "$CRUDOS"/*.profraw >/dev/null 2>&1 || falla "no hay perfiles en $CRUDOS: compila con CHOYA_OPT=pgo-generar, juega en la consola y copia wiisports-choya/pgo/*.profraw ahí"
+    echo "Perfiles de la consola en $CRUDOS: $(ls "$CRUDOS"/*.profraw | wc -l) archivos ($(du -shc "$CRUDOS"/*.profraw | tail -1 | cut -f1))" | tee -a "$LOG"
+  fi
+  mkdir -p "$PGO"
+  # 0.32.0: se junta y valida en un temporal; el perfil anterior solo se reemplaza si el nuevo salió bien, y si
+  # falla la compilación se detiene (antes un merge fallido dejaba el perfil viejo y seguía con él).
+  python3 "$CHOYA/scripts/pgo-perfil.py" --crudos "$CRUDOS" --perfil "$PERFIL" --clang="$CLANG_VER" \
+    --profdata="docker run --rm -u $(id -u):$(id -g) -e HOME=/tmp -v $WC:$WC $IMG llvm-profdata-21" \
+    --identidad "$EST/identidad.json" --generar "$PGO/generar.json" \
+    $([ "${CHOYA_PGO_REUSAR:-0}" = 1 ] && echo --reusar) 2>&1 | tee -a "$LOG"
+  [ "${PIPESTATUS[0]}" -eq 0 ] || falla "perfil PGO (ver arriba; no se usa el anterior sin pedirlo)"
+  PGO_META="$PERFIL.json"
   # Ninja no sabe que el perfil cambió: si es otro, se recompila todo.
-  SELLO_PGO=$(sha1sum "$PERFIL" | cut -c1-12)
+  SELLO_PGO=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['sha256'][:12])" "$PGO_META")
+  [ "$(sha256sum "$PERFIL" | cut -c1-12)" = "$SELLO_PGO" ] || falla "el perfil $PERFIL no es el que se validó"
   if [ "$(cat "$WC/$BUILD/choya-perfil.txt" 2>/dev/null)" != "$SELLO_PGO" ] && [ -f "$WC/$BUILD/build.ninja" ]; then
     echo "Perfil nuevo: se recompila el código traducido" | tee -a "$LOG"
-    docker run --rm -u "$(id -u):$(id -g)" -v "$WC":"$WC" -w "$WC" "$IMG" cmake --build "$BUILD" --target clean >>"$LOG" 2>&1
+    docker run --rm -u "$(id -u):$(id -g)" -v "$WC":"$WC" -w "$WC" "$IMG" cmake --build "$BUILD" --target clean >>"$LOG" 2>&1 \
+      || falla "limpiar $BUILD para el perfil nuevo"
   fi
 fi
 
@@ -114,75 +156,90 @@ fi
 
 paso "5/6 Recursos convertidos (assets.wlpk del conversor de Choya)"
 # El conversor reduce las texturas del disco y las recodifica a ETC2/EAC; el motor de Choya las usa en vez de las que
-# aurora decodifica a RGBA8 (menos memoria, menos trabajo en el hilo del juego). Se convierte una vez y se vuelve a
-# convertir solo si cambia el conversor o el perfil. CHOYA_DISCO=carpeta del disco extraído (por defecto
-# /mnt/c/wii/RSPE01), PERFIL_TEXTURAS=rg35xxh|ligero|calidad, CHOYA_PAQUETE=un assets.wlpk ya hecho,
-# CHOYA_SIN_PAQUETE=1 = el port sin recursos convertidos.
+# aurora decodifica a RGBA8 (menos memoria, menos trabajo en el hilo del juego).
+# 0.32.0: se vuelve a usar solo si coinciden el código del conversor, las opciones, el perfil, numpy/Pillow y el
+# contenido del disco (huella de files/ y sys/ archivo por archivo, no fechas ni rutas). Si no se puede convertir se
+# detiene. CHOYA_DISCO=carpeta del disco extraído (por defecto /mnt/c/wii/RSPE01), PERFIL_TEXTURAS=rg35xxh|ligero|
+# calidad, CHOYA_PAQUETE=un assets.wlpk ya hecho, CHOYA_SIN_PAQUETE=1 = el port sin recursos convertidos (a propósito).
 DISCO="${CHOYA_DISCO:-/mnt/c/wii/RSPE01}"
 PERFIL_TEX="${PERFIL_TEXTURAS:-rg35xxh}"
 PAQ_DIR="$HOME/choya-paquete"
 PAQ=""
+REC="$EST/recursos.json"
 if [ "${CHOYA_SIN_PAQUETE:-0}" = 1 ]; then
-  echo "Sin recursos convertidos (CHOYA_SIN_PAQUETE=1)" | tee -a "$LOG"
+  echo "Sin recursos convertidos (CHOYA_SIN_PAQUETE=1): el manifiesto lo anota" | tee -a "$LOG"
+  echo '{"estado": "sin_paquete", "motivo": "CHOYA_SIN_PAQUETE=1 (pedido a propósito)"}' > "$REC"
 elif [ -n "${CHOYA_PAQUETE:-}" ]; then
-  [ -f "$CHOYA_PAQUETE" ] && PAQ="$CHOYA_PAQUETE" || echo "AVISO: no existe CHOYA_PAQUETE=$CHOYA_PAQUETE" | tee -a "$LOG"
+  python3 -m choya recursos --externo "$CHOYA_PAQUETE" --estado "$REC" 2>&1 | tee -a "$LOG"
+  [ "${PIPESTATUS[0]}" -eq 0 ] || falla "CHOYA_PAQUETE=$CHOYA_PAQUETE no es un assets.wlpk válido"
 else
-  SELLO="$(cd "$CHOYA/choya" && cat anim.py audio.py brsar.py compress.py containers.py engine.py etc.py gxtex.py mdl0.py model_pack.py \
-           optimize.py pack.py profiles.py scan.py tev.py u8.py 2>/dev/null | sha1sum | cut -c1-12) $PERFIL_TEX"
-  if [ -f "$PAQ_DIR/assets.wlpk" ] && [ "$(cat "$PAQ_DIR/sello.txt" 2>/dev/null)" = "$SELLO" ]; then
-    PAQ="$PAQ_DIR/assets.wlpk"
-    echo "Ya convertido (perfil $PERFIL_TEX): $PAQ" | tee -a "$LOG"
-  elif [ ! -d "$DISCO" ]; then
-    echo "AVISO: no encontré el disco extraído en $DISCO (CHOYA_DISCO=...): el port usará las texturas del disco" | tee -a "$LOG"
-  elif ! python3 -c "import numpy, PIL" 2>/dev/null; then
-    echo "AVISO: para convertir faltan numpy y pillow:  sudo apt install -y python3-numpy python3-pil python3-scipy" | tee -a "$LOG"
-  else
-    echo "Convirtiendo $DISCO con el perfil $PERFIL_TEX (la primera vez tarda unos minutos)..." | tee -a "$LOG"
-    rm -rf "$PAQ_DIR.tmp"
-    if (cd "$CHOYA" && python3 -m choya convert "$DISCO" "$PAQ_DIR.tmp" -p "$PERFIL_TEX" --sin-animaciones) >>"$LOG" 2>&1 \
-       && [ -f "$PAQ_DIR.tmp/assets.wlpk" ]; then
-      rm -rf "$PAQ_DIR" && mv "$PAQ_DIR.tmp" "$PAQ_DIR" && echo "$SELLO" > "$PAQ_DIR/sello.txt"
-      PAQ="$PAQ_DIR/assets.wlpk"
-      grep -m3 -iE "texturas|memoria|total" "$PAQ_DIR/report.md" | tee -a "$LOG"
-    else
-      echo "AVISO: la conversión falló (detalles en $LOG): el port usará las texturas del disco" | tee -a "$LOG"
-    fi
-  fi
+  [ -d "$DISCO" ] || falla "no encontré el disco extraído en $DISCO (CHOYA_DISCO=...). Para armar sin recursos convertidos: CHOYA_SIN_PAQUETE=1"
+  python3 -c "import numpy, PIL" 2>/dev/null || falla "para convertir faltan numpy y pillow:  sudo apt install -y python3-numpy python3-pil python3-scipy  (o CHOYA_SIN_PAQUETE=1)"
+  echo "Revisando el disco y los recursos convertidos (si hay que convertir, la primera vez tarda unos minutos)..."
+  python3 -m choya recursos "$DISCO" "$PAQ_DIR" -p "$PERFIL_TEX" --opcion=--sin-animaciones --estado "$REC" >>"$LOG" 2>&1
+  RC=$?
+  grep -E "^(Huella del disco|Hay que convertir|Recursos convertidos|ERROR)" "$LOG" | tail -4
+  [ "$RC" -eq 0 ] || falla "conversión de recursos (el paquete anterior no se usa; CHOYA_SIN_PAQUETE=1 arma sin él)"
+  grep -m3 -iE "texturas|memoria|total" "$PAQ_DIR/report.md" 2>/dev/null | tee -a "$LOG"
 fi
+PAQ=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('paquete') or '')" "$REC")
 
 paso "6/6 Armar el port"
-rm -rf "$PORT" && mkdir -p "$PORT/wiisports-choya/lib" "$PORT/wiisports-choya/game"
+# 0.32.0: se arma en $NUEVO y reemplaza a $PORT solo si quedó completo y verificado contra su manifiesto.
+rm -rf "$NUEVO" && mkdir -p "$NUEVO/wiisports-choya/lib" "$NUEVO/wiisports-choya/game" || falla "carpeta $NUEVO"
 if [ -n "$PAQ" ]; then
-  cp "$PAQ" "$PORT/wiisports-choya/assets.wlpk" && \
-    echo "Recursos convertidos: wiisports-choya/assets.wlpk ($(du -h "$PAQ" | cut -f1))" | tee -a "$LOG"
+  cp "$PAQ" "$NUEVO/wiisports-choya/assets.wlpk" || falla "copiar assets.wlpk"
+  echo "Recursos convertidos: wiisports-choya/assets.wlpk ($(du -h "$PAQ" | cut -f1))" | tee -a "$LOG"
 fi
 B="$WC/$BUILD"
-docker run --rm -u "$(id -u):$(id -g)" -v "$WC":"$WC" -v "$PORT":"$PORT" "$IMG" bash -c "
-  aarch64-linux-gnu-strip -o '$PORT/wiisports-choya/WiiCompiled' '$B/WiiCompiled' &&
-  file '$PORT/wiisports-choya/WiiCompiled' &&
+docker run --rm -u "$(id -u):$(id -g)" -v "$WC":"$WC" -v "$NUEVO":"$NUEVO" "$IMG" bash -c "
+  set -o pipefail
+  aarch64-linux-gnu-strip -o '$NUEVO/wiisports-choya/WiiCompiled' '$B/WiiCompiled' &&
+  file '$NUEVO/wiisports-choya/WiiCompiled' &&
   aarch64-linux-gnu-readelf -d '$B/WiiCompiled' | grep NEEDED &&
   aarch64-linux-gnu-readelf -V '$B/WiiCompiled' | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1" \
-  | tee "$PORT/wiisports-choya/necesita.txt" | tee -a "$LOG"
+  | tee "$NUEVO/wiisports-choya/necesita.txt" | tee -a "$LOG"
+[ "${PIPESTATUS[0]}" -eq 0 ] || falla "strip/readelf del ejecutable"
 # La SD de KNULLI no guarda enlaces simbólicos: cada .so se copia con el nombre que pide el ejecutable (libpng16.so.16).
 find "$B" -maxdepth 3 -name "*.so*" -type f -not -path "*/CMakeFiles/*" | while read -r f; do
-  cp -L "$f" "$PORT/wiisports-choya/lib/$(basename "$f" | sed -E 's/(\.so\.[0-9]+)\..*/\1/')"
+  cp -L "$f" "$NUEVO/wiisports-choya/lib/$(basename "$f" | sed -E 's/(\.so\.[0-9]+)\..*/\1/')" || exit 1
+done || falla "copiar las bibliotecas"
+for f in dsp_coef.bin initial_pipeline_cache.db cacert.pem; do
+  if [ -f "$B/$f" ]; then cp "$B/$f" "$NUEVO/wiisports-choya/" || falla "copiar $f"; fi
 done
-for f in dsp_coef.bin initial_pipeline_cache.db cacert.pem; do [ -f "$B/$f" ] && cp "$B/$f" "$PORT/wiisports-choya/"; done
-[ -d "$B/wii_bootstrap" ] && cp -r "$B/wii_bootstrap" "$PORT/wiisports-choya/"
-cp "$CHOYA/scripts/knulli/Wii Sports (Choya).sh" "$CHOYA/scripts/knulli/Wii Sports (Choya) - diagnostico.sh" "$PORT/"
-echo "Copia aquí la carpeta DATA de tu disco (la que tiene files y sys)." > "$PORT/wiisports-choya/game/LEEME.txt"
+if [ -d "$B/wii_bootstrap" ]; then cp -r "$B/wii_bootstrap" "$NUEVO/wiisports-choya/" || falla "copiar wii_bootstrap"; fi
+cp "$CHOYA/scripts/knulli/Wii Sports (Choya).sh" "$CHOYA/scripts/knulli/Wii Sports (Choya) - diagnostico.sh" "$NUEVO/" \
+  || falla "copiar los lanzadores"
+echo "Copia aquí la carpeta DATA de tu disco (la que tiene files y sys)." > "$NUEVO/wiisports-choya/game/LEEME.txt"
 case "$OPT_MODO" in
   pgo-generar) echo "pgo-generar (toma el perfil: va más lento; los perfiles quedan en wiisports-choya/pgo)" ;;
-  pgo|pgo-O3) echo "$OPT_MODO (perfil $(cat "$WC/$BUILD/choya-perfil.txt" 2>/dev/null))" ;;
+  pgo|pgo-O3) echo "$OPT_MODO (perfil $SELLO_PGO)" ;;
   *) echo "$OPT_MODO" ;;
-esac > "$PORT/wiisports-choya/compilado.txt"
-# 0.31.2: qué versión es el port y cuándo se armó (el resumen de la consola lo muestra en la primera línea, y
-# scripts/copiar-a-consola.ps1 lo compara después de copiar).
-echo "Choya $VERSION_CHOYA, armado el $(date '+%d/%m/%Y %H:%M:%S')" > "$PORT/wiisports-choya/version.txt"
+esac > "$NUEVO/wiisports-choya/compilado.txt"
+# 0.32.0: los perfiles que tome esta versión llevan en el nombre la identidad del código traducido.
+[ "$OPT_MODO" = pgo-generar ] && echo "$CODIGO_ID" > "$NUEVO/wiisports-choya/pgo-id.txt"
+# Manifiesto (qué se compiló, con qué, SHA-256 de cada archivo) y version.txt con la identidad del port.
+# (--flags=... con "=": los valores empiezan con guion, -O3, -fprofile-use=...)
+python3 -m choya manifiesto "$NUEVO" --wc "$WC" --build "$B" --modo "$OPT_MODO" --flags="$OPT_FLAGS" \
+  --enlace="$OPT_ENLACE" --clang="$CLANG_VER" --imagen="$IMAGEN_ID" --deps "$EST/dependencias.json" --deps-cambios "$EST/dependencias-cambios.json" \
+  --recursos "$REC" --identidad "$EST/identidad.json" ${PGO_META:+--pgo "$PGO_META"} 2>&1 | tee -a "$LOG"
+[ "${PIPESTATUS[0]}" -eq 0 ] || falla "manifiesto del port"
+python3 -m choya publicar-port "$NUEVO" "$PORT" 2>&1 | tee -a "$LOG"
+[ "${PIPESTATUS[0]}" -eq 0 ] || falla "el port nuevo no quedó completo: $PORT sigue con el anterior"
+if [ "$OPT_MODO" = pgo-generar ]; then
+  python3 -c "import json,sys; json.dump({'codigo_traducido': json.load(open(sys.argv[1]))['huella'], 'choya': sys.argv[2]}, open(sys.argv[3], 'w'))" \
+    "$EST/identidad.json" "$VERSION_CHOYA" "$PGO/generar.json"
+fi
 ls -la "$PORT/wiisports-choya" "$PORT/wiisports-choya/lib" | tee -a "$LOG"
 du -sh "$PORT" | tee -a "$LOG"
-rm -rf /mnt/c/Users/Public/choya-port && cp -r "$PORT" /mnt/c/Users/Public/choya-port \
-  && echo "Listo: C:\\Users\\Public\\choya-port" | tee -a "$LOG"
+head -12 "$PORT/wiisports-choya/manifiesto.txt" | tee -a "$LOG"
+# La copia para Windows también se arma aparte y se verifica antes de reemplazar la anterior.
+if [ -d /mnt/c/Users/Public ]; then
+  rm -rf "$WIN.nuevo" && cp -r "$PORT" "$WIN.nuevo" || falla "copiar el port a $WIN.nuevo"
+  python3 -m choya publicar-port "$WIN.nuevo" "$WIN" 2>&1 | tee -a "$LOG"
+  [ "${PIPESTATUS[0]}" -eq 0 ] || falla "la copia en C:\\Users\\Public\\choya-port no quedó igual (sigue la anterior)"
+  echo "Listo: C:\\Users\\Public\\choya-port ($(cat "$WIN/wiisports-choya/version.txt"))" | tee -a "$LOG"
+fi
 cp "$LOG" /mnt/c/Users/Public/choya-build-arm64.log 2>/dev/null
-echo "Para pasarlo a la consola (PowerShell, con la tarjeta en la PC):"
+echo "Para pasarlo a la consola (PowerShell, con la tarjeta en la PC; comprueba cada archivo con el manifiesto):"
 echo "  powershell -ExecutionPolicy Bypass -File \$HOME\\choya-wii-converter\\scripts\\copiar-a-consola.ps1"

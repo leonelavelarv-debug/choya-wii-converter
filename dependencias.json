@@ -1,0 +1,13 @@
+{
+ "nota": "Revisiones con las que se probaron los parches de Choya. Si la tuya es otra, la compilación solo avisa: los parches obligatorios comprueban su texto uno por uno y detienen todo si alguno no encaja. La revisión que usa tu PC queda fijada en <WiiCompiled>/choya-dependencias.lock.",
+ "wiicompiled": {
+  "repo": "https://github.com/josiahg2502-glitch/BrawlRecompiled",
+  "carpeta": "wiicompiled",
+  "commit": "a77be8847ec9d8cf6128f086fe9c493d105ecbce",
+  "aurora": "aurora-main, dentro del mismo repositorio (sin revisión propia)"
+ },
+ "docker": {
+  "base": "ubuntu:24.04",
+  "clang": "21 (apt.llvm.org, llvm-toolchain-noble-21); la versión exacta queda en el manifiesto del port"
+ }
+}

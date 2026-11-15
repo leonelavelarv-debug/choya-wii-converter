@@ -84,7 +84,8 @@ class ScriptDeCompilacion(unittest.TestCase):
         texto = leer(SCRIPT)
         self.assertIn("-DCHOYA_OPT_TRADUCIDO='$OPT_FLAGS'", texto)
         self.assertIn("-DCHOYA_ENLACE_EXTRA='$OPT_ENLACE'", texto)
-        self.assertIn("llvm-profdata-21 merge", texto)
+        self.assertIn("llvm-profdata-21", texto)          # 0.32.0: el merge lo hace scripts/pgo-perfil.py
+        self.assertIn("pgo-perfil.py", texto)
         self.assertIn("compilado.txt", texto)
         self.assertIn("-DCHOYA_COMPILADO='$COMPILADO'", texto)  # 0.30.0: también dentro del binario
 
@@ -118,7 +119,9 @@ class ScriptDeCompilacion(unittest.TestCase):
 class GuardadoDelPerfil(unittest.TestCase):
     def test_lanzador(self):
         texto = leer(LANZADOR)
-        self.assertIn('export LLVM_PROFILE_FILE="$DIR/pgo/wiisports-%m.profraw"', texto)
+        # 0.32.0: con la identidad del código traducido (pgo-id.txt) en el nombre
+        self.assertIn('export LLVM_PROFILE_FILE="$DIR/pgo/wiisports-${PGO_ID:+$PGO_ID-}%m.profraw"', texto)
+        self.assertIn('pgo-id.txt', texto)
         self.assertIn("compilado.txt", texto)
 
     def test_choya_gles(self):
@@ -152,7 +155,8 @@ class GuardadoDelPerfil(unittest.TestCase):
             self.assertEqual(open(os.path.join(sal, "varios.profraw"), "rb").read(), magia + b"C" * 104)
             self.assertEqual(open(os.path.join(sal, "cortado.profraw"), "rb").read(), magia + b"B" * 100)
             self.assertEqual(open(os.path.join(sal, "uno.profraw"), "rb").read(), magia + b"Z" * 50)
-        self.assertIn('python3 "$CHOYA/scripts/pgo-preparar.py" "$CRUDOS" "$PGO/crudos"', leer(SCRIPT))
+        # 0.32.0: lo usa pgo-perfil.py (que el script llama), en una carpeta temporal
+        self.assertIn('"pgo-preparar.py"', leer(os.path.join(RAIZ, "scripts", "pgo-perfil.py")))
 
     @unittest.skipUnless(os.environ.get("CHOYA_PRUEBA_PGO_RED") == "1" and shutil.which("clang") and
                          shutil.which("llvm-profdata"), "CHOYA_PRUEBA_PGO_RED=1 (baja compiler-rt de github.com)")
@@ -204,9 +208,9 @@ class VersionEnLaConsola(unittest.TestCase):
         self.assertIn('echo "choya: lanzador $LANZADOR_VERSION; port', leer(LANZADOR))
 
     def test_port_con_version_txt(self):
-        texto = leer(SCRIPT)
-        self.assertIn('> "$PORT/wiisports-choya/version.txt"', texto)
-        self.assertIn("Choya $VERSION_CHOYA", texto)
+        # 0.32.0: version.txt lo escribe el manifiesto (versión, commit, modo e identidad del port, sin fecha);
+        # tests/test_fiabilidad.py lo prueba de verdad.
+        self.assertIn('python3 -m choya manifiesto "$NUEVO"', leer(SCRIPT))
 
     def test_script_de_copia(self):
         ruta = os.path.join(RAIZ, "scripts", "copiar-a-consola.ps1")
@@ -214,5 +218,5 @@ class VersionEnLaConsola(unittest.TestCase):
             datos = f.read()
         self.assertTrue(datos.startswith(b"\xef\xbb\xbf"))  # con BOM: PowerShell 5 lo lee como UTF-8
         texto = datos.decode("utf-8-sig")
-        for algo in ("/IS /IT", "Get-FileHash", "wiisports-choya\\version.txt", "Wii Sports (Choya).sh"):
+        for algo in ("/IS /IT", "Get-FileHash", "manifiesto.json", "SHA256", "-LiteralPath"):
             self.assertIn(algo, texto)

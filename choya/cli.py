@@ -136,23 +136,71 @@ def cmd_recomp_native(a):
     print(f"Parches revisados a mano:   {r.count('parche')}")
     print(f"Nativas propias de Choya:   {r.count('choya_nativa')} ({retarget.HLE_FILE})")
     print(f"Funciones de otros juegos:  {r.count('ausente')} (stub en {retarget.MISSING_FILE})")
-    bad = [c for c in r.changes if c.kind == "parche_fallido"]
-    for c in bad:
-        print(f"AVISO: parche no aplicado: {c.name} ({c.file}): {c.text}")
+    rp = retarget.resultado_parches(r)
+    with open(os.path.join(proj, "parches.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump(rp, f, ensure_ascii=False, indent=1)
+    res = rp["resumen"]
+    print(f"Parches: {res['aplicado']} aplicados, {res['ya_aplicado']} ya aplicados (compatibles), "
+          f"{res['opcional_no_aplicable']} opcionales no aplicables, {res['obligatorio_fallido']} obligatorios fallidos")
+    for c in r.changes:
+        if c.kind == "parche_omitido":
+            print(f"AVISO: parche opcional no aplicado: {c.name} ({c.file}): {c.text}")
     g = r.game
     if g is not None and g.entry is not None:
         lo, hi = g.arena_lo, g.arena_hi
         print(f"Entrada {g.entry:08X} · SDA {g.sda or 0:08X}/{g.sda2 or 0:08X} · MEM1 arena "
               f"{'?' if lo is None else f'{lo:08X}'}-{'?' if hi is None else f'{hi:08X}'}")
-    wrong = [s for s in r.structs if s[2] != s[1]]
+    wrong = retarget.estructuras_incompatibles(r)
+    sin_medir = [s[0] for s in r.structs if s[2] is None]
     print("Estructuras del SDK: " + ("iguales a las que espera el runtime" if not wrong else
-                                     "REVISAR " + ", ".join(s[0] for s in wrong)))
+                                     "INCOMPATIBLES " + ", ".join(s[0] for s in wrong))
+          + (f" (sin medir: {', '.join(sin_medir)})" if sin_medir else ""))
     print(f"Sin resolver (a mano):      {r.count('sin_resolver')}")
     print(f"Informe:                    {rep}")
     if os.path.isfile(yml) and retarget.update_manifest(yml):
         print(f"recomp.yml ahora usa {retarget.OUT_DIR}/src para las funciones nativas")
     else:
         print("AVISO: no encontré projects/wiisports/recomp.yml; corre primero recomp-prep")
+    # 0.32.0: un parche obligatorio sin aplicar o un objeto del SDK de otro tamaño detienen todo (código 3): el port
+    # saldría con un runtime a medias que compila y parece correcto.
+    fallidos = retarget.fallidos_obligatorios(r)
+    for c in fallidos:
+        print(f"ERROR: parche obligatorio no aplicado\n  archivo: {c.file}\n  parche:  {c.name}\n"
+              f"  motivo:  {c.text}\n  qué hacer: {retarget.accion_parche(c)}")
+    for name, want, got, what in wrong:
+        print(f"ERROR: {name} ({what}) mide 0x{got:X} en Wii Sports y el runtime espera 0x{want:X}\n"
+              f"  qué hacer: el SDK de este disco no es el que conoce el runtime; revisa el disco (Wii Sports USA Rev 1)"
+              f" y los símbolos (--simbolos)")
+    if fallidos or wrong:
+        print(f"recomp-native: {len(fallidos)} parches obligatorios fallidos, {len(wrong)} estructuras incompatibles "
+              f"(detalle en {rep} y {os.path.join(proj, 'parches.json')})")
+        sys.exit(3)
+
+
+def _dependencias(a) -> int:
+    from . import dependencias
+    return dependencias.main(a)
+
+
+def cmd_identidad_codigo(a):
+    from . import huellas
+    ident = huellas.identidad_codigo(a.wiicompiled)
+    if a.json:
+        huellas.escribir_json(a.json, ident)
+    if not ident.get("huella"):
+        sys.exit(f"identidad del código traducido: {ident.get('motivo')}")
+    print(f"Código traducido: {ident['huella'][:16]} ({ident['archivos']} archivos) · main.dol "
+          f"{(ident.get('main_dol_sha256') or '—')[:16]}")
+
+
+def _recursos(a) -> int:
+    from . import recursos_cache
+    return recursos_cache.main(a)
+
+
+def _manifiesto(fn: str, a) -> int:
+    from . import manifiesto
+    return getattr(manifiesto, fn)(a)
 
 
 def cmd_donde(a):
@@ -281,6 +329,54 @@ def main(argv=None):
 
     pr = sub.add_parser("profiles", help="lista los perfiles de optimización")
     pr.set_defaults(fn=cmd_profiles)
+
+    # 0.32.0: fiabilidad de la compilación del port (los usa scripts/build-wiisports-arm64.sh).
+    dp = sub.add_parser("dependencias", help="revisión de WiiCompiled/aurora fijada y cambios locales")
+    dp.add_argument("wiicompiled")
+    dp.add_argument("--json", help="guardar el estado en este archivo")
+    dp.add_argument("--actualizar", action="store_true", help="aceptar la revisión actual como la fijada")
+    dp.set_defaults(fn=lambda a: sys.exit(_dependencias(a)))
+
+    ic = sub.add_parser("identidad-codigo", help="huella del código traducido (generated/) y del main.dol")
+    ic.add_argument("wiicompiled")
+    ic.add_argument("--json", help="guardar en este archivo")
+    ic.set_defaults(fn=cmd_identidad_codigo)
+
+    rc = sub.add_parser("recursos", help="assets.wlpk con caché por contenido (convierte solo si cambió algo)")
+    rc.add_argument("disco", nargs="?", default="", help="carpeta del disco extraído")
+    rc.add_argument("destino", nargs="?", default="", help="carpeta donde se guarda el paquete convertido")
+    rc.add_argument("-p", "--perfil", default="rg35xxh")
+    rc.add_argument("--opcion", action="append", help="opción extra para convert (p. ej. --sin-animaciones)")
+    rc.add_argument("--externo", help="usar este assets.wlpk ya hecho (se valida y se anota)")
+    rc.add_argument("--estado", help="escribir el resultado (JSON) en este archivo")
+    rc.add_argument("--forzar", action="store_true", help="convertir aunque la clave sea la misma")
+    rc.add_argument("--conversor", help=argparse.SUPPRESS)  # pruebas: otro comando en vez de 'choya convert'
+    rc.set_defaults(fn=lambda a: sys.exit(_recursos(a)))
+
+    mf = sub.add_parser("manifiesto", help="escribe el manifiesto del port (lo usa el script de compilación)")
+    mf.add_argument("port")
+    mf.add_argument("--wc", required=True)
+    mf.add_argument("--build", required=True)
+    mf.add_argument("--modo", required=True)
+    mf.add_argument("--flags", default="")
+    mf.add_argument("--enlace", default="")
+    mf.add_argument("--clang", default=None)
+    mf.add_argument("--imagen", default=None)
+    mf.add_argument("--deps")
+    mf.add_argument("--deps-cambios", help="estado de WiiCompiled después de recomp-native (cambios locales)")
+    mf.add_argument("--recursos")
+    mf.add_argument("--pgo")
+    mf.add_argument("--identidad")
+    mf.set_defaults(fn=lambda a: sys.exit(_manifiesto("main_crear", a)))
+
+    vp = sub.add_parser("verificar-port", help="comprueba un port (o su copia en la microSD) contra su manifiesto")
+    vp.add_argument("carpeta", help="carpeta que contiene wiisports-choya")
+    vp.set_defaults(fn=lambda a: sys.exit(_manifiesto("main_verificar", a)))
+
+    pp = sub.add_parser("publicar-port", help="reemplaza un port por otro solo si el nuevo está completo")
+    pp.add_argument("nuevo")
+    pp.add_argument("destino")
+    pp.set_defaults(fn=lambda a: sys.exit(_manifiesto("main_publicar", a)))
 
     # Nombres japoneses (Shift-JIS) en modelos y archivos: la consola de Windows no siempre los acepta.
     for stream in (sys.stdout, sys.stderr):
