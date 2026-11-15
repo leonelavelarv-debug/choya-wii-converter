@@ -3393,6 +3393,73 @@ struct IdsGrupo {
 };
 std::unordered_map<uint64_t, IdsGrupo> g_idsGrupo;
 
+// --- Censo de copias del EFB (0.36.0) -----------------------------------------------------------------------------
+// Con la 0.35.0 el hilo de la pantalla es el límite (~48-52 ms por cuadro dibujado, ~20 cuadros/s con el juego a
+// ~33): 23 copias del EFB por cuadro en tenis y ~0.7 ms esperando en el driver al enlazar cada una (el pase anterior
+// se cierra ahí), más la vuelta. Para saber cuáles se pueden quitar, juntar o achicar, el censo anota por destino:
+// cuántas veces se copia, de qué zona a qué tamaño, y si alguien la lee (un dibujo o una paleta) en el mismo cuadro,
+// en uno después o nunca antes de volver a copiarla. CHOYA_GX_CENSO_COPIAS=0 lo apaga.
+bool censo_activo() {
+  static const bool on = [] {
+    const char* e = std::getenv("CHOYA_GX_CENSO_COPIAS");
+    return e == nullptr || std::strcmp(e, "0") != 0;
+  }();
+  return on;
+}
+struct CensoCopia {
+  uint64_t copias = 0;
+  uint64_t mismoCuadro = 0;  // la leyeron en el mismo cuadro de la copia (antes de copiarla otra vez)
+  uint64_t despues = 0;      // la leyeron por primera vez en un cuadro posterior
+  uint64_t sinLeer = 0;      // se volvió a copiar sin que nadie la leyera en medio
+  uint64_t dibujos = 0;      // dibujos que la leen (cada dibujo cuenta)
+  uint64_t cuadroCopia = 0;
+  bool leida = true;         // leída desde la última copia (la primera no cuenta como "sin leer")
+  int w = 0, h = 0;
+  uint32_t texW = 0, texH = 0, fmt = 0;
+};
+std::unordered_map<uint64_t, CensoCopia> g_censo;
+uint64_t g_censoCuadro = 0;    // cuadros dibujados por el motor desde el inicio
+uint64_t g_censoCuadros = 0;   // cuadros desde el último informe
+int g_censoN = 0;              // copias que lee el grupo de texturas actual
+CensoCopia* g_censoGrupo[8] = {};
+
+void censo_copia(const Item& it) {
+  CensoCopia& c = g_censo[it.copy.tex];
+  ++c.copias;
+  if (!c.leida) ++c.sinLeer;
+  c.leida = false;
+  c.cuadroCopia = g_censoCuadro;
+  c.w = it.copy.rect.width;
+  c.h = it.copy.rect.height;
+  c.texW = it.copy.texW;
+  c.texH = it.copy.texH;
+  c.fmt = it.copy.fmt;
+}
+void censo_leer(CensoCopia& c) {
+  if (!c.leida) {
+    c.leida = true;
+    ++(c.cuadroCopia == g_censoCuadro ? c.mismoCuadro : c.despues);
+  }
+}
+// El grupo de texturas cambió: qué copias del censo lee (ids de aurora, como grupo_lee_pendiente).
+void censo_grupo(uint64_t bindGroup) {
+  g_censoN = 0;
+  if (g_censo.empty() || bindGroup == 0) return;
+  IdsGrupo& ids = g_idsGrupo[bindGroup];
+  const uint64_t gen = g_bindGen.load(std::memory_order_acquire);
+  if (ids.gen != gen) {
+    BindDesc bd;
+    if (!find_bind_group(bindGroup, bd)) return;
+    for (int i = 0; i < 8; ++i) ids.tex[i] = bd.tex[i];
+    ids.gen = gen;
+  }
+  for (int i = 0; i < 8; ++i) {
+    if (ids.tex[i] == 0) continue;
+    auto e = g_censo.find(ids.tex[i]);
+    if (e != g_censo.end()) g_censoGrupo[g_censoN++] = &e->second;
+  }
+}
+
 bool grupo_lee_pendiente(uint64_t bindGroup) {
   if (g_pendientes.empty() || bindGroup == 0) return false;
   IdsGrupo& ids = g_idsGrupo[bindGroup];
@@ -3764,6 +3831,14 @@ void texture_packed_data(uint64_t id, uint32_t width, uint32_t height, uint32_t 
 // hilo GX de Choya (0.23.0, gameTid y gxTid), el hilo GX va solo en el penúltimo núcleo y los demás en el resto. Se
 // llama desde el hilo que procesa el GX; dos veces, para alcanzar a los hilos que nacen después. CHOYA_NUCLEOS=0 lo
 // apaga.
+Nucleos repartir_nucleos(int ncpu, bool conGx, bool gxSolo) noexcept {
+  Nucleos r;
+  r.juego = ncpu - 1;
+  r.gx = r.juego - 1;  // sin hilo GX no se usa
+  r.otros = conGx ? (gxSolo ? r.gx : r.gx + 1) : r.juego;
+  return r;
+}
+
 void pin_game_thread(int gameTid, int gxTid) noexcept {
 #if defined(__linux__)
   const char* env = std::getenv("CHOYA_NUCLEOS");
@@ -3772,9 +3847,17 @@ void pin_game_thread(int gameTid, int gxTid) noexcept {
   if (ncpu < 3 || ncpu > CPU_SETSIZE) return;
   const pid_t self = gameTid > 0 ? static_cast<pid_t>(gameTid) : static_cast<pid_t>(syscall(SYS_gettid));
   const bool conGx = gxTid > 0 && gxTid != self && ncpu >= 4;
-  const int gameCpu = static_cast<int>(ncpu) - 1;
-  const int gxCpu = gameCpu - 1;
-  const int otros = conGx ? gxCpu : gameCpu;  // núcleos 0..otros-1
+  // 0.36.0: el hilo GX usa ~37 % de su núcleo y el hilo de la pantalla, con los hilos de la Mali, esperaba turno
+  // 14-20 % del tiempo en los otros dos. Ahora los demás hilos también pueden usar el núcleo del hilo GX (él sigue
+  // fijo ahí); CHOYA_GX_NUCLEO_SOLO=1 (archivo hilo-gx-solo) se lo vuelve a dejar solo, como antes.
+  static const bool gxSolo = [] {
+    const char* e = std::getenv("CHOYA_GX_NUCLEO_SOLO");
+    return e != nullptr && std::strcmp(e, "1") == 0;
+  }();
+  const Nucleos rep = repartir_nucleos(static_cast<int>(ncpu), conGx, gxSolo);
+  const int gameCpu = rep.juego;
+  const int gxCpu = rep.gx;
+  const int otros = rep.otros;  // núcleos 0..otros-1
   cpu_set_t game, gx, others;
   CPU_ZERO(&game);
   CPU_ZERO(&gx);
@@ -3799,8 +3882,9 @@ void pin_game_thread(int gameTid, int gxTid) noexcept {
     ::closedir(d);
   }
   if (conGx) {
-    log_line("motor: hilo del juego %d solo en el núcleo %d; hilo GX %d solo en el núcleo %d; %d hilos más en los "
-             "núcleos 0-%d", static_cast<int>(self), gameCpu, gxTid, gxCpu, moved, otros - 1);
+    log_line("motor: hilo del juego %d solo en el núcleo %d; hilo GX %d en el núcleo %d%s; %d hilos más en los "
+             "núcleos 0-%d", static_cast<int>(self), gameCpu, gxTid, gxCpu,
+             gxSolo ? " (solo él: hilo-gx-solo)" : " (los demás también lo usan)", moved, otros - 1);
   } else {
     log_line("motor: hilo del juego %d solo en el núcleo %d; %d hilos más en los núcleos 0-%d", static_cast<int>(self),
              gameCpu, moved, otros - 1);
@@ -4548,6 +4632,9 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   g_tMarca = cpuStart;
   const double cpuHiloIni = cpu_hilo_ms();
   gpu_cuadro_empezar();
+  ++g_censoCuadro;
+  ++g_censoCuadros;
+  uint64_t censoGrupo = ~0ull;  // grupo de texturas para el que se calculó g_censoGrupo
   // Tamaño del EFB: el pase más grande del cuadro.
   int efbW = 1, efbH = 1;
   for (const Item& pass : f.items) {
@@ -4775,6 +4862,10 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     case Op::Copy: {
       mali_mark(kMaliDibujos);
       gpu_pases_tramo(passIndex, 1);
+      if (censo_activo()) {
+        censo_copia(it);
+        censoGrupo = ~0ull;  // la copia puede ser nueva en el censo: recalcular lo que leen los grupos
+      }
       if (copies_enabled()) {
         if (copia_directa_sirve(it)) {
           if (g_efbFuera) reponer_tras_copia();  // lee el EFB enlazado (glCopyTexSubImage2D)
@@ -4794,6 +4885,10 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       mali_mark(kMaliDibujos);
       gpu_pases_tramo(passIndex, 1);
       convertir_pendientes();  // la paleta lee la copia
+      if (censo_activo()) {
+        auto e = g_censo.find(it.conv.src);
+        if (e != g_censo.end()) censo_leer(e->second);
+      }
       run_palette_conv(it);
       gpu_pases_tramo(passIndex, 0);
       mali_mark(kMaliCopias);
@@ -4929,6 +5024,16 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
         set_color_mask(true, true);
       }
       ++drawIndex;
+      if (censo_activo()) {
+        if (it.draw.bindGroup != censoGrupo) {
+          censo_grupo(it.draw.bindGroup);
+          censoGrupo = it.draw.bindGroup;
+        }
+        for (int k = 0; k < g_censoN; ++k) {
+          censo_leer(*g_censoGrupo[k]);
+          ++g_censoGrupo[k]->dibujos;
+        }
+      }
       if (g_mali.curPass >= 0) ++g_mali.pass[g_mali.curPass].draws;
       if (g_gpuPases.midiendo) ++g_gpuPases.infoCuadro[gpu_pase_idx(passIndex)].dibujos;
       gl.DrawElements(kTriangles, static_cast<GLsizei>(it.draw.indexCount), kUnsignedShort,
@@ -5080,6 +5185,51 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
           log_line("motor: copias directas: apagadas (%s); cada copia dibuja leyendo el EFB",
                    gl.CopyTexSubImage2D == nullptr ? "el driver no da glCopyTexSubImage2D" : "CHOYA_GX_COPIA_DIRECTA=1 las prende");
         }
+      }
+      if (censo_activo() && g_censoCuadros > 0 && !g_censo.empty()) {  // 0.36.0
+        const double n = static_cast<double>(g_censoCuadros);
+        uint64_t cop = 0, mismo = 0, desp = 0, sin = 0, destinos = 0;
+        std::vector<std::pair<uint64_t, const CensoCopia*>> orden;
+        for (const auto& [id, c] : g_censo) {
+          if (c.copias == 0) continue;
+          ++destinos;
+          cop += c.copias;
+          mismo += c.mismoCuadro;
+          desp += c.despues;
+          sin += c.sinLeer;
+          orden.emplace_back(id, &c);
+        }
+        if (cop > 0) {
+          log_line("motor: censo de copias (por cuadro): %.1f copias a %llu destinos; leídas en el mismo cuadro %.1f, "
+                   "en un cuadro después %.1f, vueltas a copiar sin leerse %.1f (CHOYA_GX_CENSO_COPIAS=0 lo apaga)",
+                   static_cast<double>(cop) / n, static_cast<unsigned long long>(destinos),
+                   static_cast<double>(mismo) / n, static_cast<double>(desp) / n, static_cast<double>(sin) / n);
+          std::sort(orden.begin(), orden.end(), [](const auto& x, const auto& y) {
+            return x.second->copias != y.second->copias ? x.second->copias > y.second->copias : x.first < y.first;
+          });
+          std::string lista;
+          char buf[200];
+          for (size_t k = 0; k < orden.size() && k < 12; ++k) {
+            const CensoCopia& c = *orden[k].second;
+            std::snprintf(buf, sizeof buf, "%s%llx: %.1f/cuadro %dx%d->%ux%u fmt %u, %.1f dibujos la leen, mismo %llu, "
+                          "después %llu, sin leer %llu", k == 0 ? "" : "; ",
+                          static_cast<unsigned long long>(orden[k].first & 0xFFFFFFull), static_cast<double>(c.copias) / n,
+                          c.w, c.h, c.texW, c.texH, c.fmt, static_cast<double>(c.dibujos) / n,
+                          static_cast<unsigned long long>(c.mismoCuadro), static_cast<unsigned long long>(c.despues),
+                          static_cast<unsigned long long>(c.sinLeer));
+            lista += buf;
+          }
+          log_line("motor: censo de copias, las más hechas (destino: copias por cuadro, zona->textura, formato; veces "
+                   "leída en el mismo cuadro, después, nunca antes de rehacerla): %s", lista.c_str());
+        }
+        for (auto& [id, c] : g_censo) {  // contadores a cero; se queda si la última copia ya se leyó
+          const bool leida = c.leida;
+          const uint64_t cuadro = c.cuadroCopia;
+          c = CensoCopia{};
+          c.leida = leida;
+          c.cuadroCopia = cuadro;
+        }
+        g_censoCuadros = 0;
       }
       g_dir = CopiasDirectas{};
       g_tCopias = TiempoCopias{};

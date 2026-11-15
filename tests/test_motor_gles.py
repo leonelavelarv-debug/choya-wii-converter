@@ -79,6 +79,31 @@ class TestMotorGles(unittest.TestCase):
                                       r"invalidarla [\d.]+\), dibujo [\d.]+, vuelta al EFB [\d.]+ \(CPU [\d.]+\); "
                                       r"sin rotar; vuelta al EFB perezosa")
             self.assertNotIn("memoria de la Mali por partes", log)  # 0.24.0: apagada salvo CHOYA_GX_MALI=1
+            # 0.36.0: censo de copias. Por cuadro: 4 copias a 3 destinos, 1 leída en el mismo cuadro, 1 en el siguiente
+            # y 2 vueltas a copiar sin leerse (la 901, dos veces por cuadro y nadie la lee).
+            r = subprocess.run([exe, "censo"], env=env, capture_output=True, text=True)
+            self.assertIn("censo hecho", r.stdout, r.stdout + r.stderr)
+            m = re.search(r"motor: censo de copias \(por cuadro\): ([\d.]+) copias a (\d+) destinos; leídas en el mismo "
+                          r"cuadro ([\d.]+), en un cuadro después ([\d.]+), vueltas a copiar sin leerse ([\d.]+)", r.stdout)
+            self.assertIsNotNone(m, r.stdout)
+            self.assertEqual(m.group(2), "3")
+            for g, esperado in ((1, 4.0), (3, 1.0), (4, 1.0), (5, 2.0)):
+                self.assertAlmostEqual(float(m.group(g)), esperado, delta=0.02)
+            self.assertIn("384: 1.0/cuadro 64x64->64x64 fmt 6, 1.0 dibujos la leen", r.stdout)
+            # 0.34.0: vuelta perezosa. Las cuatro copias van seguidas (3 sin volver al EFB en medio); apagada, ninguna.
+            self.assertRegex(r.stdout, r"copias por dentro \(por cuadro\): 4\.0 copias \(3\.0 seguidas")
+            r = subprocess.run([exe, "censo"], env=dict(env, CHOYA_GX_VUELTA_PEREZOSA="0", CHOYA_GX_CENSO_COPIAS="0"),
+                               capture_output=True, text=True)
+            self.assertIn("censo hecho", r.stdout, r.stdout + r.stderr)
+            self.assertRegex(r.stdout, r"copias por dentro \(por cuadro\): 4\.0 copias \(0\.0 seguidas")
+            self.assertNotIn("censo de copias", r.stdout)
+            # 0.36.0: reparto de núcleos. Con hilo GX, los demás hilos comparten su núcleo salvo con hilo-gx-solo.
+            nuc = os.path.join(d, "nucleos")
+            subprocess.run(["clang++", "-std=c++20", "-I", data, "-I", AURORA_INCLUDE,
+                            os.path.join(AQUI, "motor_gles", "nucleos.cpp"), os.path.join(data, "choya_gx_core.cpp"),
+                            "-o", nuc, "-ldl", "-lpthread"], check=True, capture_output=True)
+            filas = subprocess.run([nuc], capture_output=True, text=True, check=True).stdout.split("\n")
+            self.assertEqual(filas[:5], ["4 1 0 3 2 3", "4 1 1 3 2 2", "4 0 0 3 2 3", "3 0 0 2 1 2", "8 1 0 7 6 7"])
             # Caché de programas en disco: la primera vez compila y guarda, la segunda carga los binarios y dibuja igual.
             cache = os.path.join(d, "cache")
             env_cache = dict(env, CHOYA_GX_CACHE=cache)

@@ -458,12 +458,64 @@ static int clear_test() {
   return 0;
 }
 
+// harness censo (0.36.0): 305 cuadros iguales. Cada uno dibuja leyendo la 903 (copiada al final del cuadro anterior),
+// copia a la 900 (la lee un dibujo del pase siguiente), dos veces a la 901 (nadie la lee) y a la 903. Por cuadro el
+// censo tiene que dar 4 copias a 3 destinos: 1 leída en el mismo cuadro, 1 después y 2 vueltas a copiar sin leerse.
+static int census_test() {
+  gx::PipelineDesc p4 = base_desc();
+  p4.vtxStride = 20;
+  p4.attrs[GX_VA_POS] = {GX_DIRECT, 3, GX_F32, 0, 0, 0, 0, 0};
+  p4.attrs[GX_VA_TEX0] = {GX_DIRECT, 2, GX_F32, 12, 0, 0, 0, 0};
+  p4.sampledChannels = 0; p4.offChanMat[0] = 0; p4.offChanMatA[0] = 0;
+  p4.numTexGens = 1; p4.sampledTexCoords = 1;
+  p4.texgens[0] = {GX_TG_MTX2x4, GX_TG_TEX0, 0xFF, 0};
+  p4.stages[0].cd = GX_CC_TEXC; p4.stages[0].ad = GX_CA_TEXA; p4.stages[0].texCoord = 0; p4.stages[0].texMap = 0;
+  p4.offTexScale[0] = 48; p4.offTexSize[0] = 52;
+  gx::register_pipeline(4, p4);
+  gx::BindDesc bd{};
+  bd.samp[0] = {0, 0, 0, 0, 0, {0, 0, 0}, 0.f, 0.f};
+  bd.tex[0] = 900;
+  gx::register_bind_group(98, bd);
+  bd.tex[0] = 903;
+  gx::register_bind_group(97, bd);
+  std::vector<uint8_t> v4;
+  float q[4][5] = {{-1,1,.5f,0,0},{1,1,.5f,1,0},{-1,-1,.5f,0,1},{1,-1,.5f,1,1}};
+  for (auto& v : q) for (float x : v) put_be_f32(v4, x);
+  std::vector<uint8_t> u4(256, 0);
+  for (int r = 0; r < 4; ++r) put_f(u4, 20 + r * 4 + r, 1.f);
+  for (int r = 0; r < 3; ++r) put_f(u4, 36 + r * 4 + r, 1.f);
+  put_f(u4, 48, 1.f); put_f(u4, 49, 1.f);
+  put_f(u4, 52, 1.f); put_f(u4, 53, 1.f);
+  std::vector<uint16_t> i4 = {0, 1, 2, 2, 1, 3};
+  const float red[4] = {1, 0, 0, 1}, black[4] = {0, 0, 0, 1};
+  for (int n = 0; n < 305; ++n) {
+    gx::capture_begin(v4.data(), v4.size(), u4.data(), u4.size(), (const uint8_t*)i4.data(), 12, nullptr, 0);
+    gx::capture_pass(640, 480, true, true, red, 0.f, false, gx::Rect{0, 0, 0, 0});
+    gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+    gx::capture_scissor(gx::Rect{0, 0, 640, 480});
+    if (n > 0) gx::capture_draw(4, 0, 6, 1, 0, UINT32_MAX, 97);
+    gx::capture_copy(900, gx::Rect{0, 0, 64, 64}, 64, 64, 0x6, true);
+    gx::capture_copy(901, gx::Rect{0, 0, 32, 32}, 16, 16, 0x6, true);
+    gx::capture_copy(901, gx::Rect{0, 0, 32, 32}, 16, 16, 0x6, true);
+    gx::capture_copy(903, gx::Rect{0, 0, 64, 64}, 32, 32, 0x6, true);
+    gx::capture_pass(640, 480, true, true, black, 0.f, true, gx::Rect{0, 0, 640, 480});
+    gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+    gx::capture_scissor(gx::Rect{0, 0, 640, 480});
+    gx::capture_draw(4, 0, 6, 1, 0, UINT32_MAX, 98);
+    gx::capture_end(true);
+    if (!gx::draw_frame(640, 480)) { std::puts("no dibujó"); return 1; }
+  }
+  std::printf("censo hecho %06X\n", pixel(320, 240));
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (!init_egl(640, 480)) { std::puts("sin contexto GLES"); return 2; }
   if (argc >= 2 && std::strcmp(argv[1], "borrado") == 0) return clear_test();
   if (argc >= 2 && std::strcmp(argv[1], "paquete") == 0) return packed(argc, argv);
   if (argc >= 3 && std::strcmp(argv[1], "paleta") == 0) return palette_test(std::atoi(argv[2]));
   if (argc >= 2 && std::strcmp(argv[1], "cola") == 0) return queue_test();
+  if (argc >= 2 && std::strcmp(argv[1], "censo") == 0) return census_test();
   if (argc >= 3 && std::strcmp(argv[1], "tev") == 0) return tev_test(std::atoi(argv[2]));
   if (argc >= 3 && std::strcmp(argv[1], "copia-vieja") == 0) return old_copy_test(argv[2]);
   if (argc >= 5 && std::strcmp(argv[1], "sonda") == 0) return probe(argc, argv);
