@@ -4,7 +4,7 @@
 # Modo diagnóstico (3 min, perfil, volcados de cuadros; MENU + R1 vuelca el cuadro que se ve): "Wii Sports (Choya) - diagnostico.sh" o CHOYA_MODO=diagnostico.
 # Deja run.log y resumen.txt en la carpeta wiisports-choya.
 
-LANZADOR_VERSION="0.33.0"  # sube con cada versión de Choya (tests/test_opt_traducido.py lo revisa)
+LANZADOR_VERSION="0.34.0"  # sube con cada versión de Choya (tests/test_opt_traducido.py lo revisa)
 DIR="$(cd "$(dirname "$0")" && pwd)/wiisports-choya"
 cd "$DIR" || exit 1
 rm -f "$DIR/resumen.txt"  # que nunca quede uno viejo de otra corrida
@@ -134,6 +134,9 @@ if [ -f "$DIR/sin-invalidar-efb" ]; then export CHOYA_GX_INVALIDAR=0; fi
 # hicieron el cuadro más lento). Para probarlas: archivos vacíos "rotar-copias" y "copias-directas".
 if [ -f "$DIR/rotar-copias" ]; then export CHOYA_GX_ROTAR_COPIAS=1; fi
 if [ -f "$DIR/copias-directas" ]; then export CHOYA_GX_COPIA_DIRECTA=1; fi
+# Vuelta al EFB perezosa (0.34.0): tras una copia del EFB, el EFB se vuelve a enlazar solo cuando algo lo usa (las copias
+# seguidas no van y vuelven). Un archivo vacío "sin-vuelta-perezosa" lo apaga.
+if [ -f "$DIR/sin-vuelta-perezosa" ]; then export CHOYA_GX_VUELTA_PEREZOSA=0; fi
 # Recursos convertidos por el conversor de Choya (assets.wlpk junto al juego): texturas en ETC2/EAC ya reducidas.
 # CHOYA_PAQUETE=0 usa solo las del disco.
 if [ "${CHOYA_PAQUETE:-}" != "0" ] && [ -f "$DIR/assets.wlpk" ]; then
@@ -163,6 +166,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "EFB sin recargar en la Mali: $([ "${CHOYA_GX_INVALIDAR:-1}" = 0 ] && echo "no (archivo sin-invalidar-efb)" || echo "sí (para apagarlo: archivo vacío sin-invalidar-efb)")"
   echo "copias del EFB directas (sin salir del EFB): $([ "${CHOYA_GX_COPIA_DIRECTA:-0}" = 1 ] && echo "sí (archivo copias-directas)" || echo "no (para probarlas: archivo vacío copias-directas)")"
   echo "copias del EFB rotadas en 3 texturas: $([ "${CHOYA_GX_ROTAR_COPIAS:-0}" = 1 ] && echo "sí (archivo rotar-copias)" || echo "no (para probarlas: archivo vacío rotar-copias)")"
+  echo "vuelta al EFB tras las copias: $([ "${CHOYA_GX_VUELTA_PEREZOSA:-1}" = 0 ] && echo "después de cada copia (archivo sin-vuelta-perezosa)" || echo "perezosa, solo cuando algo usa el EFB (para apagarla: archivo vacío sin-vuelta-perezosa)")"
   echo "resolución interna: $CHOYA_RESOLUCION ($(awk -v r="$CHOYA_RESOLUCION" 'BEGIN{printf "%d", 480*r}') líneas)$([ "$CHOYA_RESOLUCION" = 1 ] && echo " (para probar menos: archivo vacío resolucion-075 o resolucion-05)" || echo " (archivo resolucion-075 o resolucion-05; bórralo para volver a 1)")"
   echo "saltar cuadros en el motor: $([ "${CHOYA_GX_SALTAR:-1}" = 0 ] && echo "no, se dibujan todos (archivo sin-saltar-cuadros)" || echo "sí (para dibujarlos todos: archivo vacío sin-saltar-cuadros)")"
   echo "hilo GX: $([ "$CHOYA_GX_HILO" = 1 ] && echo "encendido, el GX en otro núcleo (para apagarlo: archivo vacío sin-hilo-gx)" || echo "apagado (archivo sin-hilo-gx)")$([ "${CHOYA_GX_HILO_COPIAR:-0}" = 1 ] && echo "; listas copiadas (archivo hilo-gx-copiar)")"

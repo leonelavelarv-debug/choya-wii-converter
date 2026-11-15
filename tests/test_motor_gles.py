@@ -66,13 +66,18 @@ class TestMotorGles(unittest.TestCase):
             self.assertRegex(log, r"motor: copias del EFB: un programa por formato, \d+ programas hechos")
             # 0.30.0: copias rotadas en 3 texturas (el harness completo pasa igual con y sin rotar) y su tiempo por dentro.
             # 0.31.1: rotación y copias directas apagadas por omisión; prendidas (juntas o solas) pasa igual.
+            # 0.34.0: vuelta al EFB perezosa por omisión; apagada (CHOYA_GX_VUELTA_PEREZOSA=0) y combinada, igual.
             for extra in ({"CHOYA_GX_ROTAR_COPIAS": "1"}, {"CHOYA_GX_COPIA_DIRECTA": "1"},
-                          {"CHOYA_GX_ROTAR_COPIAS": "1", "CHOYA_GX_COPIA_DIRECTA": "1"}):
+                          {"CHOYA_GX_ROTAR_COPIAS": "1", "CHOYA_GX_COPIA_DIRECTA": "1"},
+                          {"CHOYA_GX_VUELTA_PEREZOSA": "0"},
+                          {"CHOYA_GX_VUELTA_PEREZOSA": "0", "CHOYA_GX_ROTAR_COPIAS": "1"}):
                 r = subprocess.run([exe], env=dict(env, **extra), capture_output=True, text=True)
                 self.assertIn("PRUEBA OK", r.stdout, str(extra) + r.stdout + r.stderr)
             if re.search(r"motor: texturas: \d+ en GL, \d+ subidas, [1-9]\d* copias del EFB", log):
-                self.assertRegex(log, r"motor: copias por dentro \(por cuadro\): [\d.]+ copias; cambio a la textura "
-                                      r"[\d.]+ ms, dibujo [\d.]+, vuelta al EFB [\d.]+ \(CPU [\d.]+\); sin rotar")
+                self.assertRegex(log, r"motor: copias por dentro \(por cuadro\): [\d.]+ copias \([\d.]+ seguidas, sin "
+                                      r"volver al EFB en medio\); cambio a la textura [\d.]+ ms \(enlazarla [\d.]+, "
+                                      r"invalidarla [\d.]+\), dibujo [\d.]+, vuelta al EFB [\d.]+ \(CPU [\d.]+\); "
+                                      r"sin rotar; vuelta al EFB perezosa")
             self.assertNotIn("memoria de la Mali por partes", log)  # 0.24.0: apagada salvo CHOYA_GX_MALI=1
             # Caché de programas en disco: la primera vez compila y guarda, la segunda carga los binarios y dibuja igual.
             cache = os.path.join(d, "cache")

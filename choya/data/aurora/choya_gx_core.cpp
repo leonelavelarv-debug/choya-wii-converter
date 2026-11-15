@@ -2813,6 +2813,12 @@ struct Efb {
   GLuint fbo = 0, color = 0, depth = 0;  // depth: textura (las copias del EFB de profundidad la leen)
   int width = 0, height = 0;
 } g_efb;
+bool g_efbFuera = false;  // 0.34.0: la última copia dejó enlazada su textura y falta volver al EFB (vuelta perezosa)
+
+void enlazar_efb() {
+  gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+  g_efbFuera = false;
+}
 
 bool ensure_efb(int width, int height) {
   if (g_efb.fbo != 0 && width <= g_efb.width && height <= g_efb.height) return true;
@@ -2834,7 +2840,7 @@ bool ensure_efb(int width, int height) {
   gl.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
   gl.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
   gl.GenFramebuffers(1, &g_efb.fbo);
-  gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+  enlazar_efb();
   gl.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, g_efb.color, 0);
   gl.FramebufferTexture2D(kFramebuffer, kDepthStencilAttachment, kTexture2D, g_efb.depth, 0);
   const GLenum status = gl.CheckFramebufferStatus(kFramebuffer);
@@ -2859,7 +2865,7 @@ void present_efb(const Rect& r, int screenWidth, int screenHeight) {
   // El EFB se dibuja con y hacia arriba en GL (como la pantalla): la copia no voltea.
   const int y0 = g_efb.height - r.y - r.height;
   gl.BlitFramebuffer(r.x, y0, r.x + r.width, y0 + r.height, 0, 0, screenWidth, screenHeight, kColorBufferBit, kLinear);
-  gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+  enlazar_efb();
 }
 
 // --- Copias del EFB a texturas (GXCopyTex) ------------------------------------------------------------------
@@ -3101,8 +3107,26 @@ double ms_entre(std::chrono::steady_clock::time_point a, std::chrono::steady_clo
 double cpu_hilo_ms();
 struct TiempoCopias {
   double cambio = 0, dibujo = 0, vuelta = 0, cpu = 0;
+  double enlazar = 0, invalidar = 0;  // 0.34.0: partes del cambio a la textura
   uint64_t copias = 0, nuevas = 0;
+  uint64_t seguidas = 0;  // 0.34.0: copias hechas sin volver al EFB desde la anterior
 } g_tCopias;
+
+// --- Vuelta al EFB perezosa (0.34.0) -----------------------------------------------------------------------
+// Medido en la consola (0.33.0, EFB de 505x417): 19 copias por cuadro y el hilo de la pantalla esperando ~1.3 ms
+// dentro del driver en cada una, aunque la GPU ya solo tarda ~30 ms por cuadro. Antes, cada copia volvía a enlazar el
+// EFB al terminar aunque lo siguiente fuera otra copia (pases sin dibujos). Ahora la copia deja enlazada su textura y
+// el EFB se vuelve a enlazar solo cuando algo lo necesita (un dibujo, un borrado, un pase, una paleta, la pantalla):
+// las copias seguidas se ahorran ir y volver. El archivo vacío "sin-vuelta-perezosa" (CHOYA_GX_VUELTA_PEREZOSA=0)
+// vuelve a enlazar el EFB después de cada copia, como antes.
+bool vuelta_perezosa() {
+  static const bool on = [] {
+    const char* e = std::getenv("CHOYA_GX_VUELTA_PEREZOSA");
+    return e == nullptr || std::strcmp(e, "0") != 0;
+  }();
+  return on;
+}
+// g_efbFuera (la última copia dejó enlazada su textura: falta volver al EFB) está junto a g_efb.
 
 // Hace la copia leyendo srcColor (el EFB, o la copia directa de su zona: ver diferir_copia) de srcW x srcH, en la
 // zona (x, y arriba, ancho, alto) de esa fuente; deja enlazado el framebuffer del EFB (el que llama repone viewport y
@@ -3143,7 +3167,11 @@ void run_copy_desde(const Item& it, GLuint srcColor, int srcW, int srcH, float r
     ct.fbo = slotFbo;
     ++g_texGen;
   }
+  if (g_efbFuera) ++g_tCopias.seguidas;  // 0.34.0: la anterior no volvió al EFB (nada lo necesitó en medio)
+  const auto tEnlazar = std::chrono::steady_clock::now();
   gl.BindFramebuffer(kFramebuffer, ct.fbo);
+  const auto tInvalidar = std::chrono::steady_clock::now();
+  g_tCopias.enlazar += ms_entre(tEnlazar, tInvalidar);
   if (invalidar_activo()) {
     // 0.26.0: la copia pinta toda la textura: que la Mali no cargue lo que tenía (ni lo conserve para los cuadros en
     // vuelo que todavía la leen); en la 0.25.0 las copias eran ~2/3 del tiempo de GPU del cuadro.
@@ -3151,6 +3179,7 @@ void run_copy_desde(const Item& it, GLuint srcColor, int srcW, int srcH, float r
     gl.InvalidateFramebuffer(kFramebuffer, 1, &att);
     ++g_inval.copias;
   }
+  g_tCopias.invalidar += ms_entre(tInvalidar, std::chrono::steady_clock::now());
   gl.Viewport(0, 0, static_cast<GLsizei>(c.texW), static_cast<GLsizei>(c.texH));
   gl.Disable(kScissorTest);
   gl.Disable(kDepthTest);
@@ -3178,8 +3207,12 @@ void run_copy_desde(const Item& it, GLuint srcColor, int srcW, int srcH, float r
   gl.BindTexture(kTexture2D, 0);
   gl.ActiveTexture(kTexture0 + 10);
   gl.BindTexture(kTexture2D, 0);
-  gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
-  gl.Enable(kScissorTest);
+  if (vuelta_perezosa()) {
+    g_efbFuera = true;  // volver_al_efb() lo enlaza cuando algo lo necesite (0.34.0)
+  } else {
+    enlazar_efb();
+    gl.Enable(kScissorTest);
+  }
   ++g_stats.copies;
   const auto t3 = std::chrono::steady_clock::now();
   g_tCopias.cambio += ms_entre(t0, t1);
@@ -3313,7 +3346,7 @@ void diferir_copia(const Item& it) {
     }
   }
   const size_t m = intermedia_tomar(c.rect.width, c.rect.height);
-  gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+  enlazar_efb();
   gl.ActiveTexture(kTexture0 + 10);
   gl.BindTexture(kTexture2D, g_intermedias[m].tex);
   gl.CopyTexSubImage2D(kTexture2D, 0, 0, 0, c.rect.x, g_efb.height - c.rect.y - c.rect.height, c.rect.width,
@@ -3500,7 +3533,7 @@ void run_palette_conv(const Item& it) {
   gl.BindTexture(kTexture2D, 0);
   gl.ActiveTexture(kTexture0 + 10);
   gl.BindTexture(kTexture2D, 0);
-  gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+  enlazar_efb();
   gl.Enable(kScissorTest);
   ++g_stats.paletteConvs;
 }
@@ -3520,7 +3553,7 @@ bool debug_read_copy(uint64_t id, std::vector<uint8_t>& rgba, uint32_t& width, u
   rgba.resize(size_t{width} * height * 4);
   gl.BindFramebuffer(kFramebuffer, c->second.fbo);
   gl.ReadPixels(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), kRgba, kUnsignedByte, rgba.data());
-  gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+  enlazar_efb();
   return true;
 }
 bool has_copy_texture(uint64_t id) noexcept { return g_copyTextures.contains(id); }
@@ -4114,7 +4147,7 @@ bool dump_last_frame(const char* path) noexcept {
                     up.data.data());
       readback.push_back(std::move(up));
     }
-    gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+    enlazar_efb();
   }
   for (const TexUpload& up : readback) texs_out.push_back(&up);
   const uint64_t nt = texs_out.size();
@@ -4524,7 +4557,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     }
   }
   if (!ensure_efb(efbW, efbH)) return false;
-  gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+  enlazar_efb();
   process_textures();
   uint64_t lastBindGroup = ~0ull;
   uint64_t lastPipeRef = ~0ull;
@@ -4661,6 +4694,11 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   int debugDrawIndex = 0;
   // Tras una copia (o las conversiones pendientes, 0.31.0): usaron su propio programa, estado y unidades 10/11.
   auto reponer_tras_copia = [&]() {
+    if (g_efbFuera) {  // 0.34.0: la copia dejó su textura enlazada (vuelta perezosa): ahora sí se vuelve al EFB
+      const auto tv = std::chrono::steady_clock::now();
+      enlazar_efb();
+      g_tCopias.vuelta += ms_entre(tv, std::chrono::steady_clock::now());
+    }
     shadow_invalidate();
     set_viewport(viewportRect);
     set_enable(kScissorTest, S.scissorOn, true);
@@ -4673,6 +4711,9 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   ++g_inval.cuadros;
   for (size_t itemIndex = 0; itemIndex < f.items.size(); ++itemIndex) {
     const Item& it = f.items[itemIndex];
+    // 0.34.0: tras una copia el EFB se vuelve a enlazar solo cuando algo lo usa; otra copia, el viewport o el recorte
+    // no (los dos se vuelven a poner al volver).
+    if (g_efbFuera && it.op != Op::Copy && it.op != Op::Viewport && it.op != Op::Scissor) reponer_tras_copia();
     switch (it.op) {
     case Op::Pass: {
       mali_mark(kMaliDibujos);  // lo dibujado en el pase anterior
@@ -4736,6 +4777,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       gpu_pases_tramo(passIndex, 1);
       if (copies_enabled()) {
         if (copia_directa_sirve(it)) {
+          if (g_efbFuera) reponer_tras_copia();  // lee el EFB enlazado (glCopyTexSubImage2D)
           diferir_copia(it);  // 0.31.0: sin salir del EFB; la conversión después
         } else {
           convertir_pendientes();  // en orden: las directas anteriores primero
@@ -4746,7 +4788,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       gpu_pases_tramo(passIndex, 0);
       mali_mark(kMaliCopias);
       ((it.copy.fmt & 0x10) != 0 ? g_maliCopiedDepth : g_maliCopiedColor) = true;
-      reponer_tras_copia();
+      if (!g_efbFuera) reponer_tras_copia();  // con la vuelta perezosa, lo hace lo siguiente que use el EFB
     } break;
     case Op::PaletteConv: {
       mali_mark(kMaliDibujos);
@@ -4895,6 +4937,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     } break;
     }
   }
+  if (g_efbFuera) reponer_tras_copia();  // 0.34.0: el cuadro terminó con una copia
   end_pass();
   mali_mark(kMaliDibujos);
   if (hay_copias_pendientes()) {  // 0.31.0: las que nadie leyó en este cuadro
@@ -5017,10 +5060,13 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       }
       if (g_tCopias.copias > 0) {  // 0.30.0
         const auto& tc = g_tCopias;
-        log_line("motor: copias por dentro (por cuadro): %.1f copias; cambio a la textura %.1f ms, dibujo %.1f, vuelta "
-                 "al EFB %.1f (CPU %.1f); %s; texturas nuevas %llu",
-                 static_cast<double>(tc.copias) / n, tc.cambio / n, tc.dibujo / n, tc.vuelta / n, tc.cpu / n,
+        log_line("motor: copias por dentro (por cuadro): %.1f copias (%.1f seguidas, sin volver al EFB en medio); "
+                 "cambio a la textura %.1f ms (enlazarla %.1f, invalidarla %.1f), dibujo %.1f, vuelta al EFB %.1f "
+                 "(CPU %.1f); %s; %s; texturas nuevas %llu",
+                 static_cast<double>(tc.copias) / n, static_cast<double>(tc.seguidas) / n, tc.cambio / n,
+                 tc.enlazar / n, tc.invalidar / n, tc.dibujo / n, tc.vuelta / n, tc.cpu / n,
                  rotar_copias() ? "rotadas en 3 versiones (CHOYA_GX_ROTAR_COPIAS=1)" : "sin rotar",
+                 vuelta_perezosa() ? "vuelta al EFB perezosa" : "vuelta al EFB tras cada copia (sin-vuelta-perezosa)",
                  static_cast<unsigned long long>(tc.nuevas));
       }
       if (g_dir.directas > 0 || g_tCopias.copias > 0) {  // 0.31.0
