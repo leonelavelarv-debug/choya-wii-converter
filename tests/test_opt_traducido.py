@@ -118,13 +118,41 @@ class ScriptDeCompilacion(unittest.TestCase):
 class GuardadoDelPerfil(unittest.TestCase):
     def test_lanzador(self):
         texto = leer(LANZADOR)
-        self.assertIn('export LLVM_PROFILE_FILE="$DIR/pgo/wiisports-%p.profraw"', texto)
+        self.assertIn('export LLVM_PROFILE_FILE="$DIR/pgo/wiisports-%m.profraw"', texto)
         self.assertIn("compilado.txt", texto)
 
     def test_choya_gles(self):
         texto = leer(GLES)
         self.assertIn('extern "C" int __llvm_profile_write_file(void) __attribute__((weak));', texto)
         self.assertIn("if (__llvm_profile_write_file) std::thread(EscribirPerfilPgo).detach();", texto)
+
+    def test_escritura_con_suma_y_contadores_a_cero(self):
+        texto = leer(GLES)
+        self.assertIn('extern "C" void __llvm_profile_reset_counters(void) __attribute__((weak));', texto)
+        self.assertIn("if (r == 0 && __llvm_profile_reset_counters) __llvm_profile_reset_counters();", texto)
+
+    def test_preparar_perfiles(self):
+        """Vacíos fuera; de varios perfiles seguidos (0.29.0/0.30.x: el runtime agrega al final) solo el último."""
+        import struct
+        magia = struct.pack("<Q", 0xFF6C70726F667281) + struct.pack("<Q", 0x0100000000000000 | 10)
+        with tempfile.TemporaryDirectory() as tmp:
+            ent, sal = os.path.join(tmp, "e"), os.path.join(tmp, "s")
+            os.makedirs(ent)
+            open(os.path.join(ent, "vacio.profraw"), "wb").close()
+            with open(os.path.join(ent, "varios.profraw"), "wb") as f:
+                f.write(magia + b"A" * 100 + magia + b"B" * 100 + magia + b"C" * 104)
+            with open(os.path.join(ent, "cortado.profraw"), "wb") as f:
+                f.write(magia + b"A" * 100 + magia + b"B" * 100 + magia + b"C" * 10)
+            with open(os.path.join(ent, "uno.profraw"), "wb") as f:
+                f.write(magia + b"Z" * 50)
+            r = subprocess.run(["python3", "-I", os.path.join(RAIZ, "scripts", "pgo-preparar.py"), ent, sal],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(sorted(os.listdir(sal)), ["cortado.profraw", "uno.profraw", "varios.profraw"])
+            self.assertEqual(open(os.path.join(sal, "varios.profraw"), "rb").read(), magia + b"C" * 104)
+            self.assertEqual(open(os.path.join(sal, "cortado.profraw"), "rb").read(), magia + b"B" * 100)
+            self.assertEqual(open(os.path.join(sal, "uno.profraw"), "rb").read(), magia + b"Z" * 50)
+        self.assertIn('python3 "$CHOYA/scripts/pgo-preparar.py" "$CRUDOS" "$PGO/crudos"', leer(SCRIPT))
 
     @unittest.skipUnless(os.environ.get("CHOYA_PRUEBA_PGO_RED") == "1" and shutil.which("clang") and
                          shutil.which("llvm-profdata"), "CHOYA_PRUEBA_PGO_RED=1 (baja compiler-rt de github.com)")
@@ -139,20 +167,26 @@ class GuardadoDelPerfil(unittest.TestCase):
             with open(os.path.join(tmp, "hot.cpp"), "w") as f:
                 f.write("int hot(int x){int s=0;for(int i=0;i<x;i++)s+=(i%3)?i:-i;return s;}\n")
             with open(os.path.join(tmp, "main.cpp"), "w") as f:
+                # Como choya_gles.cpp: escribir y poner los contadores a cero, dos veces, sin salir por exit().
                 f.write('#include <cstdlib>\nextern "C" int __llvm_profile_write_file(void) __attribute__((weak));\n'
-                        "int hot(int);\nint main(){int r=hot(1000);"
-                        "int w=__llvm_profile_write_file?__llvm_profile_write_file():9;_Exit(w|(r&0));}\n")
+                        'extern "C" void __llvm_profile_reset_counters(void) __attribute__((weak));\n'
+                        "int hot(int);\nint main(){int w=0,r=0;for(int k=0;k<2;++k){r+=hot(1000);"
+                        "w|=__llvm_profile_write_file?__llvm_profile_write_file():9;__llvm_profile_reset_counters();}"
+                        "_Exit(w|(r&0));}\n")
             c = lambda *a: subprocess.run(["clang++", *a], check=True, cwd=tmp, capture_output=True)
             c("-O2", "-fprofile-generate", "-c", "hot.cpp", "-o", "hot.o")
             c("-O2", "-c", "main.cpp", "-o", "main.o")
             c("-fuse-ld=lld", "main.o", "hot.o", "-Wl,-u,__llvm_profile_runtime", lib, "-o", "a")
-            perfil = os.path.join(tmp, "pgo", "j-%p.profraw")
+            perfil = os.path.join(tmp, "pgo", "j-%m.profraw")  # como el lanzador: suma en el mismo archivo
             r = subprocess.run([os.path.join(tmp, "a")], env=dict(os.environ, LLVM_PROFILE_FILE=perfil))
             self.assertEqual(r.returncode, 0)  # el guardado explícito funcionó (sin atexit: _Exit)
             crudos = os.listdir(os.path.join(tmp, "pgo"))
             self.assertEqual(len(crudos), 1)
             subprocess.run(["llvm-profdata", "merge", "-o", "w.profdata", os.path.join("pgo", crudos[0])],
                            check=True, cwd=tmp)
+            show = subprocess.run(["llvm-profdata", "show", "--counts", "--function=hot", "w.profdata"], check=True,
+                                  cwd=tmp, capture_output=True, text=True).stdout
+            self.assertIn("2000", show, show)  # las dos tandas sumadas una sola vez (1000 + 1000)
             c("-O2", "-fprofile-use=w.profdata", "-Werror=profile-instr-unprofiled", "-c", "hot.cpp", "-o", "h2.o")
 
 

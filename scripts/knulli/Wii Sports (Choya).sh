@@ -122,6 +122,9 @@ if [ -f "$DIR/sin-invalidar-efb" ]; then export CHOYA_GX_INVALIDAR=0; fi
 # Copias rotadas (0.30.0): cada copia del EFB escribe en otra de 3 texturas, así no espera a que la GPU termine de
 # leer la anterior. Un archivo vacío "sin-rotar-copias" vuelve a una sola textura por copia.
 if [ -f "$DIR/sin-rotar-copias" ]; then export CHOYA_GX_ROTAR_COPIAS=0; fi
+# Copias directas (0.31.0): la zona del EFB se copia sin salir de él (glCopyTexSubImage2D) y la conversión de formato
+# se hace después, todas juntas. Un archivo vacío "copias-dibujadas" vuelve a dibujar cada copia leyendo el EFB.
+if [ -f "$DIR/copias-dibujadas" ]; then export CHOYA_GX_COPIA_DIRECTA=0; fi
 # Recursos convertidos por el conversor de Choya (assets.wlpk junto al juego): texturas en ETC2/EAC ya reducidas.
 # CHOYA_PAQUETE=0 usa solo las del disco.
 if [ "${CHOYA_PAQUETE:-}" != "0" ] && [ -f "$DIR/assets.wlpk" ]; then
@@ -131,7 +134,8 @@ else
 fi
 # PGO (0.29.0): solo la compilación CHOYA_OPT=pgo-generar escribe perfiles (en wiisports-choya/pgo, cada 20 s); en
 # las demás esta variable no hace nada. Los .profraw se copian a la PC para compilar con CHOYA_OPT=pgo.
-export LLVM_PROFILE_FILE="$DIR/pgo/wiisports-%p.profraw"
+# 0.31.0: %m = un solo archivo que suma todas las partidas (con %p cada escritura se agregaba al final).
+export LLVM_PROFILE_FILE="$DIR/pgo/wiisports-%m.profraw"
 mkdir -p "$CHOYA_GX_CACHE"
 rm -f "$DIR/choya-gles.txt" "$DIR/procesador.txt" "$DIR/ultimo-cierre.tar.gz"
 
@@ -146,6 +150,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "efectos de audio: $([ "${CHOYA_SIN_REVERB:-0}" = 1 ] && echo "apagados (para oírlos: archivo con-reverb)" || echo "encendidos (archivo con-reverb)")"
   echo "memoria de la Mali por partes del cuadro: $([ "${CHOYA_GX_MALI:-0}" = 1 ] && echo "se mide (archivo medir-mali)" || echo "no se mide (para medirla: archivo vacío medir-mali)")"
   echo "EFB sin recargar en la Mali: $([ "${CHOYA_GX_INVALIDAR:-1}" = 0 ] && echo "no (archivo sin-invalidar-efb)" || echo "sí (para apagarlo: archivo vacío sin-invalidar-efb)")"
+  echo "copias del EFB directas (sin salir del EFB): $([ "${CHOYA_GX_COPIA_DIRECTA:-1}" = 0 ] && echo "no (archivo copias-dibujadas)" || echo "sí (para dibujarlas como antes: archivo vacío copias-dibujadas)")"
   echo "copias del EFB rotadas en 3 texturas: $([ "${CHOYA_GX_ROTAR_COPIAS:-1}" = 0 ] && echo "no (archivo sin-rotar-copias)" || echo "sí (para apagarlo: archivo vacío sin-rotar-copias)")"
   echo "saltar cuadros en el motor: $([ "${CHOYA_GX_SALTAR:-1}" = 0 ] && echo "no, se dibujan todos (archivo sin-saltar-cuadros)" || echo "sí (para dibujarlos todos: archivo vacío sin-saltar-cuadros)")"
   echo "hilo GX: $([ "$CHOYA_GX_HILO" = 1 ] && echo "encendido, el GX en otro núcleo (para apagarlo: archivo vacío sin-hilo-gx)" || echo "apagado (archivo sin-hilo-gx)")$([ "${CHOYA_GX_HILO_COPIAR:-0}" = 1 ] && echo "; listas copiadas (archivo hilo-gx-copiar)")"
@@ -186,9 +191,9 @@ escribir_resumen() {
     grep -h "aurora: por cuadro" "$DIR/choya-gles.txt" 2>/dev/null | tail -6
     grep -hE "aurora: hilo GX (de Choya|apagado)" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | head -1
     grep -h "aurora: hilo GX:" "$DIR/choya-gles.txt" 2>/dev/null | tail -4
-    echo "--- motor de pantalla: cuadros por segundo, tiempo por cuadro dibujado, saltos, EFB sin recargar, TEV, copias (y por dentro) y GPU por pase (0.30.0)"
+    echo "--- motor de pantalla: cuadros por segundo, tiempo por cuadro dibujado, saltos, EFB sin recargar, TEV, copias (por dentro y directas) y GPU por pase (0.31.0)"
     grep -h "motor: midiendo el tiempo de GPU\|GL_EXT_disjoint_timer_query" "$DIR/choya-gles.txt" 2>/dev/null | head -2
-    grep -h "motor: cuadros por segundo\|motor: tiempo por cuadro dibujado\|presentación: \|motor: saltos:\|motor: EFB sin recargar\|motor: TEV \|motor: copias del EFB:\|motor: copias por dentro" "$DIR/choya-gles.txt" 2>/dev/null | tail -24
+    grep -h "motor: cuadros por segundo\|motor: tiempo por cuadro dibujado\|presentación: \|motor: saltos:\|motor: EFB sin recargar\|motor: TEV \|motor: copias del EFB:\|motor: copias por dentro\|motor: copias directas" "$DIR/choya-gles.txt" 2>/dev/null | tail -27
     grep -h "motor: GPU por pase" "$DIR/choya-gles.txt" 2>/dev/null | tail -3
     grep -hE "pgo: " "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | sort -u | tail -3
     echo "--- hilos y núcleos (cada 10 s: CPU de cada núcleo y de cada hilo, ms por cuadro del juego, espera de turno)"

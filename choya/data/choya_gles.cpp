@@ -44,6 +44,7 @@ extern "C" void choya_gx_request_dump();  // volcado del siguiente cuadro (auror
 extern "C" int choya_medir_empezar(int seconds);  // medición por tramos (choya_perfil.cpp)
 // Runtime de perfiles de Clang: solo existe en la compilación CHOYA_OPT=pgo-generar (si no, es nulo).
 extern "C" int __llvm_profile_write_file(void) __attribute__((weak));
+extern "C" void __llvm_profile_reset_counters(void) __attribute__((weak));
 // Cómo se compiló el código traducido (CHOYA_OPT, 0.30.0): lo genera CMake en el binario; nulo en compilaciones viejas.
 extern "C" const char* const choya_compilado __attribute__((weak));
 
@@ -609,8 +610,10 @@ extern "C" void choya_gles_wake() {
 }
 
 // PGO (CHOYA_OPT=pgo-generar): el juego casi nunca sale por exit(), así que el perfil se escribe cada 20 s en
-// LLVM_PROFILE_FILE (el lanzador lo pone en wiisports-choya/pgo/). Cada escritura reemplaza a la anterior con los
-// contadores acumulados, así que basta con jugar y salir de cualquier forma.
+// LLVM_PROFILE_FILE (el lanzador lo pone en wiisports-choya/pgo/). 0.31.0: el runtime de Clang no reemplaza el
+// archivo, lo agrega al final (en la 0.29.0 quedaban 27 copias acumuladas en 372 MB); ahora el nombre lleva %m (el
+// runtime suma lo nuevo a lo que ya tiene el archivo) y los contadores vuelven a cero tras cada escritura: un solo
+// perfil de ~14 MB que junta todas las partidas.
 static void EscribirPerfilPgo() {
     pthread_setname_np(pthread_self(), "choya-pgo");
     const char* archivo = std::getenv("LLVM_PROFILE_FILE");
@@ -625,6 +628,7 @@ static void EscribirPerfilPgo() {
     for (int n = 1;; ++n) {
         std::this_thread::sleep_for(std::chrono::seconds(segundos));
         const int r = __llvm_profile_write_file();
+        if (r == 0 && __llvm_profile_reset_counters) __llvm_profile_reset_counters();  // lo escrito ya está sumado
         if (n == 1 || r != 0) Log("pgo: perfil guardado (%s)", r == 0 ? "bien" : "falló");
     }
 }

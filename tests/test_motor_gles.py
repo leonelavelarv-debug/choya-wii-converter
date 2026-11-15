@@ -67,6 +67,9 @@ class TestMotorGles(unittest.TestCase):
             # 0.30.0: copias rotadas en 3 texturas (el harness completo pasa igual con y sin rotar) y su tiempo por dentro.
             sin_rotar = subprocess.run([exe], env=dict(env, CHOYA_GX_ROTAR_COPIAS="0"), capture_output=True, text=True)
             self.assertIn("PRUEBA OK", sin_rotar.stdout, sin_rotar.stdout + sin_rotar.stderr)
+            # 0.31.0: copias directas (glCopyTexSubImage2D + conversión después) encendidas por omisión; sin ellas, igual.
+            dibujadas = subprocess.run([exe], env=dict(env, CHOYA_GX_COPIA_DIRECTA="0"), capture_output=True, text=True)
+            self.assertIn("PRUEBA OK", dibujadas.stdout, dibujadas.stdout + dibujadas.stderr)
             if re.search(r"motor: texturas: \d+ en GL, \d+ subidas, [1-9]\d* copias del EFB", log):
                 self.assertRegex(log, r"motor: copias por dentro \(por cuadro\): [\d.]+ copias; cambio a la textura "
                                       r"[\d.]+ ms, dibujo [\d.]+, vuelta al EFB [\d.]+ \(CPU [\d.]+\); rotadas en 3 versiones")

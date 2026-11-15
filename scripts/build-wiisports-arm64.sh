@@ -65,7 +65,10 @@ if [ "$OPT_MODO" = pgo ] || [ "$OPT_MODO" = pgo-O3 ]; then
   # Los perfiles que tomó la consola (wiisports-choya/pgo/*.profraw) se juntan en uno solo.
   CRUDOS="${CHOYA_PGO_DIR:-/mnt/c/Users/Public/choya-pgo}"
   ls "$CRUDOS"/*.profraw >/dev/null 2>&1 || falla "no hay perfiles en $CRUDOS: compila con CHOYA_OPT=pgo-generar, juega en la consola y copia wiisports-choya/pgo/*.profraw ahí"
-  rm -rf "$PGO/crudos" && mkdir -p "$PGO/crudos" && cp "$CRUDOS"/*.profraw "$PGO/crudos/"
+  # 0.31.0: sin los vacíos, y de los que traen varios perfiles seguidos (0.29.0/0.30.x) solo el último (el total).
+  rm -rf "$PGO/crudos"
+  python3 "$CHOYA/scripts/pgo-preparar.py" "$CRUDOS" "$PGO/crudos" 2>&1 | tee -a "$LOG"
+  ls "$PGO/crudos"/*.profraw >/dev/null 2>&1 || falla "ningún perfil utilizable en $CRUDOS (¿vacíos?)"
   echo "Perfiles de la consola: $(ls "$PGO/crudos" | wc -l) archivos ($(du -sh "$PGO/crudos" | cut -f1))" | tee -a "$LOG"
   docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$WC":"$WC" "$IMG" bash -c "
     llvm-profdata-21 merge -o '$PERFIL.tmp' '$PGO'/crudos/*.profraw && mv '$PERFIL.tmp' '$PERFIL' &&

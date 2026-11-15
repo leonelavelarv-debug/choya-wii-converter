@@ -180,6 +180,8 @@ struct Gl {
   void (*GetProgramBinary)(GLuint, GLsizei, GLsizei*, GLenum*, void*);
   void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);  // opcional: volcados
   void (*InvalidateFramebuffer)(GLenum, GLsizei, const GLenum*);  // opcional (GLES 3.0): EFB sin recargar
+  // opcional: copias del EFB directas (0.31.0): el driver copia del framebuffer enlazado sin cambiar de pase
+  void (*CopyTexSubImage2D)(GLenum, GLint, GLint, GLint, GLint, GLint, GLsizei, GLsizei);
   void (*ProgramBinary)(GLuint, GLenum, const void*, GLsizei);
   void (*ProgramParameteri)(GLuint, GLenum, GLint);
   const unsigned char* (*GetString)(GLenum);
@@ -281,6 +283,7 @@ bool load_gl() {
     gl.ReadPixels = reinterpret_cast<decltype(gl.ReadPixels)>(g_loader("glReadPixels"));
     gl.InvalidateFramebuffer =
         reinterpret_cast<decltype(gl.InvalidateFramebuffer)>(g_loader("glInvalidateFramebuffer"));
+    gl.CopyTexSubImage2D = reinterpret_cast<decltype(gl.CopyTexSubImage2D)>(g_loader("glCopyTexSubImage2D"));
   }
   return ok;
 }
@@ -2301,6 +2304,7 @@ bool upload_packed(GlTexture& tex, const TexUpload& up) {
   return true;
 }
 
+void soltar_pendientes_de(uint64_t id);
 void process_textures() {
   std::vector<TexUpload> pending;
   std::vector<uint64_t> released;
@@ -2318,6 +2322,7 @@ void process_textures() {
       g_textures.erase(it);
       ++g_texGen;
     }
+    soltar_pendientes_de(id);  // copias directas sin convertir (al empezar el cuadro no debería haber)
     auto c = g_copyTextures.find(id);
     if (c != g_copyTextures.end()) {
       borrar_copia(c->second);
@@ -3097,8 +3102,10 @@ struct TiempoCopias {
   uint64_t copias = 0, nuevas = 0;
 } g_tCopias;
 
-// Hace la copia; deja enlazado el framebuffer del EFB (el que llama repone viewport y recorte).
-void run_copy(const Item& it) {
+// Hace la copia leyendo srcColor (el EFB, o la copia directa de su zona: ver diferir_copia) de srcW x srcH, en la
+// zona (x, y arriba, ancho, alto) de esa fuente; deja enlazado el framebuffer del EFB (el que llama repone viewport y
+// recorte). La profundidad siempre se lee del EFB.
+void run_copy_desde(const Item& it, GLuint srcColor, int srcW, int srcH, float rx, float ry, float rw, float rh) {
   const auto& c = it.copy;
   if (c.texW == 0 || c.texH == 0 || c.texW > 4096 || c.texH > 4096 || c.rect.width <= 0 || c.rect.height <= 0) return;
   CopyProgram* cprog = copy_program(c.fmt);
@@ -3150,23 +3157,21 @@ void run_copy(const Item& it) {
   gl.ColorMask(1, 1, 1, 1);
   const auto t1 = std::chrono::steady_clock::now();
   gl.UseProgram(cprog->id);
-  gl.Uniform4f(cprog->rect, static_cast<float>(c.rect.x), static_cast<float>(c.rect.y),
-               static_cast<float>(c.rect.width), static_cast<float>(c.rect.height));
-  gl.Uniform4f(cprog->size, static_cast<float>(g_efb.width), static_cast<float>(g_efb.height),
-               static_cast<float>(c.texW), static_cast<float>(c.texH));
+  gl.Uniform4f(cprog->rect, rx, ry, rw, rh);
+  gl.Uniform4f(cprog->size, static_cast<float>(srcW), static_cast<float>(srcH), static_cast<float>(c.texW),
+               static_cast<float>(c.texH));
   gl.Uniform4f(cprog->mode, static_cast<float>(c.fmt), c.opaque ? 1.f : 0.f, g_reversedZ ? 1.f : 0.f, 0.f);
   // 0.25.0: cada copia enlaza solo lo que lee (antes el color y la profundidad del EFB siempre): una profundidad
   // enlazada sin usarse puede obligar al driver a dejarla lista para leerse como textura.
   const bool deProfundidad = (c.fmt & 0x10) != 0;
   gl.ActiveTexture(kTexture0 + 10);
-  gl.BindTexture(kTexture2D, deProfundidad ? g_whiteTexture : g_efb.color);
+  gl.BindTexture(kTexture2D, deProfundidad ? g_whiteTexture : srcColor);
   gl.BindSampler(10, 0);
   gl.ActiveTexture(kTexture0 + 11);
   gl.BindTexture(kTexture2D, deProfundidad ? g_efb.depth : g_whiteTexture);
   gl.BindSampler(11, 0);
   gl.DrawArrays(kTriangles, 0, 3);
   const auto t2 = std::chrono::steady_clock::now();
-  copia_hecha(c.tex);
   // Sin el EFB enlazado para muestrear mientras se vuelve a dibujar en él.
   gl.BindTexture(kTexture2D, 0);
   gl.ActiveTexture(kTexture0 + 10);
@@ -3180,6 +3185,181 @@ void run_copy(const Item& it) {
   g_tCopias.vuelta += ms_entre(t2, t3);
   g_tCopias.cpu += cpu_hilo_ms() - cpu0;
   ++g_tCopias.copias;
+}
+
+void run_copy(const Item& it) {
+  const auto& c = it.copy;
+  run_copy_desde(it, g_efb.color, g_efb.width, g_efb.height, static_cast<float>(c.rect.x),
+                 static_cast<float>(c.rect.y), static_cast<float>(c.rect.width), static_cast<float>(c.rect.height));
+  copia_hecha(c.tex);
+}
+
+// --- Copias del EFB directas y convertidas después (0.31.0) ---------------------------------------------------
+// En la 0.30.0 cada copia tardaba ~1.4 ms de pared en el hilo de la pantalla, casi todo esperando dentro del driver al
+// cambiar del EFB a la textura de la copia y al volver (la CPU del hilo más la GPU sumaban el tiempo del cuadro: no
+// trabajaban a la vez). La copia muestreaba el EFB como textura y luego se seguía dibujando en él. Ahora la zona se
+// copia con glCopyTexSubImage2D sin salir del EFB (el driver la hace dentro del pase) a una textura intermedia, y la
+// conversión al formato de la copia (I8, A8, escala...) se hace después, todas juntas: cuando un dibujo va a leer esa
+// copia, antes de otra copia que no se pueda hacer así (profundidad) o de una paleta, y al terminar el cuadro.
+// CHOYA_GX_COPIA_DIRECTA=0 vuelve a la copia de antes.
+bool copia_directa_activa() {
+  static const bool on = [] {
+    const char* e = std::getenv("CHOYA_GX_COPIA_DIRECTA");
+    return e == nullptr || std::strcmp(e, "0") != 0;
+  }();
+  return on && gl.CopyTexSubImage2D != nullptr;
+}
+
+struct Intermedia {
+  GLuint tex = 0;
+  int w = 0, h = 0;
+  uint64_t libreDesde = 0;  // cuadro en que se usó por última vez (se reusa 3 cuadros después: la GPU la soltó)
+  bool ocupada = false;
+};
+std::vector<Intermedia> g_intermedias;
+uint64_t g_cuadroIntermedias = 0;
+
+struct CopiaPendiente {
+  Item it;
+  size_t intermedia;
+};
+std::vector<CopiaPendiente> g_pendientes;
+
+struct CopiasDirectas {
+  uint64_t directas = 0, convertidas = 0, tandas = 0, sobrantes = 0, nuevas = 0;
+  double copiar = 0, convertir = 0;
+} g_dir;
+
+size_t intermedia_tomar(int w, int h) {
+  for (size_t i = 0; i < g_intermedias.size(); ++i) {
+    Intermedia& m = g_intermedias[i];
+    if (!m.ocupada && m.w == w && m.h == h && m.libreDesde + 3 <= g_cuadroIntermedias) {
+      m.ocupada = true;
+      return i;
+    }
+  }
+  Intermedia m;
+  m.w = w;
+  m.h = h;
+  m.ocupada = true;
+  gl.GenTextures(1, &m.tex);
+  gl.ActiveTexture(kTexture0 + 10);
+  gl.BindTexture(kTexture2D, m.tex);
+  gl.TexStorage2D(kTexture2D, 1, kRgba8, w, h);
+  gl.TexParameteri(kTexture2D, kTextureMinFilter, kLinear);  // como el EFB: la escala promedia igual
+  gl.TexParameteri(kTexture2D, kTextureMagFilter, kLinear);
+  ++g_dir.nuevas;
+  g_intermedias.push_back(m);
+  return g_intermedias.size() - 1;
+}
+
+void intermedia_soltar(size_t i) {
+  g_intermedias[i].ocupada = false;
+  g_intermedias[i].libreDesde = g_cuadroIntermedias;
+}
+
+// Una vez por cuadro dibujado: borra las intermedias que nadie usa hace mucho (otra escena, otros tamaños).
+void intermedias_cuadro() {
+  ++g_cuadroIntermedias;
+  if (g_cuadroIntermedias % 600 != 0) return;
+  for (size_t i = 0; i < g_intermedias.size();) {
+    Intermedia& m = g_intermedias[i];
+    if (!m.ocupada && m.libreDesde + 600 < g_cuadroIntermedias) {
+      gl.DeleteTextures(1, &m.tex);
+      g_intermedias[i] = g_intermedias.back();
+      g_intermedias.pop_back();
+    } else {
+      ++i;
+    }
+  }
+}
+
+bool copia_directa_sirve(const Item& it) {
+  const auto& c = it.copy;
+  if (!copia_directa_activa() || (c.fmt & 0x10) != 0) return false;  // la profundidad no se copia así
+  if (c.texW == 0 || c.texH == 0 || c.texW > 4096 || c.texH > 4096) return false;
+  if (c.rect.x < 0 || c.rect.y < 0 || c.rect.width <= 0 || c.rect.height <= 0) return false;
+  if (c.rect.x + c.rect.width > g_efb.width || c.rect.y + c.rect.height > g_efb.height) return false;
+  return copy_program(c.fmt) != nullptr;
+}
+
+// Copia la zona del EFB a una intermedia sin salir del EFB; la conversión queda pendiente.
+void diferir_copia(const Item& it) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto& c = it.copy;
+  // Si la copia anterior al mismo destino sigue pendiente, nadie la leyó: sobra.
+  for (size_t i = 0; i < g_pendientes.size(); ++i) {
+    if (g_pendientes[i].it.copy.tex == c.tex) {
+      intermedia_soltar(g_pendientes[i].intermedia);
+      g_pendientes.erase(g_pendientes.begin() + static_cast<std::ptrdiff_t>(i));
+      ++g_dir.sobrantes;
+      break;
+    }
+  }
+  const size_t m = intermedia_tomar(c.rect.width, c.rect.height);
+  gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
+  gl.ActiveTexture(kTexture0 + 10);
+  gl.BindTexture(kTexture2D, g_intermedias[m].tex);
+  gl.CopyTexSubImage2D(kTexture2D, 0, 0, 0, c.rect.x, g_efb.height - c.rect.y - c.rect.height, c.rect.width,
+                       c.rect.height);
+  gl.BindTexture(kTexture2D, 0);
+  g_pendientes.push_back(CopiaPendiente{it, m});
+  copia_hecha(c.tex);
+  ++g_dir.directas;
+  g_dir.copiar += ms_entre(t0, std::chrono::steady_clock::now());
+}
+
+bool hay_copias_pendientes() { return !g_pendientes.empty(); }
+
+void soltar_pendientes_de(uint64_t id) {
+  for (size_t i = 0; i < g_pendientes.size();) {
+    if (g_pendientes[i].it.copy.tex == id) {
+      intermedia_soltar(g_pendientes[i].intermedia);
+      g_pendientes.erase(g_pendientes.begin() + static_cast<std::ptrdiff_t>(i));
+    } else {
+      ++i;
+    }
+  }
+}
+
+// Hace las conversiones pendientes, en orden. Deja enlazado el EFB (el que llama repone el estado, como tras una copia).
+void convertir_pendientes() {
+  if (g_pendientes.empty()) return;
+  const auto t0 = std::chrono::steady_clock::now();
+  for (const CopiaPendiente& p : g_pendientes) {
+    const Intermedia& m = g_intermedias[p.intermedia];
+    run_copy_desde(p.it, m.tex, m.w, m.h, 0.f, 0.f, static_cast<float>(m.w), static_cast<float>(m.h));
+    intermedia_soltar(p.intermedia);
+    ++g_dir.convertidas;
+  }
+  g_pendientes.clear();
+  ++g_dir.tandas;
+  g_dir.convertir += ms_entre(t0, std::chrono::steady_clock::now());
+}
+
+// ¿El grupo de texturas lee alguna copia con la conversión pendiente? (los ids, guardados por grupo)
+struct IdsGrupo {
+  uint64_t gen = 0;
+  uint64_t tex[8] = {};
+};
+std::unordered_map<uint64_t, IdsGrupo> g_idsGrupo;
+
+bool grupo_lee_pendiente(uint64_t bindGroup) {
+  if (g_pendientes.empty() || bindGroup == 0) return false;
+  IdsGrupo& ids = g_idsGrupo[bindGroup];
+  const uint64_t gen = g_bindGen.load(std::memory_order_acquire);
+  if (ids.gen != gen) {
+    BindDesc bd;
+    if (!find_bind_group(bindGroup, bd)) return false;
+    for (int i = 0; i < 8; ++i) ids.tex[i] = bd.tex[i];
+    ids.gen = gen;
+  }
+  for (const CopiaPendiente& p : g_pendientes) {
+    for (int i = 0; i < 8; ++i) {
+      if (ids.tex[i] != 0 && ids.tex[i] == p.it.copy.tex) return true;
+    }
+  }
+  return false;
 }
 
 // --- Paletas sobre copias del EFB (C4/C8 + TLUT) ----------------------------------------------------------------
@@ -4463,6 +4643,15 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     }
   };
   int debugDrawIndex = 0;
+  // Tras una copia (o las conversiones pendientes, 0.31.0): usaron su propio programa, estado y unidades 10/11.
+  auto reponer_tras_copia = [&]() {
+    shadow_invalidate();
+    set_viewport(viewportRect);
+    set_enable(kScissorTest, S.scissorOn, true);
+    set_scissor(scissorRect);
+    gl.BindVertexArray(g_vao);
+    lastBindGroup = ~0ull;  // las texturas de copia pudieron rehacerse
+  };
   static std::vector<uint8_t> plan;
   planear_invalidaciones(f, plan);
   ++g_inval.cuadros;
@@ -4529,21 +4718,24 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     case Op::Copy: {
       mali_mark(kMaliDibujos);
       gpu_pases_tramo(passIndex, 1);
-      if (copies_enabled()) run_copy(it);
+      if (copies_enabled()) {
+        if (copia_directa_sirve(it)) {
+          diferir_copia(it);  // 0.31.0: sin salir del EFB; la conversión después
+        } else {
+          convertir_pendientes();  // en orden: las directas anteriores primero
+          run_copy(it);
+        }
+      }
       if (g_gpuPases.midiendo) ++g_gpuPases.infoCuadro[gpu_pase_idx(passIndex)].copias;
       gpu_pases_tramo(passIndex, 0);
       mali_mark(kMaliCopias);
       ((it.copy.fmt & 0x10) != 0 ? g_maliCopiedDepth : g_maliCopiedColor) = true;
-      shadow_invalidate();  // la copia usó su propio programa, estado y unidades 10/11
-      set_viewport(viewportRect);
-      set_enable(kScissorTest, S.scissorOn, true);
-      set_scissor(scissorRect);
-      gl.BindVertexArray(g_vao);
-      lastBindGroup = ~0ull;  // las texturas de copia pudieron rehacerse
+      reponer_tras_copia();
     } break;
     case Op::PaletteConv: {
       mali_mark(kMaliDibujos);
       gpu_pases_tramo(passIndex, 1);
+      convertir_pendientes();  // la paleta lee la copia
       run_palette_conv(it);
       gpu_pases_tramo(passIndex, 0);
       mali_mark(kMaliCopias);
@@ -4644,6 +4836,15 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
         ++g_stats.skippedProgram;
         break;
       }
+      if (it.draw.bindGroup != lastBindGroup && hay_copias_pendientes() && grupo_lee_pendiente(it.draw.bindGroup)) {
+        // 0.31.0: este dibujo lee una copia directa todavía sin convertir: se convierten todas las pendientes.
+        mali_mark(kMaliDibujos);
+        gpu_pases_tramo(passIndex, 1);
+        convertir_pendientes();
+        gpu_pases_tramo(passIndex, 0);
+        mali_mark(kMaliCopias);
+        reponer_tras_copia();
+      }
       set_program(prog.id);
       set_ubo(ubo, static_cast<GLintptr>(it.draw.uniformOffset));
       if (it.draw.bindGroup != lastBindGroup) {
@@ -4671,6 +4872,14 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   }
   end_pass();
   mali_mark(kMaliDibujos);
+  if (hay_copias_pendientes()) {  // 0.31.0: las que nadie leyó en este cuadro
+    gpu_pases_tramo(passIndex, 1);
+    convertir_pendientes();
+    gpu_pases_tramo(passIndex, 0);
+    mali_mark(kMaliCopias);
+    reponer_tras_copia();
+  }
+  intermedias_cuadro();
   if (!presented && present) {
     // Ningún pase se copió: se muestra cómo quedó el último.
     gpu_pases_tramo(passIndex, 2);
@@ -4789,6 +4998,19 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
                  rotar_copias() ? "rotadas en 3 versiones" : "sin rotar (CHOYA_GX_ROTAR_COPIAS=0)",
                  static_cast<unsigned long long>(tc.nuevas));
       }
+      if (g_dir.directas > 0 || g_tCopias.copias > 0) {  // 0.31.0
+        if (copia_directa_activa()) {
+          log_line("motor: copias directas (por cuadro): %.1f copiadas sin salir del EFB (%.1f ms), %.1f convertidas en "
+                   "%.1f tandas (%.1f ms), %.1f sobrantes; %zu intermedias (%llu nuevas)",
+                   static_cast<double>(g_dir.directas) / n, g_dir.copiar / n, static_cast<double>(g_dir.convertidas) / n,
+                   static_cast<double>(g_dir.tandas) / n, g_dir.convertir / n, static_cast<double>(g_dir.sobrantes) / n,
+                   g_intermedias.size(), static_cast<unsigned long long>(g_dir.nuevas));
+        } else {
+          log_line("motor: copias directas: apagadas (%s); cada copia dibuja leyendo el EFB",
+                   gl.CopyTexSubImage2D == nullptr ? "el driver no da glCopyTexSubImage2D" : "CHOYA_GX_COPIA_DIRECTA=0");
+        }
+      }
+      g_dir = CopiasDirectas{};
       g_tCopias = TiempoCopias{};
       g_tiempos = TiemposMotor{};
     }
