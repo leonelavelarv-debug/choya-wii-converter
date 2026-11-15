@@ -44,6 +44,8 @@ extern "C" void choya_gx_request_dump();  // volcado del siguiente cuadro (auror
 extern "C" int choya_medir_empezar(int seconds);  // medición por tramos (choya_perfil.cpp)
 // Runtime de perfiles de Clang: solo existe en la compilación CHOYA_OPT=pgo-generar (si no, es nulo).
 extern "C" int __llvm_profile_write_file(void) __attribute__((weak));
+// Cómo se compiló el código traducido (CHOYA_OPT, 0.30.0): lo genera CMake en el binario; nulo en compilaciones viejas.
+extern "C" const char* const choya_compilado __attribute__((weak));
 
 namespace {
 
@@ -633,6 +635,8 @@ extern "C" void choya_gles_frame() {
     if (!g.tried) {
         g.tried = true;
         g_tidJuego.store(static_cast<int>(syscall(SYS_gettid)));  // lo llama el hilo del juego (VI)
+        Log("compilado: código traducido con %s",
+            &choya_compilado != nullptr && choya_compilado[0] != 0 ? choya_compilado : "O2 (sin marca en el binario)");
         std::thread(PerfilHilos).detach();
         if (__llvm_profile_write_file) std::thread(EscribirPerfilPgo).detach();
         const char* on = std::getenv("CHOYA_GLES");

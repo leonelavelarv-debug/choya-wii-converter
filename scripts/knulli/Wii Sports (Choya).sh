@@ -119,6 +119,9 @@ if [ -f "$DIR/sin-saltar-cuadros" ]; then export CHOYA_GX_SALTAR=0; fi
 # EFB sin recargar (0.25.0): antes de un borrado que tapa lo que se va a leer, el motor le avisa a la Mali que no lea
 # el EFB de la memoria (y al terminar el cuadro, que no lo guarde). Un archivo vacío "sin-invalidar-efb" lo apaga.
 if [ -f "$DIR/sin-invalidar-efb" ]; then export CHOYA_GX_INVALIDAR=0; fi
+# Copias rotadas (0.30.0): cada copia del EFB escribe en otra de 3 texturas, así no espera a que la GPU termine de
+# leer la anterior. Un archivo vacío "sin-rotar-copias" vuelve a una sola textura por copia.
+if [ -f "$DIR/sin-rotar-copias" ]; then export CHOYA_GX_ROTAR_COPIAS=0; fi
 # Recursos convertidos por el conversor de Choya (assets.wlpk junto al juego): texturas en ETC2/EAC ya reducidas.
 # CHOYA_PAQUETE=0 usa solo las del disco.
 if [ "${CHOYA_PAQUETE:-}" != "0" ] && [ -f "$DIR/assets.wlpk" ]; then
@@ -137,12 +140,13 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "--- procesador"
   echo "gobernador: $(cat $CPUF/scaling_governor 2>/dev/null)  MHz actual/max: $(( $(cat $CPUF/scaling_cur_freq 2>/dev/null || echo 0) / 1000 ))/$(( $(cat $CPUF/cpuinfo_max_freq 2>/dev/null || echo 0) / 1000 ))"
   echo "juego: $GAME"
-  echo "código traducido compilado con: $(cat "$DIR/compilado.txt" 2>/dev/null || echo "O2 (port anterior a 0.29.0)")$([ -d "$DIR/pgo" ] && echo "; perfiles PGO guardados: $(ls "$DIR/pgo" 2>/dev/null | wc -l)")"
+  echo "código traducido compilado con: $(cat "$DIR/compilado.txt" 2>/dev/null || echo "no está compilado.txt (el binario lo dice en el resumen: línea \"compilado:\")")$([ -d "$DIR/pgo" ] && echo "; perfiles PGO guardados: $(ls "$DIR/pgo" 2>/dev/null | wc -l)")"
   echo "PortMaster: ${controlfolder:-no encontrado}  dispositivo: ${DEVICE_NAME:-?}  CFW: ${CFW_NAME:-?}"
   echo "mapeo del mando: ${SDL_GAMECONTROLLERCONFIG:-ninguno}" | cut -c1-200
   echo "efectos de audio: $([ "${CHOYA_SIN_REVERB:-0}" = 1 ] && echo "apagados (para oírlos: archivo con-reverb)" || echo "encendidos (archivo con-reverb)")"
   echo "memoria de la Mali por partes del cuadro: $([ "${CHOYA_GX_MALI:-0}" = 1 ] && echo "se mide (archivo medir-mali)" || echo "no se mide (para medirla: archivo vacío medir-mali)")"
   echo "EFB sin recargar en la Mali: $([ "${CHOYA_GX_INVALIDAR:-1}" = 0 ] && echo "no (archivo sin-invalidar-efb)" || echo "sí (para apagarlo: archivo vacío sin-invalidar-efb)")"
+  echo "copias del EFB rotadas en 3 texturas: $([ "${CHOYA_GX_ROTAR_COPIAS:-1}" = 0 ] && echo "no (archivo sin-rotar-copias)" || echo "sí (para apagarlo: archivo vacío sin-rotar-copias)")"
   echo "saltar cuadros en el motor: $([ "${CHOYA_GX_SALTAR:-1}" = 0 ] && echo "no, se dibujan todos (archivo sin-saltar-cuadros)" || echo "sí (para dibujarlos todos: archivo vacío sin-saltar-cuadros)")"
   echo "hilo GX: $([ "$CHOYA_GX_HILO" = 1 ] && echo "encendido, el GX en otro núcleo (para apagarlo: archivo vacío sin-hilo-gx)" || echo "apagado (archivo sin-hilo-gx)")$([ "${CHOYA_GX_HILO_COPIAR:-0}" = 1 ] && echo "; listas copiadas (archivo hilo-gx-copiar)")"
   echo "TEV: $(case "${CHOYA_GX_TEV:-}" in flotante) echo "todo en flotante (archivo tev-flotante)";; exacto) echo "todo exacto en enteros (archivo tev-exacto)";; *) echo "mixto: flotante salvo donde el redondeo cambia el resultado (todo exacto: archivo vacío tev-exacto)";; esac)"
@@ -159,6 +163,7 @@ escribir_resumen() {
     echo "codigo de salida: ${STATUS:-sigue corriendo} (124 = siguio corriendo hasta el limite del modo diagnostico)"
     [ -f "$DIR/perfil.txt" ] && echo "perfil.txt: $(grep -m1 '^muestras' "$DIR/perfil.txt"), escrito el $(date -r "$DIR/perfil.txt" '+%d/%m %H:%M' 2>/dev/null), hilo del juego $(awk '/^hilo_juego/{print $2}' "$DIR/perfil.txt")"
     cat "$DIR/cpu.txt"
+    grep -h -m1 "compilado: código traducido" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | head -1
     cat "$DIR/procesador.txt" 2>/dev/null
     echo "--- cuadros volcados"
     ls -la "$DIR"/cuadro-*.bin 2>/dev/null || echo "ninguno"
@@ -181,9 +186,9 @@ escribir_resumen() {
     grep -h "aurora: por cuadro" "$DIR/choya-gles.txt" 2>/dev/null | tail -6
     grep -hE "aurora: hilo GX (de Choya|apagado)" "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | head -1
     grep -h "aurora: hilo GX:" "$DIR/choya-gles.txt" 2>/dev/null | tail -4
-    echo "--- motor de pantalla: cuadros por segundo, tiempo por cuadro dibujado, saltos, EFB sin recargar, TEV, copias y GPU por pase (0.28.0)"
+    echo "--- motor de pantalla: cuadros por segundo, tiempo por cuadro dibujado, saltos, EFB sin recargar, TEV, copias (y por dentro) y GPU por pase (0.30.0)"
     grep -h "motor: midiendo el tiempo de GPU\|GL_EXT_disjoint_timer_query" "$DIR/choya-gles.txt" 2>/dev/null | head -2
-    grep -h "motor: cuadros por segundo\|motor: tiempo por cuadro dibujado\|presentación: \|motor: saltos:\|motor: EFB sin recargar\|motor: TEV \|motor: copias del EFB:" "$DIR/choya-gles.txt" 2>/dev/null | tail -21
+    grep -h "motor: cuadros por segundo\|motor: tiempo por cuadro dibujado\|presentación: \|motor: saltos:\|motor: EFB sin recargar\|motor: TEV \|motor: copias del EFB:\|motor: copias por dentro" "$DIR/choya-gles.txt" 2>/dev/null | tail -24
     grep -h "motor: GPU por pase" "$DIR/choya-gles.txt" 2>/dev/null | tail -3
     grep -hE "pgo: " "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | sort -u | tail -3
     echo "--- hilos y núcleos (cada 10 s: CPU de cada núcleo y de cada hilo, ms por cuadro del juego, espera de turno)"

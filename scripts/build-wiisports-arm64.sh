@@ -5,6 +5,14 @@
 #
 # Antes hay que haber corrido build-wiisports-wsl.sh (deja generated/ y runtime-wiisports/).
 # Resultado: C:\Users\Public\choya-port\  (copiar su contenido a la carpeta ports de la microSD).
+#
+# CHOYA_OPT = cómo se optimiza el código traducido del juego (cada modo usa su propia carpeta de compilación):
+#   (vacío)      -O2, como WiiCompiled
+#   O3           -O3
+#   pgo-generar  versión que toma el perfil en la consola (más lenta): jugar unos minutos, luego copiar
+#                wiisports-choya/pgo/*.profraw a C:\Users\Public\choya-pgo (CHOYA_PGO_DIR=otra carpeta)
+#   pgo          compilación guiada por ese perfil (-O2 + -fprofile-use)
+#   pgo-O3       igual, con -O3
 set -uo pipefail
 
 CHOYA="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,6 +20,21 @@ WC="${1:-$HOME/BrawlRecompiled/wiicompiled}"
 LOG="$HOME/choya-build-arm64.log"
 IMG=choya-wiicompiled-arm64
 BUILD=build-wiisports-arm64
+OPT_MODO="${CHOYA_OPT:-}"
+OPT_FLAGS=""
+OPT_ENLACE=""
+PGO="$WC/choya-pgo"
+PERFIL="$PGO/wiisports.profdata"
+PGO_USO="-fprofile-use=$PERFIL;-Wno-profile-instr-unprofiled;-Wno-profile-instr-out-of-date;-Wno-backend-plugin"
+case "$OPT_MODO" in
+  ""|O2|o2) OPT_MODO="O2" ;;
+  O3|o3) BUILD="$BUILD-o3"; OPT_FLAGS="-O3" ;;
+  pgo-generar) BUILD="$BUILD-pgogen"; OPT_FLAGS="-fprofile-generate"
+               OPT_ENLACE="$PGO/runtime/libclang_rt.profile-aarch64.a;-Wl,-u,__llvm_profile_runtime" ;;
+  pgo) BUILD="$BUILD-pgo"; OPT_FLAGS="$PGO_USO" ;;
+  pgo-O3|pgo-o3) OPT_MODO="pgo-O3"; BUILD="$BUILD-pgo3"; OPT_FLAGS="-O3;$PGO_USO" ;;
+  *) echo "CHOYA_OPT=$OPT_MODO no existe (usa O3, pgo-generar, pgo o pgo-O3)"; exit 1 ;;
+esac
 PORT="$HOME/choya-port"
 : > "$LOG"
 
@@ -30,6 +53,32 @@ grep -E "AVISO|Estructuras" "$LOG" | tail -5
 paso "3/6 Imagen de Docker (la primera vez tarda: baja Clang 21 y las bibliotecas arm64)"
 docker build -t "$IMG" "$CHOYA/docker/wiicompiled-arm64" >>"$LOG" 2>&1 || falla "docker build"
 
+echo "Código traducido: $OPT_MODO (carpeta $BUILD)" | tee -a "$LOG"
+if [ "$OPT_MODO" = pgo-generar ] && [ ! -f "$PGO/runtime/libclang_rt.profile-aarch64.a" ]; then
+  # Una sola vez: el runtime de perfiles de Clang para aarch64 (apt.llvm.org no lo trae), de compiler-rt.
+  echo "Compilando el runtime de perfiles para aarch64 (baja compiler-rt de github.com)..." | tee -a "$LOG"
+  mkdir -p "$PGO"
+  docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$WC":"$WC" -v "$CHOYA/scripts":/choya-scripts:ro "$IMG" \
+    bash /choya-scripts/pgo-runtime-aarch64.sh "$PGO/runtime" >>"$LOG" 2>&1 || falla "runtime de perfiles (PGO)"
+fi
+if [ "$OPT_MODO" = pgo ] || [ "$OPT_MODO" = pgo-O3 ]; then
+  # Los perfiles que tomó la consola (wiisports-choya/pgo/*.profraw) se juntan en uno solo.
+  CRUDOS="${CHOYA_PGO_DIR:-/mnt/c/Users/Public/choya-pgo}"
+  ls "$CRUDOS"/*.profraw >/dev/null 2>&1 || falla "no hay perfiles en $CRUDOS: compila con CHOYA_OPT=pgo-generar, juega en la consola y copia wiisports-choya/pgo/*.profraw ahí"
+  rm -rf "$PGO/crudos" && mkdir -p "$PGO/crudos" && cp "$CRUDOS"/*.profraw "$PGO/crudos/"
+  echo "Perfiles de la consola: $(ls "$PGO/crudos" | wc -l) archivos ($(du -sh "$PGO/crudos" | cut -f1))" | tee -a "$LOG"
+  docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$WC":"$WC" "$IMG" bash -c "
+    llvm-profdata-21 merge -o '$PERFIL.tmp' '$PGO'/crudos/*.profraw && mv '$PERFIL.tmp' '$PERFIL' &&
+    llvm-profdata-21 show '$PERFIL' | tail -3" 2>&1 | tee -a "$LOG"
+  [ -f "$PERFIL" ] || falla "llvm-profdata merge (¿los .profraw son de esta versión de Clang?)"
+  # Ninja no sabe que el perfil cambió: si es otro, se recompila todo.
+  SELLO_PGO=$(sha1sum "$PERFIL" | cut -c1-12)
+  if [ "$(cat "$WC/$BUILD/choya-perfil.txt" 2>/dev/null)" != "$SELLO_PGO" ] && [ -f "$WC/$BUILD/build.ninja" ]; then
+    echo "Perfil nuevo: se recompila el código traducido" | tee -a "$LOG"
+    docker run --rm -u "$(id -u):$(id -g)" -v "$WC":"$WC" -w "$WC" "$IMG" cmake --build "$BUILD" --target clean >>"$LOG" 2>&1
+  fi
+fi
+
 paso "4/6 Compilar para aarch64 (Cortex-A53)"
 MEM_GB=$(awk '/MemTotal/{print int($2/1024/1024)}' /proc/meminfo)
 JOBS=$(( MEM_GB * 2 / 3 )); [ "$JOBS" -lt 1 ] && JOBS=1; [ "$JOBS" -gt "$(nproc)" ] && JOBS=$(nproc)
@@ -39,11 +88,14 @@ echo "Memoria ${MEM_GB} GB → ${JOBS} trabajos a la vez" | tee -a "$LOG"
 # de compilación se borra para que CMake no lo vuelva a usar.
 # KNULLI no tiene X11, Wayland ni /dev/dri: SDL3 se compila "de consola" (ventana offscreen por ahora).
 rm -rf "$WC/$BUILD/_deps/dawn-"*
+# 0.30.0: el binario lleva el modo (sale en el log de la consola aunque falte compilado.txt).
+COMPILADO="$OPT_MODO${SELLO_PGO:+ (perfil $SELLO_PGO)}"
 docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$WC":"$WC" -w "$WC" "$IMG" bash -c "
   cmake -S runtime-wiisports -B $BUILD -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE=/opt/choya/aarch64-clang.cmake \
         -DAURORA_DAWN_PROVIDER=choya -UDawn_DIR -DAURORA_SDL3_PROVIDER=vendor \
-        -DSDL_UNIX_CONSOLE_BUILD=ON -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=OFF &&
+        -DSDL_UNIX_CONSOLE_BUILD=ON -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=OFF \
+        -DCHOYA_OPT_TRADUCIDO='$OPT_FLAGS' -DCHOYA_ENLACE_EXTRA='$OPT_ENLACE' -DCHOYA_COMPILADO='$COMPILADO' &&
   cmake --build $BUILD -j $JOBS -- -k 0" >>"$LOG" 2>&1
 STATUS=$?
 ERRS=$(grep -c " error: " "$LOG" || true)
@@ -53,6 +105,8 @@ if [ "$STATUS" -ne 0 ] || [ ! -f "$WC/$BUILD/WiiCompiled" ]; then
   cp "$LOG" /mnt/c/Users/Public/choya-build-arm64.log 2>/dev/null
   falla "compilación aarch64"
 fi
+
+[ -n "${SELLO_PGO:-}" ] && echo "$SELLO_PGO" > "$WC/$BUILD/choya-perfil.txt"
 
 paso "5/6 Recursos convertidos (assets.wlpk del conversor de Choya)"
 # El conversor reduce las texturas del disco y las recodifica a ETC2/EAC; el motor de Choya las usa en vez de las que
@@ -113,6 +167,11 @@ for f in dsp_coef.bin initial_pipeline_cache.db cacert.pem; do [ -f "$B/$f" ] &&
 [ -d "$B/wii_bootstrap" ] && cp -r "$B/wii_bootstrap" "$PORT/wiisports-choya/"
 cp "$CHOYA/scripts/knulli/Wii Sports (Choya).sh" "$CHOYA/scripts/knulli/Wii Sports (Choya) - diagnostico.sh" "$PORT/"
 echo "Copia aquí la carpeta DATA de tu disco (la que tiene files y sys)." > "$PORT/wiisports-choya/game/LEEME.txt"
+case "$OPT_MODO" in
+  pgo-generar) echo "pgo-generar (toma el perfil: va más lento; los perfiles quedan en wiisports-choya/pgo)" ;;
+  pgo|pgo-O3) echo "$OPT_MODO (perfil $(cat "$WC/$BUILD/choya-perfil.txt" 2>/dev/null))" ;;
+  *) echo "$OPT_MODO" ;;
+esac > "$PORT/wiisports-choya/compilado.txt"
 ls -la "$PORT/wiisports-choya" "$PORT/wiisports-choya/lib" | tee -a "$LOG"
 du -sh "$PORT" | tee -a "$LOG"
 rm -rf /mnt/c/Users/Public/choya-port && cp -r "$PORT" /mnt/c/Users/Public/choya-port \

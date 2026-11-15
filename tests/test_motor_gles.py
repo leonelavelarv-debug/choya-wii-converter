@@ -64,6 +64,12 @@ class TestMotorGles(unittest.TestCase):
             self.assertRegex(log, r"motor: EFB sin recargar: (encendido|el driver no tiene); por cuadro: [\d.]+ borrados")
             self.assertRegex(log, r"motor: TEV mixto: \d+ programas en flotante, \d+ exactos")
             self.assertRegex(log, r"motor: copias del EFB: un programa por formato, \d+ programas hechos")
+            # 0.30.0: copias rotadas en 3 texturas (el harness completo pasa igual con y sin rotar) y su tiempo por dentro.
+            sin_rotar = subprocess.run([exe], env=dict(env, CHOYA_GX_ROTAR_COPIAS="0"), capture_output=True, text=True)
+            self.assertIn("PRUEBA OK", sin_rotar.stdout, sin_rotar.stdout + sin_rotar.stderr)
+            if re.search(r"motor: texturas: \d+ en GL, \d+ subidas, [1-9]\d* copias del EFB", log):
+                self.assertRegex(log, r"motor: copias por dentro \(por cuadro\): [\d.]+ copias; cambio a la textura "
+                                      r"[\d.]+ ms, dibujo [\d.]+, vuelta al EFB [\d.]+ \(CPU [\d.]+\); rotadas en 3 versiones")
             self.assertNotIn("memoria de la Mali por partes", log)  # 0.24.0: apagada salvo CHOYA_GX_MALI=1
             # Caché de programas en disco: la primera vez compila y guarda, la segunda carga los binarios y dibuja igual.
             cache = os.path.join(d, "cache")

@@ -86,6 +86,33 @@ class ScriptDeCompilacion(unittest.TestCase):
         self.assertIn("-DCHOYA_ENLACE_EXTRA='$OPT_ENLACE'", texto)
         self.assertIn("llvm-profdata-21 merge", texto)
         self.assertIn("compilado.txt", texto)
+        self.assertIn("-DCHOYA_COMPILADO='$COMPILADO'", texto)  # 0.30.0: también dentro del binario
+
+    def test_modo_en_el_binario(self):
+        out = retarget.apply_edits(PUBLIC_PRODUCTS, "cmake/PublicProducts.cmake", [])
+        self.assertIn('file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/choya_compilado.cpp" @ONLY', out)
+        self.assertIn('const char* const choya_compilado = \\"@CHOYA_COMPILADO@\\";', out)
+        self.assertIn('target_sources(WiiCompiled PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/choya_compilado.cpp")', out)
+        texto = leer(GLES)
+        self.assertIn('extern "C" const char* const choya_compilado __attribute__((weak));', texto)
+        self.assertIn('Log("compilado: código traducido con %s"', texto)
+        self.assertIn("compilado: código traducido", leer(LANZADOR))
+        if shutil.which("cmake") and shutil.which("c++"):
+            # CMake de verdad genera el archivo con el modo (con espacios y paréntesis, como "pgo (perfil abc)").
+            with tempfile.TemporaryDirectory() as tmp:
+                with open(os.path.join(tmp, "main.cpp"), "w") as f:
+                    f.write('#include <cstdio>\nextern "C" const char* const choya_compilado;\n'
+                            'int main(){std::puts(choya_compilado);}\n')
+                with open(os.path.join(tmp, "CMakeLists.txt"), "w") as f:
+                    f.write("cmake_minimum_required(VERSION 3.20)\nproject(t CXX)\n"
+                            "function(mkw_configure_product t)\nendfunction()\n"
+                            "add_executable(WiiCompiled main.cpp)\n" + out[out.index("mkw_configure_product(WiiCompiled)"):])
+                b = os.path.join(tmp, "b")
+                subprocess.run(["cmake", "-S", tmp, "-B", b, "-DCHOYA_COMPILADO=pgo (perfil abc)"], check=True,
+                               capture_output=True)
+                subprocess.run(["cmake", "--build", b], check=True, capture_output=True)
+                r = subprocess.run([os.path.join(b, "WiiCompiled")], capture_output=True, text=True)
+                self.assertEqual(r.stdout.strip(), "pgo (perfil abc)")
 
 
 class GuardadoDelPerfil(unittest.TestCase):

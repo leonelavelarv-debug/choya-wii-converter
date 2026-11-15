@@ -1182,8 +1182,14 @@ EDITS = [
      "mkw_configure_product(WiiCompiled)\n"
      "if(CHOYA_ENLACE_EXTRA)  # choya: runtime de perfiles (PGO) para el binario de la consola\n"
      "    target_link_libraries(WiiCompiled PRIVATE ${CHOYA_ENLACE_EXTRA})\n"
-     "endif()\n",
-     "enlace del runtime de perfiles (PGO)"),
+     "endif()\n"
+     "# choya: el binario dice cómo se compiló el código traducido (CHOYA_OPT); el motor lo escribe en el log.\n"
+     "file(CONFIGURE OUTPUT \"${CMAKE_CURRENT_BINARY_DIR}/choya_compilado.cpp\" @ONLY\n"
+     "     CONTENT \"extern \\\"C\\\" const char* const choya_compilado = \\\"@CHOYA_COMPILADO@\\\";\\n\")\n"
+     "set_source_files_properties(\"${CMAKE_CURRENT_BINARY_DIR}/choya_compilado.cpp\" PROPERTIES\n"
+     "    SKIP_PRECOMPILE_HEADERS ON SKIP_UNITY_BUILD_INCLUSION ON)\n"
+     "target_sources(WiiCompiled PRIVATE \"${CMAKE_CURRENT_BINARY_DIR}/choya_compilado.cpp\")\n",
+     "enlace del runtime de perfiles (PGO) y modo de compilación en el binario"),
 ]
 
 

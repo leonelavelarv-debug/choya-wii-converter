@@ -576,9 +576,16 @@ TexShared& texs() {
 std::unordered_map<uint64_t, GlTexture> g_textures;  // solo en el hilo del motor
 // Texturas que son copias del EFB (GXCopyTex): las llena el motor en la GPU, con su framebuffer.
 struct CopyTexture {
-  GLuint tex = 0, fbo = 0;
+  GLuint tex = 0, fbo = 0;  // la versión vigente (la última copia hecha): la que leen los dibujos
   uint32_t width = 0, height = 0;
+  // 0.30.0: copias rotadas. Cada copia escribe en otra de kRotaCopias texturas, así no espera a que la GPU termine de
+  // leer la anterior (los cuadros en vuelo todavía la muestrean). Solo en g_copyTextures.
+  static constexpr int kRotaCopias = 3;
+  GLuint texs[kRotaCopias] = {}, fbos[kRotaCopias] = {};
+  int cur = 0;
 };
+// Borra las texturas y framebuffers de una copia (todas las versiones rotadas).
+void borrar_copia(CopyTexture& c);
 std::unordered_map<uint64_t, CopyTexture> g_copyTextures;  // solo en el hilo del motor
 std::unordered_map<uint64_t, CopyTexture> g_convTextures;  // paletas sobre copias del EFB (también con su framebuffer)
 GLuint g_whiteTexture = 0;
@@ -2313,8 +2320,7 @@ void process_textures() {
     }
     auto c = g_copyTextures.find(id);
     if (c != g_copyTextures.end()) {
-      gl.DeleteFramebuffers(1, &c->second.fbo);
-      gl.DeleteTextures(1, &c->second.tex);
+      borrar_copia(c->second);
       g_copyTextures.erase(c);
       ++g_texGen;
     }
@@ -3056,26 +3062,77 @@ bool copies_enabled() {
   return on;
 }
 
+// 0.30.0: copias rotadas (ver CopyTexture). CHOYA_GX_ROTAR_COPIAS=0 vuelve a una sola textura por copia.
+bool rotar_copias() {
+  static const bool on = [] {
+    const char* e = std::getenv("CHOYA_GX_ROTAR_COPIAS");
+    return e == nullptr || std::strcmp(e, "0") != 0;
+  }();
+  return on;
+}
+
+void borrar_copia(CopyTexture& c) {
+  bool rotadas = false;
+  for (int i = 0; i < CopyTexture::kRotaCopias; ++i) {
+    if (c.fbos[i] != 0) gl.DeleteFramebuffers(1, &c.fbos[i]);
+    if (c.texs[i] != 0) gl.DeleteTextures(1, &c.texs[i]);
+    rotadas = rotadas || c.texs[i] != 0;
+    c.texs[i] = c.fbos[i] = 0;
+  }
+  if (!rotadas) {  // sin rotar: la única está en tex/fbo
+    if (c.fbo != 0) gl.DeleteFramebuffers(1, &c.fbo);
+    if (c.tex != 0) gl.DeleteTextures(1, &c.tex);
+  }
+  c.tex = c.fbo = 0;
+  c.cur = 0;
+}
+
+// Tiempo de pared dentro de las copias (0.30.0): en la 0.29.0 la parte "copias del EFB" del hilo de la pantalla
+// tardaba ~30 ms por cuadro con ~20 copias, casi todo esperando dentro del driver. Dónde: al cambiar a la textura de
+// la copia (el driver cierra el pase del EFB), al dibujarla o al volver al EFB.
+double ms_entre(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b);
+double cpu_hilo_ms();
+struct TiempoCopias {
+  double cambio = 0, dibujo = 0, vuelta = 0, cpu = 0;
+  uint64_t copias = 0, nuevas = 0;
+} g_tCopias;
+
 // Hace la copia; deja enlazado el framebuffer del EFB (el que llama repone viewport y recorte).
 void run_copy(const Item& it) {
   const auto& c = it.copy;
   if (c.texW == 0 || c.texH == 0 || c.texW > 4096 || c.texH > 4096 || c.rect.width <= 0 || c.rect.height <= 0) return;
   CopyProgram* cprog = copy_program(c.fmt);
   if (cprog == nullptr) return;
+  const auto t0 = std::chrono::steady_clock::now();
+  const double cpu0 = cpu_hilo_ms();
   CopyTexture& ct = g_copyTextures[c.tex];
-  if (ct.tex == 0 || ct.width != c.texW || ct.height != c.texH) {
-    if (ct.fbo != 0) gl.DeleteFramebuffers(1, &ct.fbo);
-    if (ct.tex != 0) gl.DeleteTextures(1, &ct.tex);
-    gl.ActiveTexture(kTexture0 + 10);
-    gl.GenTextures(1, &ct.tex);
+  if (ct.tex != 0 && (ct.width != c.texW || ct.height != c.texH)) {
+    borrar_copia(ct);
     ++g_texGen;
-    gl.BindTexture(kTexture2D, ct.tex);
+  }
+  const bool rotar = rotar_copias();
+  if (rotar && ct.tex != 0) {
+    ct.cur = (ct.cur + 1) % CopyTexture::kRotaCopias;  // la siguiente versión; la vigente la siguen leyendo
+  }
+  GLuint& slotTex = rotar ? ct.texs[ct.cur] : ct.tex;
+  GLuint& slotFbo = rotar ? ct.fbos[ct.cur] : ct.fbo;
+  if (slotTex == 0) {
+    gl.ActiveTexture(kTexture0 + 10);
+    gl.GenTextures(1, &slotTex);
+    gl.BindTexture(kTexture2D, slotTex);
     gl.TexStorage2D(kTexture2D, 1, kRgba8, static_cast<GLsizei>(c.texW), static_cast<GLsizei>(c.texH));
-    gl.GenFramebuffers(1, &ct.fbo);
-    gl.BindFramebuffer(kFramebuffer, ct.fbo);
-    gl.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, ct.tex, 0);
+    gl.GenFramebuffers(1, &slotFbo);
+    gl.BindFramebuffer(kFramebuffer, slotFbo);
+    gl.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, slotTex, 0);
     ct.width = c.texW;
     ct.height = c.texH;
+    ++g_tCopias.nuevas;
+    if (!rotar) ++g_texGen;
+  }
+  if (rotar && (ct.tex != slotTex || ct.fbo != slotFbo)) {
+    ct.tex = slotTex;  // los dibujos que vienen después leen esta versión
+    ct.fbo = slotFbo;
+    ++g_texGen;
   }
   gl.BindFramebuffer(kFramebuffer, ct.fbo);
   if (invalidar_activo()) {
@@ -3091,6 +3148,7 @@ void run_copy(const Item& it) {
   gl.Disable(kBlend);
   gl.Disable(kCullFace);
   gl.ColorMask(1, 1, 1, 1);
+  const auto t1 = std::chrono::steady_clock::now();
   gl.UseProgram(cprog->id);
   gl.Uniform4f(cprog->rect, static_cast<float>(c.rect.x), static_cast<float>(c.rect.y),
                static_cast<float>(c.rect.width), static_cast<float>(c.rect.height));
@@ -3107,6 +3165,7 @@ void run_copy(const Item& it) {
   gl.BindTexture(kTexture2D, deProfundidad ? g_efb.depth : g_whiteTexture);
   gl.BindSampler(11, 0);
   gl.DrawArrays(kTriangles, 0, 3);
+  const auto t2 = std::chrono::steady_clock::now();
   copia_hecha(c.tex);
   // Sin el EFB enlazado para muestrear mientras se vuelve a dibujar en él.
   gl.BindTexture(kTexture2D, 0);
@@ -3115,6 +3174,12 @@ void run_copy(const Item& it) {
   gl.BindFramebuffer(kFramebuffer, g_efb.fbo);
   gl.Enable(kScissorTest);
   ++g_stats.copies;
+  const auto t3 = std::chrono::steady_clock::now();
+  g_tCopias.cambio += ms_entre(t0, t1);
+  g_tCopias.dibujo += ms_entre(t1, t2);
+  g_tCopias.vuelta += ms_entre(t2, t3);
+  g_tCopias.cpu += cpu_hilo_ms() - cpu0;
+  ++g_tCopias.copias;
 }
 
 // --- Paletas sobre copias del EFB (C4/C8 + TLUT) ----------------------------------------------------------------
@@ -4716,6 +4781,15 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
                  copia_generica() ? "programa único (CHOYA_GX_COPIA_GENERICA=1)" : "un programa por formato",
                  static_cast<unsigned long long>(g_copyProgramsHechos), medios);
       }
+      if (g_tCopias.copias > 0) {  // 0.30.0
+        const auto& tc = g_tCopias;
+        log_line("motor: copias por dentro (por cuadro): %.1f copias; cambio a la textura %.1f ms, dibujo %.1f, vuelta "
+                 "al EFB %.1f (CPU %.1f); %s; texturas nuevas %llu",
+                 static_cast<double>(tc.copias) / n, tc.cambio / n, tc.dibujo / n, tc.vuelta / n, tc.cpu / n,
+                 rotar_copias() ? "rotadas en 3 versiones" : "sin rotar (CHOYA_GX_ROTAR_COPIAS=0)",
+                 static_cast<unsigned long long>(tc.nuevas));
+      }
+      g_tCopias = TiempoCopias{};
       g_tiempos = TiemposMotor{};
     }
     log_line("motor: KB por cuadro: vértices %.0f, uniformes %.0f, índices %.0f, arreglos %.0f; CPU del motor %.2f ms "
