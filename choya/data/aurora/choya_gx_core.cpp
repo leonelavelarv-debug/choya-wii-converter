@@ -18,6 +18,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -39,6 +40,7 @@
 #include <iterator>
 #if defined(__linux__)
 #include <sched.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #endif
 #include <vector>
@@ -3412,6 +3414,10 @@ struct CensoCopia {
   uint64_t despues = 0;      // la leyeron por primera vez en un cuadro posterior
   uint64_t sinLeer = 0;      // se volvió a copiar sin que nadie la leyera en medio
   uint64_t dibujos = 0;      // dibujos que la leen (cada dibujo cuenta)
+  // 0.37.0: el tramo de dibujos antes de la copia (desde la copia o el pase anterior). "Aislable": dibuja solo dentro de
+  // la zona copiada y empieza borrando esa zona (color y profundidad), así que se podría dibujar en un framebuffer
+  // chico sin tocar el EFB. "Borrada después": lo siguiente que toca la zona es un borrado (nadie ve lo que quedó).
+  uint64_t aislable = 0, borradaDespues = 0, tramoDibujos = 0;
   uint64_t cuadroCopia = 0;
   bool leida = true;         // leída desde la última copia (la primera no cuenta como "sin leer")
   int w = 0, h = 0;
@@ -3441,6 +3447,57 @@ void censo_leer(CensoCopia& c) {
     ++(c.cuadroCopia == g_censoCuadro ? c.mismoCuadro : c.despues);
   }
 }
+// Cajas en coordenadas del EFB (x0, y0, x1, y1; vacía si x1 <= x0 o y1 <= y0) para el censo de tramos (0.37.0).
+struct Caja {
+  int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+  bool vacia() const { return x1 <= x0 || y1 <= y0; }
+};
+Caja caja_de(int x, int y, int w, int h) { return Caja{x, y, x + w, y + h}; }
+Caja cruce(const Caja& a, const Caja& b) {
+  return Caja{std::max(a.x0, b.x0), std::max(a.y0, b.y0), std::min(a.x1, b.x1), std::min(a.y1, b.y1)};
+}
+Caja unir(const Caja& a, const Caja& b) {
+  if (a.vacia()) return b;
+  if (b.vacia()) return a;
+  return Caja{std::min(a.x0, b.x0), std::min(a.y0, b.y0), std::max(a.x1, b.x1), std::max(a.y1, b.y1)};
+}
+bool contiene(const Caja& fuera, const Caja& dentro) {
+  return !fuera.vacia() && fuera.x0 <= dentro.x0 && fuera.y0 <= dentro.y0 && fuera.x1 >= dentro.x1 &&
+         fuera.y1 >= dentro.y1;
+}
+bool se_tocan(const Caja& a, const Caja& b) { return !cruce(a, b).vacia(); }
+// Tramo actual: dibujos desde la última copia o el último pase, lo que pintaron y lo que se borró antes del primero.
+struct TramoCenso {
+  uint64_t dibujos = 0;
+  Caja pintado, borrado;
+  CensoCopia* pendiente = nullptr;  // la última copia, hasta ver si lo siguiente que toca su zona la borra
+  Caja zonaPendiente;
+  void nuevo() {
+    dibujos = 0;
+    pintado = Caja{};
+    borrado = Caja{};
+  }
+  void borrar(const Caja& b) {
+    if (dibujos == 0) borrado = unir(borrado, b);
+    if (pendiente != nullptr && contiene(b, zonaPendiente)) {
+      ++pendiente->borradaDespues;
+      pendiente = nullptr;
+    }
+  }
+  void dibujar(const Caja& b) {
+    ++dibujos;
+    pintado = unir(pintado, b);
+    if (pendiente != nullptr && se_tocan(b, zonaPendiente)) pendiente = nullptr;  // pinta encima: no se borró
+  }
+  void copiar(CensoCopia& c, const Caja& zona) {
+    c.tramoDibujos += dibujos;
+    if (dibujos > 0 && contiene(zona, pintado) && contiene(borrado, zona)) ++c.aislable;
+    pendiente = &c;
+    zonaPendiente = zona;
+    nuevo();
+  }
+};
+
 // El grupo de texturas cambió: qué copias del censo lee (ids de aurora, como grupo_lee_pendiente).
 void censo_grupo(uint64_t bindGroup) {
   g_censoN = 0;
@@ -3831,6 +3888,15 @@ void texture_packed_data(uint64_t id, uint32_t width, uint32_t height, uint32_t 
 // hilo GX de Choya (0.23.0, gameTid y gxTid), el hilo GX va solo en el penúltimo núcleo y los demás en el resto. Se
 // llama desde el hilo que procesa el GX; dos veces, para alcanzar a los hilos que nacen después. CHOYA_NUCLEOS=0 lo
 // apaga.
+int prioridad_gx() noexcept {
+  const char* e = std::getenv("CHOYA_GX_PRIORIDAD");
+  if (e == nullptr || *e == '\0') return -6;
+  char* fin = nullptr;
+  const long v = std::strtol(e, &fin, 10);
+  if (fin == e || *fin != '\0' || v < -20 || v > 19) return -6;
+  return static_cast<int>(v);
+}
+
 Nucleos repartir_nucleos(int ncpu, bool conGx, bool gxSolo) noexcept {
   Nucleos r;
   r.juego = ncpu - 1;
@@ -3872,6 +3938,15 @@ void pin_game_thread(int gameTid, int gxTid) noexcept {
   if (conGx && sched_setaffinity(static_cast<pid_t>(gxTid), sizeof(gx), &gx) != 0) {
     log_line("motor: no pude fijar el hilo GX a un núcleo");
   }
+  // 0.37.0: con el núcleo compartido (0.36.0) el hilo GX esperó turno 14-18 % (antes 4-5 %) y el juego, que lo espera
+  // en GXDrawDone, bajó de ~33 a ~30 cuadros por segundo. El hilo GX pasa delante de los demás en su núcleo (nice
+  // CHOYA_GX_PRIORIDAD, -6 por omisión: ~4 veces el peso de un hilo normal; 0 lo deja igual). Hace falta root (KNULLI).
+  int gxNice = 0;
+  bool gxNiceOk = true;
+  if (conGx && !gxSolo) {
+    gxNice = prioridad_gx();
+    if (gxNice != 0) gxNiceOk = setpriority(PRIO_PROCESS, static_cast<id_t>(gxTid), gxNice) == 0;
+  }
   int moved = 0;
   if (DIR* d = ::opendir("/proc/self/task")) {
     while (const dirent* e = ::readdir(d)) {
@@ -3882,9 +3957,13 @@ void pin_game_thread(int gameTid, int gxTid) noexcept {
     ::closedir(d);
   }
   if (conGx) {
-    log_line("motor: hilo del juego %d solo en el núcleo %d; hilo GX %d en el núcleo %d%s; %d hilos más en los "
+    char prio[96] = "";
+    if (!gxSolo && gxNice != 0) {
+      std::snprintf(prio, sizeof prio, gxNiceOk ? ", prioridad nice %d" : ", sin prioridad (nice %d no se pudo)", gxNice);
+    }
+    log_line("motor: hilo del juego %d solo en el núcleo %d; hilo GX %d en el núcleo %d%s%s; %d hilos más en los "
              "núcleos 0-%d", static_cast<int>(self), gameCpu, gxTid, gxCpu,
-             gxSolo ? " (solo él: hilo-gx-solo)" : " (los demás también lo usan)", moved, otros - 1);
+             gxSolo ? " (solo él: hilo-gx-solo)" : " (los demás también lo usan)", prio, moved, otros - 1);
   } else {
     log_line("motor: hilo del juego %d solo en el núcleo %d; %d hilos más en los núcleos 0-%d", static_cast<int>(self),
              gameCpu, moved, otros - 1);
@@ -4635,6 +4714,8 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   ++g_censoCuadro;
   ++g_censoCuadros;
   uint64_t censoGrupo = ~0ull;  // grupo de texturas para el que se calculó g_censoGrupo
+  TramoCenso tramo;             // 0.37.0
+  Caja vpCaja, scCaja;          // viewport y recorte en coordenadas del EFB (para el tramo)
   // Tamaño del EFB: el pase más grande del cuadro.
   int efbW = 1, efbH = 1;
   for (const Item& pass : f.items) {
@@ -4812,6 +4893,11 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       passW = it.pass.width ? static_cast<int>(it.pass.width) : efbW;
       passH = it.pass.height ? static_cast<int>(it.pass.height) : efbH;
       passCopy = it.pass.copy.width > 0 && it.pass.copy.height > 0 ? it.pass.copy : Rect{0, 0, passW, passH};
+      if (censo_activo()) {
+        vpCaja = scCaja = caja_de(0, 0, passW, passH);
+        tramo.nuevo();
+        if (it.pass.clearColor && it.pass.clearDepth) tramo.borrar(vpCaja);
+      }
       viewportRect[0] = 0;
       viewportRect[1] = g_efb.height - passH;
       viewportRect[2] = passW;
@@ -4850,6 +4936,11 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       to_gl_rect(it.viewport.left, it.viewport.top, it.viewport.width, it.viewport.height, r);
       set_viewport(r);
       std::memcpy(viewportRect, r, sizeof(r));
+      if (censo_activo()) {
+        vpCaja = Caja{static_cast<int>(std::floor(it.viewport.left)), static_cast<int>(std::floor(it.viewport.top)),
+                      static_cast<int>(std::ceil(it.viewport.left + it.viewport.width)),
+                      static_cast<int>(std::ceil(it.viewport.top + it.viewport.height))};
+      }
       const float minDepth = g_reversedZ ? 1.0f - it.viewport.zfar : it.viewport.znear;
       const float maxDepth = g_reversedZ ? 1.0f - it.viewport.znear : it.viewport.zfar;
       set_depth_range(minDepth, maxDepth);
@@ -4858,12 +4949,15 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       to_gl_rect(static_cast<float>(it.scissor.x), static_cast<float>(it.scissor.y),
                      static_cast<float>(it.scissor.width), static_cast<float>(it.scissor.height), scissorRect);
       set_scissor(scissorRect);
+      if (censo_activo()) scCaja = caja_de(it.scissor.x, it.scissor.y, it.scissor.width, it.scissor.height);
     } break;
     case Op::Copy: {
       mali_mark(kMaliDibujos);
       gpu_pases_tramo(passIndex, 1);
       if (censo_activo()) {
         censo_copia(it);
+        tramo.copiar(g_censo[it.copy.tex], caja_de(it.copy.rect.x, it.copy.rect.y, it.copy.rect.width,
+                                                   it.copy.rect.height));
         censoGrupo = ~0ull;  // la copia puede ser nueva en el censo: recalcular lo que leen los grupos
       }
       if (copies_enabled()) {
@@ -4911,6 +5005,11 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
                        static_cast<float>(it.clear.scissor.width), static_cast<float>(it.clear.scissor.height), r);
       }
       set_scissor(r);
+      if (censo_activo() && cc.color && cc.depth) {
+        tramo.borrar(it.clear.useScissor ? caja_de(it.clear.scissor.x, it.clear.scissor.y, it.clear.scissor.width,
+                                                   it.clear.scissor.height)
+                                         : scCaja);
+      }
       set_color_mask(cc.color != 0, cc.alpha != 0);
       set_depth_mask(cc.depth != 0);
       mali_mark(kMaliDibujos);
@@ -5025,6 +5124,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       }
       ++drawIndex;
       if (censo_activo()) {
+        tramo.dibujar(cruce(vpCaja, scCaja));
         if (it.draw.bindGroup != censoGrupo) {
           censo_grupo(it.draw.bindGroup);
           censoGrupo = it.draw.bindGroup;
@@ -5188,7 +5288,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       }
       if (censo_activo() && g_censoCuadros > 0 && !g_censo.empty()) {  // 0.36.0
         const double n = static_cast<double>(g_censoCuadros);
-        uint64_t cop = 0, mismo = 0, desp = 0, sin = 0, destinos = 0;
+        uint64_t cop = 0, mismo = 0, desp = 0, sin = 0, destinos = 0, aisl = 0, borr = 0, aislDib = 0;
         std::vector<std::pair<uint64_t, const CensoCopia*>> orden;
         for (const auto& [id, c] : g_censo) {
           if (c.copias == 0) continue;
@@ -5197,6 +5297,9 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
           mismo += c.mismoCuadro;
           desp += c.despues;
           sin += c.sinLeer;
+          aisl += c.aislable;
+          borr += c.borradaDespues;
+          if (c.aislable > 0) aislDib += c.tramoDibujos;
           orden.emplace_back(id, &c);
         }
         if (cop > 0) {
@@ -5204,19 +5307,24 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
                    "en un cuadro después %.1f, vueltas a copiar sin leerse %.1f (CHOYA_GX_CENSO_COPIAS=0 lo apaga)",
                    static_cast<double>(cop) / n, static_cast<unsigned long long>(destinos),
                    static_cast<double>(mismo) / n, static_cast<double>(desp) / n, static_cast<double>(sin) / n);
+          log_line("motor: censo de tramos (por cuadro): %.1f copias aislables (sus dibujos caen solo dentro de la zona "
+                   "copiada y empiezan borrándola; %.1f dibujos), %.1f con la zona borrada después",
+                   static_cast<double>(aisl) / n, static_cast<double>(aislDib) / n, static_cast<double>(borr) / n);
           std::sort(orden.begin(), orden.end(), [](const auto& x, const auto& y) {
             return x.second->copias != y.second->copias ? x.second->copias > y.second->copias : x.first < y.first;
           });
           std::string lista;
-          char buf[200];
+          char buf[320];
           for (size_t k = 0; k < orden.size() && k < 12; ++k) {
             const CensoCopia& c = *orden[k].second;
             std::snprintf(buf, sizeof buf, "%s%llx: %.1f/cuadro %dx%d->%ux%u fmt %u, %.1f dibujos la leen, mismo %llu, "
-                          "después %llu, sin leer %llu", k == 0 ? "" : "; ",
+                          "después %llu, sin leer %llu; tramo %.1f dibujos, aislable %llu, borrada después %llu",
+                          k == 0 ? "" : "; ",
                           static_cast<unsigned long long>(orden[k].first & 0xFFFFFFull), static_cast<double>(c.copias) / n,
                           c.w, c.h, c.texW, c.texH, c.fmt, static_cast<double>(c.dibujos) / n,
                           static_cast<unsigned long long>(c.mismoCuadro), static_cast<unsigned long long>(c.despues),
-                          static_cast<unsigned long long>(c.sinLeer));
+                          static_cast<unsigned long long>(c.sinLeer), static_cast<double>(c.tramoDibujos) / n,
+                          static_cast<unsigned long long>(c.aislable), static_cast<unsigned long long>(c.borradaDespues));
             lista += buf;
           }
           log_line("motor: censo de copias, las más hechas (destino: copias por cuadro, zona->textura, formato; veces "

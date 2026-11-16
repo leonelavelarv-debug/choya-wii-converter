@@ -86,16 +86,25 @@ class TestMotorGles(unittest.TestCase):
             m = re.search(r"motor: censo de copias \(por cuadro\): ([\d.]+) copias a (\d+) destinos; leídas en el mismo "
                           r"cuadro ([\d.]+), en un cuadro después ([\d.]+), vueltas a copiar sin leerse ([\d.]+)", r.stdout)
             self.assertIsNotNone(m, r.stdout)
-            self.assertEqual(m.group(2), "3")
-            for g, esperado in ((1, 4.0), (3, 1.0), (4, 1.0), (5, 2.0)):
+            self.assertEqual(m.group(2), "4")
+            for g, esperado in ((1, 5.0), (3, 1.0), (4, 1.0), (5, 3.0)):
                 self.assertAlmostEqual(float(m.group(g)), esperado, delta=0.02)
             self.assertIn("384: 1.0/cuadro 64x64->64x64 fmt 6, 1.0 dibujos la leen", r.stdout)
-            # 0.34.0: vuelta perezosa. Las cuatro copias van seguidas (3 sin volver al EFB en medio); apagada, ninguna.
-            self.assertRegex(r.stdout, r"copias por dentro \(por cuadro\): 4\.0 copias \(3\.0 seguidas")
+            # 0.37.0: tramos. La 904 es aislable (pase que borra, un dibujo en 32x32, copia de esa zona); la 903 y la 904
+            # quedan borradas por el pase siguiente.
+            m = re.search(r"motor: censo de tramos \(por cuadro\): ([\d.]+) copias aislables .*?; ([\d.]+) dibujos\), "
+                          r"([\d.]+) con la zona borrada después", r.stdout)
+            self.assertIsNotNone(m, r.stdout)
+            for g, esperado in ((1, 1.0), (2, 1.0), (3, 2.0)):
+                self.assertAlmostEqual(float(m.group(g)), esperado, delta=0.02)
+            self.assertRegex(r.stdout, r"388: 1\.0/cuadro 32x32->32x32 fmt 6, 0\.0 dibujos la leen, mismo 0, después 0, "
+                                       r"sin leer \d+; tramo 1\.0 dibujos, aislable 30\d, borrada después 30\d")
+            # 0.34.0: vuelta perezosa. Las cuatro primeras copias van seguidas (3 sin volver al EFB en medio).
+            self.assertRegex(r.stdout, r"copias por dentro \(por cuadro\): 5\.0 copias \(3\.0 seguidas")
             r = subprocess.run([exe, "censo"], env=dict(env, CHOYA_GX_VUELTA_PEREZOSA="0", CHOYA_GX_CENSO_COPIAS="0"),
                                capture_output=True, text=True)
             self.assertIn("censo hecho", r.stdout, r.stdout + r.stderr)
-            self.assertRegex(r.stdout, r"copias por dentro \(por cuadro\): 4\.0 copias \(0\.0 seguidas")
+            self.assertRegex(r.stdout, r"copias por dentro \(por cuadro\): 5\.0 copias \(0\.0 seguidas")
             self.assertNotIn("censo de copias", r.stdout)
             # 0.36.0: reparto de núcleos. Con hilo GX, los demás hilos comparten su núcleo salvo con hilo-gx-solo.
             nuc = os.path.join(d, "nucleos")
@@ -104,6 +113,12 @@ class TestMotorGles(unittest.TestCase):
                             "-o", nuc, "-ldl", "-lpthread"], check=True, capture_output=True)
             filas = subprocess.run([nuc], capture_output=True, text=True, check=True).stdout.split("\n")
             self.assertEqual(filas[:5], ["4 1 0 3 2 3", "4 1 1 3 2 2", "4 0 0 3 2 3", "3 0 0 2 1 2", "8 1 0 7 6 7"])
+            # 0.37.0: nice del hilo GX: -6 por omisión, el valor de CHOYA_GX_PRIORIDAD si es válido.
+            self.assertEqual(filas[5], "prioridad -6")
+            for valor, esperado in (("0", "0"), ("-10", "-10"), ("abc", "-6"), ("-30", "-6")):
+                out = subprocess.run([nuc], env=dict(os.environ, CHOYA_GX_PRIORIDAD=valor), capture_output=True,
+                                     text=True, check=True).stdout.split("\n")
+                self.assertEqual(out[5], "prioridad " + esperado, valor)
             # Caché de programas en disco: la primera vez compila y guarda, la segunda carga los binarios y dibuja igual.
             cache = os.path.join(d, "cache")
             env_cache = dict(env, CHOYA_GX_CACHE=cache)

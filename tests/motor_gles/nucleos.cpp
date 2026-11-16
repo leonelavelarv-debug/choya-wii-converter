@@ -8,5 +8,6 @@ int main() {
     const auto r = repartir_nucleos(c.n, c.gx, c.solo);
     std::printf("%d %d %d %d %d %d\n", c.n, c.gx, c.solo, r.juego, r.gx, r.otros);
   }
+  std::printf("prioridad %d\n", choya::gx::prioridad_gx());
   return 0;
 }

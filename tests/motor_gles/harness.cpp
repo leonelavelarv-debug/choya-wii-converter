@@ -459,8 +459,9 @@ static int clear_test() {
 }
 
 // harness censo (0.36.0): 305 cuadros iguales. Cada uno dibuja leyendo la 903 (copiada al final del cuadro anterior),
-// copia a la 900 (la lee un dibujo del pase siguiente), dos veces a la 901 (nadie la lee) y a la 903. Por cuadro el
-// censo tiene que dar 4 copias a 3 destinos: 1 leída en el mismo cuadro, 1 después y 2 vueltas a copiar sin leerse.
+// copia a la 900 (la lee un dibujo del último pase), dos veces a la 901 (nadie la lee) y a la 903; luego un pase que
+// borra, dibuja solo en 32x32 y lo copia a la 904 (aislable, nadie la lee). Por cuadro: 5 copias a 4 destinos, 1 leída
+// en el mismo cuadro, 1 después, 3 vueltas a copiar sin leerse, 1 aislable y 2 con la zona borrada después.
 static int census_test() {
   gx::PipelineDesc p4 = base_desc();
   p4.vtxStride = 20;
@@ -478,6 +479,8 @@ static int census_test() {
   gx::register_bind_group(98, bd);
   bd.tex[0] = 903;
   gx::register_bind_group(97, bd);
+  bd.tex[0] = 0;  // sin textura (blanca)
+  gx::register_bind_group(96, bd);
   std::vector<uint8_t> v4;
   float q[4][5] = {{-1,1,.5f,0,0},{1,1,.5f,1,0},{-1,-1,.5f,0,1},{1,-1,.5f,1,1}};
   for (auto& v : q) for (float x : v) put_be_f32(v4, x);
@@ -498,6 +501,12 @@ static int census_test() {
     gx::capture_copy(901, gx::Rect{0, 0, 32, 32}, 16, 16, 0x6, true);
     gx::capture_copy(901, gx::Rect{0, 0, 32, 32}, 16, 16, 0x6, true);
     gx::capture_copy(903, gx::Rect{0, 0, 64, 64}, 32, 32, 0x6, true);
+    // 0.37.0: un tramo aislable (como una sombra): pase que borra, recorte de 32x32, un dibujo y la copia de esa zona.
+    gx::capture_pass(640, 480, true, true, black, 0.f, false, gx::Rect{0, 0, 0, 0});
+    gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+    gx::capture_scissor(gx::Rect{0, 0, 32, 32});
+    gx::capture_draw(4, 0, 6, 1, 0, UINT32_MAX, 96);
+    gx::capture_copy(904, gx::Rect{0, 0, 32, 32}, 32, 32, 0x6, true);
     gx::capture_pass(640, 480, true, true, black, 0.f, true, gx::Rect{0, 0, 640, 480});
     gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
     gx::capture_scissor(gx::Rect{0, 0, 640, 480});
