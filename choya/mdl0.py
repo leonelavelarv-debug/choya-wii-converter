@@ -50,6 +50,20 @@ class TexMatrix:
     """Matriz de textura del material (ResTexSrtData, la que NW4R carga como matriz posterior GX_PTTEXMTX0 + 3*i)."""
     rows: tuple                # 2x4 (fila s y fila t) sobre (s, t, 1, 1) de la coordenada que genera el texgen
     map_mode: int = 0          # 0 coordenadas normales; 1, 3 entorno; 2 proyección; 4 entorno especular
+    cam_ref: int = -1          # TexMtxEffect.ref_camera: cámara de la escena para los modos 1, 2 y 4 (-1 = la actual)
+    light_ref: int = -1        # TexMtxEffect.ref_light: luz de la escena para los modos 1, 3 y 4 (-1 = ninguna)
+
+
+@dataclass
+class TexEffect:
+    """Lo crudo de una coordenada de ResTexSrtData (para recalcular la matriz con una animación SRT0)."""
+    flag: int                  # 4 bits: existe, escala 1, sin giro, sin traslación
+    srt: tuple                 # (su, sv, giro en grados, tu, tv)
+    map_mode: int
+    misc: int                  # bit 0: la matriz de efecto es la identidad
+    effect: np.ndarray         # 4x4
+    cam_ref: int = -1
+    light_ref: int = -1
 
 
 @dataclass
@@ -74,6 +88,10 @@ class Material:
     tex_mtx: list = field(default_factory=lambda: [None] * 8)   # TexMatrix o None por coordenada
     num_chans: int = 1
     chans: list = field(default_factory=lambda: [Channel(), Channel()])
+    light_set: int = -1        # ResMatMiscData.light_set_idx
+    fog: int = -1              # ResMatMiscData.fog_idx
+    tex_srt_mode: int = 0      # ResTexSrtData.texMtxMode (0 Maya, 1 XSI, 2 3ds Max)
+    tex_effects: list = field(default_factory=lambda: [None] * 8)   # TexEffect por coordenada (o None)
 
 
 @dataclass
@@ -82,6 +100,7 @@ class SubMesh:
     first: int                 # primer índice
     count: int                 # número de índices
     xlu: bool
+    vis_node: int = -1         # id del nodo cuya visibilidad decide si se dibuja (DrawOpa/DrawXlu, VIS0)
 
 
 @dataclass
@@ -368,38 +387,70 @@ def tex_srt_matrix(su: float, sv: float, r_deg: float, tu: float, tv: float, mod
     return m
 
 
-def _read_tex_mtx(d: bytes, m: int, size: int) -> list:
-    """Como LoadResTexSrt (g3d_state.cpp): por coordenada, la SRT del material por la matriz de efecto."""
+def compose_tex_rows(flag: int, srt: tuple, mode: int, map_mode: int, misc: int, effect: np.ndarray) -> np.ndarray | None:
+    """Como LoadResTexSrt (g3d_state.cpp, ogws): la matriz posterior de una coordenada como 4x4 (se usan las filas s y
+    t sobre (s, t, 1, 1) de lo que da el texgen). Con map_mode != 0 la coordenada de entrada ya pasó por la matriz de la
+    escena (entorno o proyección), que el runtime calcula; aquí va la matriz de efecto y la SRT con sus columnas 2 y 3
+    intercambiadas, como en NW4R. Las banderas "escala 1", "sin giro" y "sin traslación" mandan sobre los valores."""
+    su, sv, r, tu, tv = srt
+    if flag & 2:
+        su = sv = 1.0
+    if flag & 4:
+        r = 0.0
+    if flag & 8:
+        tu = tv = 0.0
+    identity = (flag & 0xF) == 0xF
+    mtx = np.eye(4)
+    if map_mode == 0:
+        if identity:
+            return mtx
+        if not misc & 1:
+            mtx = effect.copy()
+        mtx = tex_srt_matrix(su, sv, r, tu, tv, mode) @ mtx
+    elif not identity:
+        mtx = effect @ mtx
+        srt_m = tex_srt_matrix(su, sv, r, tu, tv, mode)
+        srt_m[:2, [2, 3]] = srt_m[:2, [3, 2]]   # la SRT va sobre la coordenada de entorno (s, t, 1)
+        mtx = srt_m @ mtx
+    if not np.all(np.isfinite(mtx)):
+        return None
+    return mtx
+
+
+def _read_tex_effects(d: bytes, m: int, size: int) -> tuple[int, list]:
+    """(texMtxMode, [TexEffect] * 8) de ResTexSrtData; la coordenada existe si flag & 1."""
     out: list = [None] * 8
     base = m + MAT_TEXSRT
     if size < MAT_HEADER or base + 0x248 > len(d):
-        return out
+        return 0, out
     flag, mode = struct.unpack_from(">II", d, base)
     if mode > 2:
-        return out
-    for i in range(8):
+        return 0, out
+    for i in range(8):   # también las que no existen: una SRT0 puede encenderlas con su efecto
         f = (flag >> (4 * i)) & 0xF
-        if not f & 1:
-            continue
-        su, sv, r, tu, tv = struct.unpack_from(">5f", d, base + 8 + 0x14 * i)
+        srt = struct.unpack_from(">5f", d, base + 8 + 0x14 * i)
         eff = base + 0xA8 + 0x34 * i
+        cam_ref, light_ref = struct.unpack_from(">bb", d, eff)
         map_mode, misc = d[eff + 2], d[eff + 3]
         effect = np.eye(4)
         effect[:3, :] = np.array(struct.unpack_from(">12f", d, eff + 4)).reshape(3, 4)
-        identity = (f & 0xF) == 0xF and (misc & 1)
-        mtx = np.eye(4)
-        if not identity:
-            if not misc & 1:
-                mtx = effect @ mtx
-            srt = tex_srt_matrix(su, sv, r, tu, tv, mode)
-            if map_mode:
-                srt[:2, [2, 3]] = srt[:2, [3, 2]]   # la SRT va sobre la coordenada de entorno (s, t, 1)
-            if (f >> 1) & 7 != 7:                   # escala 1, sin giro ni traslación: CalcTexMtx no la aplica
-                mtx = srt @ mtx
-        if not np.all(np.isfinite(mtx)):
-            continue
-        out[i] = TexMatrix(tuple(float(v) for v in mtx[:2, :].reshape(-1)), map_mode if map_mode <= 4 else 0)
-    return out
+        out[i] = TexEffect(f, srt, map_mode if map_mode <= 4 else 0, misc, effect, cam_ref, light_ref)
+    return mode, out
+
+
+def tex_matrix(e: TexEffect, mode: int, flag: int | None = None, srt: tuple | None = None) -> TexMatrix | None:
+    """La matriz de una coordenada; flag y srt reemplazan a los del material (lo que hace una animación SRT0)."""
+    mtx = compose_tex_rows(e.flag if flag is None else flag, e.srt if srt is None else srt, mode, e.map_mode,
+                           e.misc, e.effect)
+    if mtx is None:
+        return None
+    return TexMatrix(tuple(float(v) for v in mtx[:2, :].reshape(-1)), e.map_mode, e.cam_ref, e.light_ref)
+
+
+def _read_tex_mtx(d: bytes, m: int, size: int) -> list:
+    """Como LoadResTexSrt (g3d_state.cpp): por coordenada, la SRT del material por la matriz de efecto."""
+    mode, effects = _read_tex_effects(d, m, size)
+    return [tex_matrix(e, mode) if e is not None and e.flag & 1 else None for e in effects]
 
 
 def _read_chans(d: bytes, m: int, size: int) -> list:
@@ -532,7 +583,11 @@ def read_mdl0(d: bytes, mdl0: int, name: str) -> Model:
         cull = _u32(d, m + 0x18)
         mat = Material(mname, _s32(d, m + 0x0C), m, cull if cull <= 3 else 2, bool(flags & 0x80000000))
         msize = _u32(d, m)
-        mat.tex_mtx = _read_tex_mtx(d, m, msize)
+        mat.tex_srt_mode, mat.tex_effects = _read_tex_effects(d, m, msize)
+        mat.tex_mtx = [tex_matrix(e, mat.tex_srt_mode) if e is not None and e.flag & 1 else None
+                       for e in mat.tex_effects]
+        if msize >= 0x20 and m + 0x1F <= len(d):
+            mat.light_set, mat.fog = struct.unpack_from(">bb", d, m + 0x1D)
         mat.num_chans = min(d[m + 0x15], 2)
         mat.chans = _read_chans(d, m, msize)
         materials.append(mat)
@@ -573,14 +628,14 @@ def read_mdl0(d: bytes, mdl0: int, name: str) -> Model:
             warnings.append(f"material {mat.name}: no se encontraron comandos TEV")
 
     # Lista de dibujo: qué objeto se dibuja con qué material.
-    draws: list[tuple[int, int, bool]] = []
+    draws: list[tuple[int, int, bool, int]] = []
     for dname, doff in sec["defs"]:
         if dname not in ("DrawOpa", "DrawXlu"):
             continue
         p = doff
-        while p < len(d) and d[p] == 0x04:
-            mat_i, obj_i = _u16(d, p + 1), _u16(d, p + 3)
-            draws.append((obj_i, mat_i, dname == "DrawXlu"))
+        while p + 8 <= len(d) and d[p] == 0x04:
+            mat_i, obj_i, node_i = _u16(d, p + 1), _u16(d, p + 3), _u16(d, p + 5)   # DrawParams (g3d_rescommon.h)
+            draws.append((obj_i, mat_i, dname == "DrawXlu", node_i))
             p += 8
     mat_index = {m.index: i for i, m in enumerate(materials)}
 
@@ -673,11 +728,11 @@ def read_mdl0(d: bytes, mdl0: int, name: str) -> Model:
 
     submeshes = []
     used = set()
-    for obj_i, mat_i, xlu in draws:
+    for obj_i, mat_i, xlu, node_i in draws:
         if obj_i in obj_meshes and (obj_i, mat_i) not in used:
             used.add((obj_i, mat_i))
             first, count = obj_meshes[obj_i]
-            submeshes.append(SubMesh(mat_index.get(mat_i, 0), first, count, xlu))
+            submeshes.append(SubMesh(mat_index.get(mat_i, 0), first, count, xlu, node_i))
     for obj_i, (first, count) in obj_meshes.items():   # objetos sin comando de dibujo
         if not any(s.first == first for s in submeshes):
             submeshes.append(SubMesh(0, first, count, False))

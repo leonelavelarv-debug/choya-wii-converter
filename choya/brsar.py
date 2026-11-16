@@ -8,7 +8,8 @@ Se sigue a ogws (snd_SoundArchiveFile.h, snd_WsdFile.h, snd_WaveFile.h, snd_Memo
         grupo.waveDataOffset + elemento.waveDataOffset.
   RWSD: DATA (sonidos: notas → índice de onda) y WAVE (información de cada onda: formato, canales, frecuencia,
         bucle y, por canal, el desplazamiento de las muestras y los coeficientes ADPCM).
-Las secuencias (RSEQ, como MIDI con instrumentos de un RBNK) no son audio grabado: se cuentan y siguen en el disco.
+Las secuencias (RSEQ, el MML de NW4R con instrumentos de un RBNK) no son audio grabado: read_brsar las ubica (archivo
+de la secuencia, inicio, banco y sus ondas) y choya/rseq.py las prerenderiza.
 """
 from __future__ import annotations
 
@@ -27,10 +28,22 @@ class BrsarError(ValueError):
 
 
 @dataclass
+class SeqSound:
+    """Un sonido de secuencia: dónde está su RSEQ, desde qué etiqueta empieza y con qué banco."""
+    name: str
+    seq: tuple | None          # (dirección del RSEQ, tamaño, dirección de ondas) o None si es externo
+    data_offset: int           # SeqSoundInfo.dataOffset: inicio de la pista 0 desde la base de datos
+    bank_id: int
+    bank: tuple | None         # (dirección del RBNK, tamaño, dirección de sus ondas) o None
+    volume: int                # SoundCommonInfo.volume (0..127)
+
+
+@dataclass
 class BrsarResult:
     sounds: list[tuple[str, DecodedAudio]] = field(default_factory=list)   # (nombre del sonido, audio)
     counts: dict = field(default_factory=dict)                             # tipos de sonido y omitidos
     warnings: list[str] = field(default_factory=list)
+    sequences: list[SeqSound] = field(default_factory=list)
 
 
 def _u32(d, o):
@@ -157,6 +170,7 @@ def read_brsar(d: bytes) -> BrsarResult:
         raise BrsarError("sin bloque INFO")
     base = info + 8
     sounds = _table(d, _ref(d, base, base), base)
+    banks = _table(d, _ref(d, base + 0x08, base), base)
     files = _table(d, _ref(d, base + 0x18, base), base)
     groups = _table(d, _ref(d, base + 0x20, base), base)
 
@@ -188,9 +202,23 @@ def read_brsar(d: bytes) -> BrsarResult:
         stype = d[s + 0x16]
         kind = {SOUND_SEQ: "secuencias", SOUND_STRM: "streams", SOUND_WAVE: "ondas"}.get(stype, "otros")
         res.counts[kind] = res.counts.get(kind, 0) + 1
+        name = _cstr(d, strings[string_id]) if 0 <= string_id < len(strings) else f"sonido_{sid}"
+        if stype == SOUND_SEQ:
+            try:
+                info_ref = _ref(d, s + 0x18, base)
+                data_off, bank_id = struct.unpack_from(">II", d, info_ref)
+                bank_where = None
+                if 0 <= bank_id < len(banks) and banks[bank_id] is not None:
+                    _bs, bank_file = struct.unpack_from(">II", d, banks[bank_id])
+                    bank_where = file_pos(bank_file)
+                res.sequences.append(SeqSound(name, file_pos(file_id), data_off, bank_id, bank_where, d[s + 0x14]))
+            except (struct.error, IndexError, TypeError, BrsarError) as e:
+                res.counts["omitidos"] = res.counts.get("omitidos", 0) + 1
+                if len(res.warnings) < 20:
+                    res.warnings.append(f"{name}: secuencia ilegible ({e})")
+            continue
         if stype != SOUND_WAVE:
             continue
-        name = _cstr(d, strings[string_id]) if 0 <= string_id < len(strings) else f"sonido_{sid}"
         try:
             sub = struct.unpack_from(">i", d, _ref(d, s + 0x18, base))[0]
             where = file_pos(file_id)

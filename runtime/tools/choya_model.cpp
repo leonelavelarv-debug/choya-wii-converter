@@ -4,6 +4,8 @@
 //   Cruceta / stick izquierdo: girar      A / B: acercar / alejar
 //   L1 / R1: modelo anterior / siguiente  X: cull on/off   Y: TEV / sombreado simple
 //   Select: texturas on/off (modo simple) Start (o Escape): salir
+//   R2 / L2 (teclado N): grupo de animaciones siguiente / anterior (CHR0 + SRT0/CLR0/PAT0/VIS0 del mismo nombre)
+//   L3 (teclado E): escena SCN0 siguiente (luces y cámaras de referencia); después de la última, la luz del visor
 #include <SDL2/SDL.h>
 #include <GLES3/gl3.h>
 
@@ -78,33 +80,87 @@ int main(int argc, char** argv) {
         if (!renderer.init()) return 1;
         wl::Orbit orbit;
         wl::RenderOptions opt;
-        // Animaciones del modelo (CHR0 horneadas): R2 la siguiente, L2 la anterior; la última vuelve a la pose de
-        // reposo. En el teclado, N.
-        std::vector<uint32_t> anims;
+        // Grupos de animaciones del modelo (CHR0 horneada + SRT0/CLR0/PAT0/VIS0 del mismo nombre): R2 el siguiente, L2
+        // el anterior; el último vuelve a la pose y los materiales de reposo. En el teclado, N. Todo se arma al cargar
+        // el modelo; por cuadro solo se copian valores.
+        std::vector<wl::AnimGroup> groups;
         int anim_cur = -1;
         wl::AnimView anim;
+        bool has_chr = false;
+        std::vector<wl::MatAnimView> mats;
         float anim_t = 0;
         bool r2_down = false, l2_down = false;
         auto pick_anim = [&](int step) {
-            if (anims.empty()) return;
-            const int n = int(anims.size()) + 1;  // + reposo
+            if (groups.empty()) return;
+            const int n = int(groups.size()) + 1;  // + reposo
             anim_cur = ((anim_cur + 1 + step) % n + n) % n - 1;
             anim_t = 0;
-            if (anim_cur < 0 || !wl::anim_view(pack, pack.entry(anims[size_t(anim_cur)]), anim)) {
-                anim_cur = -1;
+            mats.clear();
+            has_chr = false;
+            renderer.reset_material_state();
+            if (anim_cur < 0) {
                 renderer.set_pose(nullptr, 0);
                 std::printf("  pose de reposo\n");
             } else {
-                std::printf("  animación %d/%zu: %s (%u cuadros)\n", anim_cur + 1, anims.size(),
-                            pack.name(pack.entry(anims[size_t(anim_cur)])), anim.frames);
+                const wl::AnimGroup& g = groups[size_t(anim_cur)];
+                has_chr = g.chr >= 0 && wl::anim_view(pack, pack.entry(uint32_t(g.chr)), anim);
+                if (!has_chr) renderer.set_pose(nullptr, 0);
+                int textures = 0;
+                for (uint32_t mi : g.mats) {
+                    wl::MatAnimView m;
+                    if (wl::mat_anim_view(pack, pack.entry(mi), m)) {
+                        textures += renderer.prepare_textures(m);
+                        mats.push_back(m);
+                    }
+                }
+                std::printf("  grupo %d/%zu: %s (%u cuadros%s, %zu de material, %d texturas de PAT0)\n", anim_cur + 1,
+                            groups.size(), g.name.c_str(), g.frames, has_chr ? ", CHR0" : "", mats.size(), textures);
             }
             std::fflush(stdout);
         };
+        // Escenas SCN0 (la más cercana al modelo primero); -1 = luz y cámara del visor.
+        std::vector<uint32_t> scenes;
+        int scene_cur = -1;
+        wl::SceneView scene;
+        float scene_t = 0;
+        auto pick_scene = [&]() {
+            if (scenes.empty()) {
+                std::printf("  sin escenas SCN0 en el paquete: luz y cámara del visor\n");
+                return;
+            }
+            scene_cur = scene_cur + 1 >= int(scenes.size()) ? -1 : scene_cur + 1;
+            scene_t = 0;
+            if (scene_cur >= 0 && wl::scene_view(pack, pack.entry(scenes[size_t(scene_cur)]), scene)) {
+                renderer.set_scene(&scene, 0);
+                std::printf("  escena %d/%zu: %s (%u conjuntos, %u luces, %u cámaras, %u nieblas sin aplicar)\n",
+                            scene_cur + 1, scenes.size(), pack.name(pack.entry(scenes[size_t(scene_cur)])),
+                            scene.set_count, scene.light_count, scene.camera_count, scene.fog_count);
+            } else {
+                scene_cur = -1;
+                renderer.set_scene(nullptr, 0);
+                std::printf("  sin escena: luz y cámara del visor (no son las del juego)\n");
+            }
+            std::fflush(stdout);
+        };
+        bool l3_down = false;
         auto load = [&](size_t i) {
             const wl::LoadInfo li = renderer.load(models[i]);
-            anims = wl::anims_for(pack, pack.entry(models[i]).key);
+            groups = wl::anim_groups_for(pack, pack.entry(models[i]).key);
             anim_cur = -1;
-            if (!anims.empty()) std::printf("  %zu animaciones (R2/L2 o N)\n", anims.size());
+            mats.clear();
+            has_chr = false;
+            if (!groups.empty()) std::printf("  %zu grupos de animaciones (R2/L2 o N)\n", groups.size());
+            scenes = wl::scenes_for(pack, pack.name(pack.entry(models[i])));
+            if (scene_cur >= int(scenes.size())) scene_cur = -1;
+            if (scene_cur >= 0 && wl::scene_view(pack, pack.entry(scenes[size_t(scene_cur)]), scene))
+                renderer.set_scene(&scene, 0);
+            else
+                scene_cur = -1, renderer.set_scene(nullptr, 0);
+            if (li.light_set_materials || li.ref_matrices || li.hidden_submeshes)
+                std::printf("  %d materiales con conjunto de luces, %d matrices con ref_camera/ref_light, %d submallas "
+                            "ocultas por su nodo%s\n",
+                            li.light_set_materials, li.ref_matrices, li.hidden_submeshes,
+                            scenes.empty() ? "; sin escena SCN0: luz y cámara del visor" : " (L3 o E: escena)");
             if (!li.ok) {
                 std::printf("[%zu/%zu] %s  DAÑADO\n", i + 1, models.size(), li.name.c_str());
             } else {
@@ -133,6 +189,7 @@ int main(int argc, char** argv) {
                         case SDLK_PAGEUP: step = -1; break;
                         case SDLK_c: opt.cull = !opt.cull; break;
                         case SDLK_n: pick_anim(1); break;
+                        case SDLK_e: pick_scene(); break;
                         case SDLK_t: opt.textures = !opt.textures; break;
                         case SDLK_l: opt.lighting = !opt.lighting; break;
                         case SDLK_y: opt.tev = !opt.tev; break;
@@ -193,19 +250,33 @@ int main(int argc, char** argv) {
                 r2_down = r2;
                 l2_down = l2;
             }
-            if (anim_cur >= 0 && anim.frames) {
-                anim_t += dt * anim.fps;
+            for (SDL_GameController* c : pads) {
+                const bool l3 = SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSTICK);
+                if (l3 && !l3_down) pick_scene();
+                l3_down = l3;
+            }
+            if (anim_cur >= 0) {
+                // Un solo reloj para la CHR0 y las de material del grupo (60 cuadros por segundo, como NW4R).
+                const wl::AnimGroup& g = groups[size_t(anim_cur)];
+                anim_t += dt * 60.0f;
                 uint32_t f = uint32_t(anim_t);
-                if (f >= anim.frames) {
-                    if (anim.loop) {
-                        anim_t = std::fmod(anim_t, float(anim.frames));
-                        f = uint32_t(anim_t) % anim.frames;
+                if (g.frames && f >= g.frames) {
+                    if (g.loop) {
+                        anim_t = std::fmod(anim_t, float(g.frames));
+                        f = uint32_t(anim_t) % g.frames;
                     } else {
-                        f = anim.frames - 1;
-                        if (anim_t > anim.frames + 30) anim_t = 0;  // al terminar, pausa y otra vez
+                        f = g.frames - 1;
+                        if (anim_t > g.frames + 30) anim_t = 0;  // al terminar, pausa y otra vez
                     }
                 }
-                renderer.set_pose(anim.frame(f), anim.bones);
+                if (has_chr) renderer.set_pose(anim.frame(anim.loop ? f % anim.frames : std::min(f, anim.frames - 1)),
+                                               anim.bones);
+                renderer.reset_material_state();  // estado base: una animación no deja restos en la otra
+                for (const wl::MatAnimView& m : mats) renderer.apply_mat_anim(m, f);
+            }
+            if (scene_cur >= 0) {
+                scene_t += dt * 60.0f;
+                renderer.set_scene(&scene, uint32_t(scene_t));
             }
             orbit.yaw += rx * 1.8f * dt;
             orbit.pitch = std::clamp(orbit.pitch + ry * 1.2f * dt, -1.45f, 1.45f);
@@ -221,8 +292,9 @@ int main(int argc, char** argv) {
             SDL_GL_SwapWindow(win);
             ++frames;
             if (now - fps_t0 >= 2000) {
-                std::printf("[fps] %.1f  %s  (%s)\n", frames * 1000.0 / (now - fps_t0),
-                            pack.name(pack.entry(models[cur])), opt.tev ? "TEV" : "simple");
+                std::printf("[fps] %.1f  %s  (%s)\n%s\n", frames * 1000.0 / (now - fps_t0),
+                            pack.name(pack.entry(models[cur])), opt.tev ? "TEV" : "simple",
+                            renderer.scene_diag().text().c_str());
                 std::fflush(stdout);
                 frames = 0;
                 fps_t0 = now;

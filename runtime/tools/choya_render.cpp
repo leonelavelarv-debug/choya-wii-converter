@@ -1,7 +1,10 @@
 // choya_render: dibuja modelos del paquete a PNG sin pantalla (EGL + OpenGL ES 3, p. ej. Mesa en WSL2).
 //   choya_render assets.wlpk carpeta [texto] [--max N] [--size PIXELES] [--simple] [--cuadro F]
 // Con --verificar, compara cada textura ETC2/EAC tal como la lee la GPU con el decodificador de la CPU y termina.
-// Con --cuadro F, cada modelo con animaciones sale también en el cuadro F de cada una (modelo@animación.png).
+// Con --cuadro F, cada modelo con animaciones sale también en el cuadro F de cada grupo (modelo@grupo.png): la CHR0 y
+// las SRT0/CLR0/PAT0/VIS0 del mismo nombre, con el mismo reloj.
+// Con --escena (o --escena texto), las luces y cámaras de una escena SCN0 del paquete (la más cercana al modelo, o la
+// que contenga el texto) en el cuadro de --cuadro (0 si no se dio); sin ella, la luz y la cámara del visor.
 // Usa el mismo render que choya_model, así que lo que salga aquí es lo que verás en la consola.
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -79,7 +82,14 @@ int main(int argc, char** argv) {
     int anim_frame = -1;
     bool both_faces = false;  // --doble: sin descartar caras traseras
     bool verify = false;
+    bool use_scene = false;
+    const char* scene_filter = nullptr;
     for (int i = 3; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--escena")) {
+            use_scene = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') scene_filter = argv[++i];
+            continue;
+        }
         if (!std::strcmp(argv[i], "--max") && i + 1 < argc) max_models = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--cuadro") && i + 1 < argc) anim_frame = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--size") && i + 1 < argc) size = std::atoi(argv[++i]);
@@ -119,13 +129,14 @@ int main(int argc, char** argv) {
     if (verify) {
         std::string rep;
         const wl::GpuCheckResult r = wl::gpu_check_textures(pack, 0, &rep);
-        std::printf("texturas comprimidas: %d revisadas, %d idénticas, %d a 1 de diferencia (11 bits), %d con "
-                    "diferencias, %d sin revisar\n%s", r.checked, r.exact, r.close, r.failed, r.skipped, rep.c_str());
+        std::printf("%stexturas comprimidas: %d revisadas, %d idénticas, %d a 1 de diferencia (11 bits), %d con "
+                    "diferencias, %d sin revisar\n", rep.c_str(), r.checked, r.exact, r.close, r.failed, r.skipped);
         if (!r.first_problem.empty()) std::printf("primera diferencia: %s\n", r.first_problem.c_str());
+        std::printf("%s\n", r.ok() ? "VERIFICACION OK" : "VERIFICACION CON PROBLEMAS");
         eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         eglDestroyContext(dpy, ctx);
         eglTerminate(dpy);
-        return r.failed == 0 && r.checked > 0 ? 0 : 1;
+        return r.ok() ? 0 : 1;
     }
     GLuint fb, rb[2];
     glGenFramebuffers(1, &fb);
@@ -156,6 +167,22 @@ int main(int argc, char** argv) {
             }
             float view[16], proj[16];
             wl::orbit_matrices(renderer.view(), wl::Orbit{}, 1.0f, view, proj);  // la cámara de la pose de reposo
+            wl::SceneView scene;
+            bool have_scene = false;
+            if (use_scene) {
+                for (uint32_t si : wl::scenes_for(pack, pack.name(e))) {
+                    if (scene_filter && !std::strstr(pack.name(pack.entry(si)), scene_filter)) continue;
+                    if (wl::scene_view(pack, pack.entry(si), scene)) {
+                        have_scene = true;
+                        std::printf("escena %s (%u cuadros, %u conjuntos, %u luces, %u cámaras)\n",
+                                    pack.name(pack.entry(si)), scene.frames, scene.set_count, scene.light_count,
+                                    scene.camera_count);
+                        break;
+                    }
+                }
+                if (!have_scene) std::printf("sin escena SCN0 para %s: luz y cámara del visor\n", li.name.c_str());
+            }
+            renderer.set_scene(have_scene ? &scene : nullptr, anim_frame > 0 ? uint32_t(anim_frame) : 0);
             auto shot = [&](const std::string& out) {
                 glViewport(0, 0, size, size);
                 glClearColor(0.18f, 0.22f, 0.28f, 1);
@@ -169,20 +196,33 @@ int main(int argc, char** argv) {
             shot(out);
             std::printf("%s  %u tri, %u materiales%s\n", out.c_str(), li.triangles, li.materials,
                         li.missing_textures ? "  (texturas faltantes)" : "");
+            if (use_scene || li.ref_matrices || li.light_set_materials)
+                std::printf("%s\n", renderer.scene_diag().text().c_str());
             if (anim_frame >= 0) {
-                for (uint32_t ai : wl::anims_for(pack, e.key)) {
-                    wl::AnimView a;
-                    if (!wl::anim_view(pack, pack.entry(ai), a)) continue;
-                    renderer.set_pose(a.frame(uint32_t(anim_frame) < a.frames ? uint32_t(anim_frame) : a.frames - 1),
-                                      a.bones);
-                    std::string an = pack.name(pack.entry(ai));
-                    an = an.substr(0, an.find('@'));
+                for (const wl::AnimGroup& g : wl::anim_groups_for(pack, e.key)) {
+                    renderer.reset_material_state();
+                    const uint32_t f = uint32_t(anim_frame);
+                    if (g.chr >= 0) {
+                        wl::AnimView a;
+                        if (wl::anim_view(pack, pack.entry(uint32_t(g.chr)), a))
+                            renderer.set_pose(a.frame(f < a.frames ? f : a.frames - 1), a.bones);
+                    } else {
+                        renderer.set_pose(nullptr, 0);
+                    }
+                    for (uint32_t mi : g.mats) {
+                        wl::MatAnimView m;
+                        if (!wl::mat_anim_view(pack, pack.entry(mi), m)) continue;
+                        renderer.prepare_textures(m);
+                        renderer.apply_mat_anim(m, f);
+                    }
                     const std::string o2 = std::string(argv[2]) + "/" + safe(li.name.c_str()) + "@" +
-                                           safe(an.c_str()) + ".png";
+                                           safe(g.name.c_str()) + ".png";
                     shot(o2);
-                    std::printf("%s  cuadro %d de %u\n", o2.c_str(), anim_frame, a.frames);
+                    std::printf("%s  cuadro %d de %u (%s%zu de material)\n", o2.c_str(), anim_frame, g.frames,
+                                g.chr >= 0 ? "CHR0 + " : "", g.mats.size());
                 }
                 renderer.set_pose(nullptr, 0);
+                renderer.reset_material_state();
             }
             ++done;
         }

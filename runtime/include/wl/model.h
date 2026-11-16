@@ -1,6 +1,7 @@
 // Mallas del paquete (entrada KIND_MODEL, bloque "CMDL"; ver choya/model_pack.py).
 #pragma once
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "wl/pack.h"
@@ -9,6 +10,8 @@ namespace wl {
 
 constexpr uint8_t KIND_MODEL = 3;
 constexpr uint8_t KIND_ANIM = 4;  // animación de huesos horneada (bloque "CANM"; ver choya/anim.py)
+constexpr uint8_t KIND_MATANIM = 5;  // SRT0/CLR0/PAT0/VIS0 horneada para un modelo (bloque "CMAN"; choya/anim_mat.py)
+constexpr uint8_t KIND_SCENE = 6;    // escena SCN0 horneada (bloque "CSCN"; choya/scn0.py)
 
 #pragma pack(push, 1)
 struct ModelVertexV2 {  // versiones 1 y 2: sin huesos
@@ -41,7 +44,10 @@ struct ModelSubmesh {
     uint8_t wrap_s;        // 0 clamp, 1 repetir, 2 espejo
     uint8_t wrap_t;
     uint32_t material;     // índice en ModelView::materials (versión 2)
-    uint8_t reserved[8];
+    uint8_t vis_flags;     // versión 4: bit0 = oculta por defecto (su nodo no tiene FLAG_VISIBLE)
+    uint8_t pad;
+    uint16_t vis_node;     // versión 4: nodo de visibilidad (0xFFFF = ninguno)
+    uint32_t reserved;
 };
 
 // Material TEV (512 bytes; ver choya/model_pack.py). Registros en los mismos bits que el hardware GX.
@@ -79,7 +85,14 @@ struct TevMaterialRec {
     uint8_t tex_mtx_mode[8];  // 0 sin matriz; 1 + modo de mapeo de NW4R (0 coordenadas, 1/3/4 entorno, 2 proyección)
     uint8_t num_chans, pad2[3];
     ChanRec chans[2];
-    uint8_t pad3[204];
+    // Versión 4 (en la 3 estos bytes van en cero y ref_valid = 0):
+    int8_t cam_ref[8];        // TexMtxEffect.ref_camera de cada matriz de textura (-1 = la cámara actual)
+    int8_t light_ref[8];      // TexMtxEffect.ref_light (-1 = ninguna)
+    int8_t light_set;         // ResMatMiscData.light_set_idx (-1 = sin conjunto de luces)
+    int8_t fog;               // ResMatMiscData.fog_idx
+    uint8_t ref_valid;        // bit0: los campos de arriba vienen del conversor
+    uint8_t pad4;
+    uint8_t pad3[184];
 };
 #pragma pack(pop)
 static_assert(sizeof(ModelVertexV2) == 36, "vértice de 36 bytes");
@@ -128,5 +141,111 @@ struct AnimView {
 bool anim_view(const Pack& pack, const PackEntry& e, AnimView& out);
 // Entradas KIND_ANIM horneadas para el modelo de esa clave (índices del paquete).
 std::vector<uint32_t> anims_for(const Pack& pack, uint64_t model_key);
+
+// Animación de material o visibilidad horneada (CMAN; choya/anim_mat.py). Los destinos ya son índices del modelo.
+enum MatAnimType : uint32_t { MATANIM_SRT = 1, MATANIM_CLR = 2, MATANIM_PAT = 3, MATANIM_VIS = 4 };
+#pragma pack(push, 1)
+struct MatAnimTrack {
+    uint16_t target;   // material (en VIS0, submalla)
+    uint8_t slot;      // coordenada, objetivo de color (0 CLR0, 1 CLR1, 2 AMB0, 3 AMB1, 4-6 C0-C2, 7-10 K0-K3) o unidad
+    uint8_t flags;     // bit0: constante (un solo valor)
+    uint32_t offset;   // desde el principio del bloque
+    uint32_t count;
+    uint32_t reserved;
+};
+#pragma pack(pop)
+static_assert(sizeof(MatAnimTrack) == 16, "pista de 16 bytes");
+struct MatAnimView {
+    uint32_t type = 0, frames = 0;
+    uint64_t model_key = 0;
+    bool loop = false;
+    float fps = 60.0f;
+    const MatAnimTrack* tracks = nullptr;
+    uint32_t track_count = 0;
+    const uint64_t* keys = nullptr;  // PAT0: claves de textura
+    uint32_t key_count = 0;
+    const uint8_t* base = nullptr;
+    // Valor de la pista en el cuadro f (ya acotado o en bucle por quien llama): puntero a 8 float (SRT), 4 u8 (CLR),
+    // 1 u16 (PAT) o 1 u8 (VIS).
+    const void* value(const MatAnimTrack& t, uint32_t f) const;
+};
+bool mat_anim_view(const Pack& pack, const PackEntry& e, MatAnimView& out);
+
+// Escena SCN0 horneada (CSCN; choya/scn0.py).
+#pragma pack(push, 1)
+struct SceneLightSet {
+    uint16_t ref;
+    int16_t amb;        // índice en la tabla de ambientes (-1 = blanco)
+    uint8_t count;
+    uint8_t pad[3];
+    int16_t light[8];   // índices en la tabla de luces
+    uint8_t pad2[8];
+};
+struct SceneAmb {
+    uint16_t ref;
+    uint8_t flags, constant;
+    uint32_t offset, count;
+};
+struct SceneLight {
+    uint16_t ref;
+    int16_t spec;       // índice de su luz especular (-1 = ninguna)
+    uint8_t type;       // 0 punto, 1 direccional, 2 foco, 3 especular
+    uint8_t flags;      // 1 color, 2 alfa
+    uint8_t constant, pad;
+    uint32_t offset, count;
+};
+struct SceneLightFrame {
+    float pos[3], dir[3];
+    uint8_t color[4];
+    float a[3], k[3];
+    uint32_t enabled;
+    float shininess;
+    uint32_t pad;
+};
+struct SceneCamera {
+    uint16_t ref;
+    uint8_t proj, constant;
+    uint32_t offset, count, pad;
+};
+struct SceneCameraFrame {
+    float view[12];     // 3x4 por filas, mundo -> cámara
+    float fovy_or_height, aspect, near_z, far_z;
+};
+#pragma pack(pop)
+static_assert(sizeof(SceneLightSet) == 32 && sizeof(SceneAmb) == 12 && sizeof(SceneLight) == 16 &&
+                  sizeof(SceneCamera) == 16 && sizeof(SceneLightFrame) == 64 && sizeof(SceneCameraFrame) == 64,
+              "tamaños de CSCN");
+struct SceneView {
+    uint32_t frames = 0;
+    bool loop = false;
+    float fps = 60.0f;
+    const SceneLightSet* sets = nullptr;
+    const SceneAmb* ambs = nullptr;
+    const SceneLight* lights = nullptr;
+    const SceneCamera* cameras = nullptr;
+    uint32_t set_count = 0, amb_count = 0, light_count = 0, camera_count = 0, fog_count = 0;
+    const uint8_t* base = nullptr;
+    const uint8_t* amb_color(uint32_t i, uint32_t f) const;
+    const SceneLightFrame& light(uint32_t i, uint32_t f) const;
+    const SceneCameraFrame& camera(uint32_t i, uint32_t f) const;
+    int find_set(int ref) const;     // índice en sets con ese refNumber (-1 si no hay)
+    int find_light(int ref) const;
+    int find_camera(int ref) const;
+};
+bool scene_view(const Pack& pack, const PackEntry& e, SceneView& out);
+
+// Grupo de animaciones que se reproducen juntas, con el mismo reloj: las que comparten nombre (como las enlaza un
+// juego de NW4R: "wait" de CHR0, SRT0, CLR0, PAT0 y VIS0). Se arma una vez al cargar el modelo; durante el cuadro no
+// se buscan nombres.
+struct AnimGroup {
+    std::string name;
+    int32_t chr = -1;                // entrada KIND_ANIM (-1 = sin huesos)
+    std::vector<uint32_t> mats;      // entradas KIND_MATANIM
+    uint32_t frames = 0;             // la más larga del grupo
+    bool loop = false;
+};
+std::vector<AnimGroup> anim_groups_for(const Pack& pack, uint64_t model_key);
+// Entradas KIND_SCENE ordenadas: primero las del mismo archivo que el modelo (prefijo de ruta más largo).
+std::vector<uint32_t> scenes_for(const Pack& pack, const char* model_name);
 
 }  // namespace wl

@@ -4232,10 +4232,13 @@ void texture_packed_data(uint64_t id, uint32_t width, uint32_t height, uint32_t 
 // apaga.
 int prioridad_gx() noexcept {
   const char* e = std::getenv("CHOYA_GX_PRIORIDAD");
-  if (e == nullptr || *e == '\0') return -10;
+  // 0.41.0: -3 por omisión. Medido en la consola con mali-cmar en el núcleo del hilo GX: con nice 0 la pantalla iba a
+  // ~24 cuadros/s y el juego a ~30.5 (el hilo GX esperó turno 17 %); con -10 el juego volvió a ~33 pero mali-cmar esperó
+  // turno 29-30 % y la pantalla volvió a ~20. -3 es el punto medio que queda por medir.
+  if (e == nullptr || *e == '\0') return -3;
   char* fin = nullptr;
   const long v = std::strtol(e, &fin, 10);
-  if (fin == e || *fin != '\0' || v < -20 || v > 19) return -10;
+  if (fin == e || *fin != '\0' || v < -20 || v > 19) return -3;
   return static_cast<int>(v);
 }
 

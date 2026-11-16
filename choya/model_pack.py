@@ -1,6 +1,7 @@
 """Formato de malla del paquete (entrada KIND_MODEL) y exportación OBJ para revisar en la PC.
 
-Bloque "CMDL" versión 3, little-endian (el runtime lee también la 2 y la 1):
+Bloque "CMDL" versión 4, little-endian (el runtime lee también la 3, la 2 y la 1; la 4 tiene el mismo tamaño que la 3 y
+solo usa bytes que en la 3 iban en cero):
   0  char[4] "CMDL"   4 u32 versión (3)   8 u32 vértices   12 u32 índices   16 u32 submallas
   20 u32 banderas (bit0 normales, bit1 color de vértice, bit2 con huesos)   24 float min[3]   36 float max[3]
   48 u32 materiales   52 u32 huesos   56..63 reservado
@@ -8,7 +9,9 @@ Bloque "CMDL" versión 3, little-endian (el runtime lee también la 2 y la 1):
      36 en la versión 2, sin huesos). Peso 0 en los cuatro = vértice fijo.
   luego índices u32, luego submallas de 32 bytes:
      u32 primer índice, u32 cantidad, u64 clave de la textura principal (0 = sin textura),
-     u8 cull, u8 xlu, u8 wrap_s, u8 wrap_t, u32 material, u32[2] reservado
+     u8 cull, u8 xlu, u8 wrap_s, u8 wrap_t, u32 material,
+     (versión 4) u8 visibilidad (bit0: oculta por defecto, su nodo no tiene FLAG_VISIBLE), u8 libre,
+     u16 nodo de visibilidad (0xFFFF = ninguno), u32 reservado
   luego materiales de 1024 bytes (512 en la versión 2; MATERIAL, ver abajo): registros TEV crudos, como en GX.
   luego huesos de 64 bytes: i32 padre, u32 banderas, float inversa de la pose de reposo[12] (3x4 por filas),
      u32 FNV-1a del nombre, u32 reservado.
@@ -29,8 +32,8 @@ VERTEX = np.dtype([("pos", "<f4", 3), ("nrm", "<f4", 3), ("col", "u1", 4), ("uv"
 assert VERTEX_V2.itemsize == 36 and VERTEX.itemsize == 44
 BONE = struct.Struct("<iI12fII")
 assert BONE.size == 64
-VERSION = 3
-SUBMESH = struct.Struct("<IIQBBBBI8x")
+VERSION = 4
+SUBMESH = struct.Struct("<IIQBBBBIBxHI")
 assert SUBMESH.size == 32
 HEADER_SIZE = 64
 
@@ -45,7 +48,11 @@ HEADER_SIZE = 64
 # 776 u8 canales de luz, 3 libres
 # 780 canales[2] de 20 bytes: u32 banderas (ResChan), u8 color de material[4], u8 color ambiente[4],
 #     u32 control del color, u32 control del alfa (registro XF 0x100E de GX)
+# (versión 4)
+# 820 s8 cámara de referencia[8] (TexMtxEffect.ref_camera)   828 s8 luz de referencia[8] (ref_light)
+# 836 s8 light_set_idx   837 s8 fog_idx   838 u8 banderas (bit0: 820..837 son válidos)   839 libre
 MATERIAL_SIZE = 1024
+NODE_VISIBLE = 1 << 8            # ResNodeData::FLAG_VISIBLE
 MATERIAL_SIZE_V2 = 512
 
 
@@ -76,6 +83,11 @@ def pack_material(t: TevRaw | None, xlu: bool, cull: int, maps: list[tuple[int, 
         for c, ch in enumerate(mat.chans[:2]):
             struct.pack_into("<I4B4BII", out, 780 + 20 * c, ch.flags, *ch.mat, *ch.amb, ch.ctrl_color,
                              ch.ctrl_alpha)
+        cams = [tm.cam_ref if tm is not None else -1 for tm in mat.tex_mtx[:8]]
+        lights = [tm.light_ref if tm is not None else -1 for tm in mat.tex_mtx[:8]]
+        struct.pack_into("<8b8bbbB", out, 820, *[max(-128, min(127, v)) for v in cams],
+                         *[max(-128, min(127, v)) for v in lights], max(-128, min(127, mat.light_set)),
+                         max(-128, min(127, mat.fog)), 1)
     return bytes(out)
 
 
@@ -105,12 +117,19 @@ def pack_model(m: Model, texture_keys: list[int], map_keys: list[list[tuple[int,
     assert len(out) == HEADER_SIZE
     out += v.tobytes()
     out += m.indices.astype("<u4").tobytes()
+    node_flags = {b.index: b.flags for b in m.bones}
+    # Si ningún nodo de dibujo es visible, la bandera no se está leyendo bien: no se oculta nada.
+    if m.submeshes and all(s.vis_node in node_flags and not node_flags[s.vis_node] & NODE_VISIBLE
+                           for s in m.submeshes):
+        node_flags = {}
     for s in m.submeshes:
         mat = m.materials[s.material] if s.material < len(m.materials) else None
         key = texture_keys[s.material] if s.material < len(texture_keys) else 0
         lay = mat.layers[0] if mat and mat.layers else None
+        hidden = s.vis_node in node_flags and not node_flags[s.vis_node] & NODE_VISIBLE
         out += SUBMESH.pack(s.first, s.count, key, mat.cull if mat else 2, int(s.xlu or (mat.xlu if mat else 0)),
-                            lay.wrap_s if lay else 1, lay.wrap_t if lay else 1, s.material)
+                            lay.wrap_s if lay else 1, lay.wrap_t if lay else 1, s.material, 1 if hidden else 0,
+                            s.vis_node if 0 <= s.vis_node < 0xFFFF else 0xFFFF, 0)
     for i, mat in enumerate(m.materials):
         maps = map_keys[i] if map_keys and i < len(map_keys) else [None] * 8
         xlu = mat.xlu or any(s.xlu for s in m.submeshes if s.material == i)

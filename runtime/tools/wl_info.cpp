@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
     const bool list = argc > 2 && std::strcmp(argv[2], "-l") == 0;
     std::map<std::string, std::pair<int, uint64_t>> by_fmt;
     uint64_t tex_bytes = 0, audio_bytes = 0;
-    int textures = 0, audio = 0, models = 0, bad_order = 0;
+    int textures = 0, audio = 0, models = 0, bad_order = 0, chr_anims = 0, mat_anims = 0, scenes = 0;
     uint64_t tris = 0;
     for (uint32_t i = 0; i < pack.size(); ++i) {
         const wl::PackEntry& e = pack.entry(i);
@@ -93,6 +93,23 @@ int main(int argc, char** argv) {
             if (list)
                 std::printf("MDL %016llx %6u vért. %6u tri. %2u submallas  %s\n", (unsigned long long)e.key,
                             mv.vertex_count, mv.index_count / 3, mv.submesh_count, pack.name(e));
+        } else if (e.kind == wl::KIND_ANIM) {
+            ++chr_anims;
+        } else if (e.kind == wl::KIND_MATANIM) {  // SRT0/CLR0/PAT0/VIS0 horneada (0.42.0)
+            ++mat_anims;
+            wl::MatAnimView a;
+            if (!wl::mat_anim_view(pack, e, a)) ++bad_order;
+            if (list)
+                std::printf("MAN %016llx tipo %u %5u cuadros %4u pistas  %s\n", (unsigned long long)e.key, a.type,
+                            a.frames, a.track_count, pack.name(e));
+        } else if (e.kind == wl::KIND_SCENE) {  // SCN0 horneada (0.42.0)
+            ++scenes;
+            wl::SceneView sv;
+            if (!wl::scene_view(pack, e, sv)) ++bad_order;
+            if (list)
+                std::printf("SCN %016llx %5u cuadros %u conjuntos %u luces %u cámaras  %s\n",
+                            (unsigned long long)e.key, sv.frames, sv.set_count, sv.light_count, sv.camera_count,
+                            pack.name(e));
         } else if (e.kind == uint8_t(wl::Kind::Audio)) {
             ++audio;
             audio_bytes += e.data_size;
@@ -108,6 +125,8 @@ int main(int argc, char** argv) {
         std::printf("  %-14s %5d  %.2f MiB\n", kv.first.c_str(), kv.second.first, kv.second.second / 1048576.0);
     std::printf("audio: %d (%.2f MiB)\n", audio, audio_bytes / 1048576.0);
     std::printf("modelos: %d (%llu triángulos)\n", models, (unsigned long long)tris);
+    std::printf("animaciones: %d de huesos, %d de material o visibilidad; escenas: %d\n", chr_anims, mat_anims,
+                scenes);
     if (bad_order) {
         std::printf("ERROR: %d entradas fuera de orden o con clave inconsistente\n", bad_order);
         return 1;

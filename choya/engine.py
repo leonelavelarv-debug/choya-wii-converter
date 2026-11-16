@@ -9,7 +9,8 @@ from concurrent.futures import ProcessPoolExecutor
 
 from PIL import Image
 
-from . import __version__, anim as an, audio as au, mdl0 as md, model_pack as mp, optimize as opt, pack, scan as sc
+from . import __version__, anim as an, anim_mat as am, audio as au, mdl0 as md, model_pack as mp, optimize as opt, pack
+from . import scan as sc, scn0 as sn
 from .gxtex import FORMAT_NAMES, GXTexture, level_size
 from .profiles import Profile
 
@@ -56,8 +57,11 @@ def _find_texture(model_path: str, tname: str, key_by_name: dict[str, int]) -> i
 def _convert_models(res, writer, key_by_name, preview_by_key, obj_dir, errors, anims: bool = True) -> dict:
     rows = []
     totals = dict(modelos=0, fallidos=0, objetos=0, triangulos=0, omitidos=0, sin_textura=0, avisos=0,
-                  con_huesos=0, animaciones=0, animaciones_fallidas=0, animaciones_sin_modelo=0)
+                  con_huesos=0, animaciones=0, animaciones_fallidas=0, animaciones_sin_modelo=0,
+                  anim_material=0, anim_material_fallidas=0, anim_material_sin_modelo=0, escenas=0,
+                  escenas_fallidas=0)
     loaded: list = []    # (BRRES, modelo, clave, nombre) de los modelos con huesos
+    every: list = []     # lo mismo, de todos los modelos (animaciones de material y visibilidad)
     if obj_dir:
         os.makedirs(obj_dir, exist_ok=True)
     for item in res.models:
@@ -87,6 +91,7 @@ def _convert_models(res, writer, key_by_name, preview_by_key, obj_dir, errors, a
         if m.skinned:
             totals["con_huesos"] += 1
             loaded.append((item.path, m, pack.path_key(full), full))
+        every.append((item.path, m, pack.path_key(full), full))
         if obj_dir and len(m.indices):
             mp.write_obj(m, os.path.join(obj_dir, _safe(full) + ".obj"), files)
         totals["modelos"] += 1
@@ -98,7 +103,11 @@ def _convert_models(res, writer, key_by_name, preview_by_key, obj_dir, errors, a
                          objects=m.stats["objetos"], skipped=m.stats["omitidos"], materials=len(m.materials),
                          missing_textures=missing, warnings=m.warnings[:10]))
     anim_rows = _convert_anims(res, writer, loaded, totals, errors) if anims else []
-    return dict(summary=totals, models=rows, anims=anim_rows)
+    notes: dict = {}
+    if anims:
+        anim_rows += _convert_mat_anims(res, writer, every, key_by_name, totals, errors, notes)
+        anim_rows += _convert_scenes(res, writer, totals, errors, notes)
+    return dict(summary=totals, models=rows, anims=anim_rows, notes=notes)
 
 
 MAX_MODELS_PER_ANIM = 8
@@ -138,6 +147,68 @@ def _convert_anims(res, writer, loaded, totals, errors) -> list:
     return rows
 
 
+def _convert_mat_anims(res, writer, every, key_by_name, totals, errors, notes) -> list:
+    """SRT0/CLR0/PAT0/VIS0: cada una se hornea para los modelos que tienen todos sus materiales (o nodos), primero los
+    del mismo BRRES; las claves de textura de PAT0 se buscan como las de los materiales."""
+    rows = []
+    mat_sets = [(path, m, key, full, {x.name for x in m.materials}, {b.name for b in m.bones})
+                for path, m, key, full in every]
+    for item in getattr(res, "mat_anims", []):
+        tname = am.TYPE_NAMES[item.kind]
+        full_anim = f"{item.path}/{item.name}.{tname}"
+        try:
+            a = am.READERS[item.kind](item.brres, item.offset, item.name)
+        except Exception as e:  # noqa: BLE001
+            totals["anim_material_fallidas"] += 1
+            errors.append(f"animación {full_anim}: {type(e).__name__}: {e}")
+            continue
+        want = am.targets(a)
+        pick = 5 if item.kind == am.TYPE_VIS else 4
+        targets = [t for t in mat_sets if want and want <= t[pick]]
+        targets.sort(key=lambda t: (t[0] != item.path, len(t[pick])))
+        if not targets:
+            totals["anim_material_sin_modelo"] += 1
+            continue
+        for path, m, key, full, _mats, _nodes in targets[:MAX_MODELS_PER_ANIM]:
+            try:
+                baked = am.bake(m, a, lambda n, p=path: _find_texture(p, n, key_by_name))
+            except Exception as e:  # noqa: BLE001
+                totals["anim_material_fallidas"] += 1
+                errors.append(f"animación {full_anim} en {full}: {type(e).__name__}: {e}")
+                continue
+            for k, v in baked.notes.items():
+                notes[f"{tname}: {k}"] = notes.get(f"{tname}: {k}", 0) + v
+            name = f"{full_anim}@{full}"
+            writer.add(pack.Entry(kind=pack.KIND_MATANIM, fmt=item.kind, count=0, flags=1 if baked.loop else 0,
+                                  key=pack.path_key(name), name=name, data=am.pack(key, baked),
+                                  extra0=baked.frames, extra1=len(baked.tracks), extra2=len(baked.keys)))
+            totals["anim_material"] += 1
+            rows.append(dict(name=name, frames=baked.frames, tracks=len(baked.tracks), loop=baked.loop, kind=tname))
+    return rows
+
+
+def _convert_scenes(res, writer, totals, errors, notes) -> list:
+    rows = []
+    for item in getattr(res, "scenes", []):
+        name = f"{item.path}/{item.name}.scn0"
+        try:
+            sc_ = sn.read_scn0(item.brres, item.offset, item.name)
+            baked = sn.bake(sc_)
+        except Exception as e:  # noqa: BLE001
+            totals["escenas_fallidas"] += 1
+            errors.append(f"escena {name}: {type(e).__name__}: {e}")
+            continue
+        for k, v in baked.notes.items():
+            notes[f"scn0: {k}"] = notes.get(f"scn0: {k}", 0) + v
+        writer.add(pack.Entry(kind=pack.KIND_SCENE, fmt=1, count=0, flags=1 if baked.loop else 0,
+                              key=pack.path_key(name), name=name, data=baked.blob, extra0=baked.frames,
+                              extra1=len(sc_.lights), extra2=len(sc_.cameras)))
+        totals["escenas"] += 1
+        rows.append(dict(name=name, frames=baked.frames, lightsets=len(sc_.lightsets), lights=len(sc_.lights),
+                         cameras=len(sc_.cameras), loop=baked.loop, kind="scn0"))
+    return rows
+
+
 def preview_png(conv: opt.ConvertedTexture) -> Image.Image:
     """El nivel 0 tal como lo verá la GPU, para revisarlo en la PC."""
     d = conv.data[:opt.out_level_size(conv.fmt, conv.width, conv.height)]
@@ -149,13 +220,13 @@ def _safe(name: str) -> str:
 
 
 def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool = False,
-        measure: bool = True, log=print, anims: bool = True) -> dict:
+        measure: bool = True, log=print, anims: bool = True, sequences: bool = True) -> dict:
     t0 = time.time()
     os.makedirs(out_dir, exist_ok=True)
     disc = sc.disc_info(src)
     gid = disc["game_id"]
     log(f"Escaneando {src} ...")
-    res = sc.scan(src)
+    res = sc.scan(src, sequences=sequences)
     log(f"  {res.files} archivos, {len(res.textures)} texturas, {len(res.audio)} audios")
 
     # Deduplicar texturas por clave antes de convertir (la misma textura aparece en varios archivos).
@@ -265,7 +336,8 @@ def run(src: str, out_dir: str, profile: Profile, jobs: int = 0, preview: bool =
     size = writer.write(pack_path, manifest)
     summary["models"] = model_report["summary"]
     report = dict(manifest=manifest, summary=summary, models=model_report["models"],
-                  anims=model_report.get("anims", []), counts=res.counts, pending=res.pending,
+                  anims=model_report.get("anims", []), anim_notes=model_report.get("notes", {}),
+                  sequences=[vars(x) for x in getattr(res, "sequences", [])], counts=res.counts, pending=res.pending,
                   errors=errors, textures=tex_report, audio=audio_report, pack_bytes=size,
                   disc_files=res.files, disc_bytes=res.disc_bytes, seconds=round(time.time() - t0, 1))
     with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
@@ -337,12 +409,47 @@ def render_markdown(r: dict) -> str:
                   "",
                   f"{mo.get('con_huesos', 0)} modelos con huesos; {mo.get('animaciones', 0)} animaciones CHR0 "
                   f"horneadas, {mo.get('animaciones_sin_modelo', 0)} sin un modelo con todos sus huesos, "
-                  f"{mo.get('animaciones_fallidas', 0)} fallidas."]
+                  f"{mo.get('animaciones_fallidas', 0)} fallidas.",
+                  "",
+                  f"Animaciones de material y visibilidad (SRT0/CLR0/PAT0/VIS0): {mo.get('anim_material', 0)} "
+                  f"horneadas, {mo.get('anim_material_sin_modelo', 0)} sin un modelo con todos sus materiales o "
+                  f"nodos, {mo.get('anim_material_fallidas', 0)} fallidas. Escenas SCN0: {mo.get('escenas', 0)} "
+                  f"horneadas, {mo.get('escenas_fallidas', 0)} fallidas."]
+        for k, v in sorted((r.get("anim_notes") or {}).items()):
+            lines.append(f"- {k}: {v}")
         problem = [x for x in r.get("models", []) if x["warnings"] or x["skipped"] or x["missing_textures"]]
         if problem:
             lines += ["", "| Modelo | Triángulos | Omitidos | Sin textura | Primer aviso |", "| --- | --- | --- | --- | --- |"]
             lines += [f"| {x['name']} | {x['triangles']} | {x['skipped']} | {x['missing_textures']} | "
                       f"{(x['warnings'] or [''])[0]} |" for x in problem[:40]]
+    seqs = r.get("sequences") or []
+    if seqs:
+        ok = [q for q in seqs if not q.get("error")]
+        lines += ["", "## Secuencias (RSEQ + RBNK, prerenderizadas en la PC)", "",
+                  f"{len(ok)} de {len(seqs)} prerenderizadas: {sum(1 for q in ok if q['loop'])} con bucle, "
+                  f"{sum(1 for q in ok if q['ended'])} que terminan, {sum(1 for q in ok if q['interactive'])} "
+                  "interactivas (leen variables que el juego cambia: quedan en su camino por defecto). En el port "
+                  "el juego usa su propio secuenciador (NW4R) con el AX emulado; esto sirve para el paquete y el "
+                  "visor.", ""]
+        ops, ignored, stats = {}, {}, {}
+        for q in ok:
+            for src_, dst in ((q["ops"], ops), (q["ignored"], ignored), (q["stats"], stats)):
+                for k, v in src_.items():
+                    dst[k] = dst.get(k, 0) + v
+        if ops:
+            lines.append("Comandos ejecutados: " + ", ".join(f"{k} {v}" for k, v in sorted(ops.items(),
+                                                                                          key=lambda kv: -kv[1])))
+        if ignored:
+            lines.append("")
+            lines.append("No aplicados (sin efecto en el audio prerenderizado): " +
+                         ", ".join(f"{k} {v}" for k, v in sorted(ignored.items())))
+        if stats:
+            lines.append("")
+            lines.append("Avisos: " + ", ".join(f"{k} {v}" for k, v in sorted(stats.items())))
+        bad = [q for q in seqs if q.get("error")]
+        if bad:
+            lines += ["", "| Secuencia | Error |", "| --- | --- |"]
+            lines += [f"| {q['path']} | {q['error']} |" for q in bad[:30]]
     lines += ["", "## Contenido del disco", "", "| Tipo | Cantidad |", "| --- | --- |"]
     lines += [f"| {k} | {v} |" for k, v in sorted(r["counts"].items())]
     if r["pending"]:

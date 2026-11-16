@@ -53,7 +53,7 @@ class TestMaterial(unittest.TestCase):
         # Al paquete: 1024 bytes por material con la matriz, su modo y los canales.
         blob = mp.pack_model(m, [0])
         u = mp.unpack_model(blob)
-        self.assertEqual(u["version"], 3)
+        self.assertEqual(u["version"], 4)
         rec = u["materials"][0]
         self.assertEqual(len(rec), 1024)
         np.testing.assert_allclose(struct.unpack_from("<8f", rec, 512), r0.reshape(-1), atol=1e-6)
@@ -139,7 +139,7 @@ class TestPaqueteYRender(unittest.TestCase):
             model = [e for e in entries if e["kind"] == pack.KIND_MODEL][0]
             self.assertEqual(len(anims), 1)
             self.assertEqual(anim.unpack_anim(anims[0]["data"])["model_key"], model["key"])
-            self.assertEqual(mp.unpack_model(model["data"])["version"], 3)
+            self.assertEqual(mp.unpack_model(model["data"])["version"], 4)
             render = os.environ.get("CHOYA_RENDER") or os.path.join(REPO, "runtime", "build", "choya_render")
             if not os.path.isfile(render):
                 self.skipTest("sin choya_render compilado (cmake -DWL_BUILD_RENDER=ON)")

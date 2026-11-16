@@ -21,8 +21,15 @@ std::string vec4c(const int16_t r[4]) {
 const char* kFrac[8] = {"1.0", "0.875", "0.75", "0.625", "0.5", "0.375", "0.25", "0.125"};
 
 // Selección de color konstante (KCSEL) como expresión vec3.
-std::string konst_color(const TevMaterialRec& m, unsigned sel) {
+std::string konst_color(const TevMaterialRec& m, unsigned sel, bool dyn) {
     if (sel < 8) return std::string("vec3(") + kFrac[sel] + ")";
+    if (dyn) {
+        static const char comp[4] = {'r', 'g', 'b', 'a'};
+        if (sel >= 0x0C && sel <= 0x0F) return "u_kreg[" + std::to_string(sel - 0x0C) + "].rgb";
+        if (sel >= 0x10 && sel <= 0x1F)
+            return std::string("vec3(u_kreg[") + std::to_string(sel & 3) + "]." + comp[(sel - 0x10) >> 2] + ")";
+        return "vec3(1.0)";
+    }
     auto k = [&](int i, int c) { return f(m.kregs[i][c] / 255.0f); };
     if (sel >= 0x0C && sel <= 0x0F) {
         const int i = int(sel - 0x0C);
@@ -35,8 +42,14 @@ std::string konst_color(const TevMaterialRec& m, unsigned sel) {
     return "vec3(1.0)";
 }
 
-std::string konst_alpha(const TevMaterialRec& m, unsigned sel) {
+std::string konst_alpha(const TevMaterialRec& m, unsigned sel, bool dyn) {
     if (sel < 8) return kFrac[sel];
+    if (dyn) {
+        static const char comp[4] = {'r', 'g', 'b', 'a'};
+        if (sel >= 0x10 && sel <= 0x1F)
+            return std::string("u_kreg[") + std::to_string(sel & 3) + "]." + comp[(sel - 0x10) >> 2];
+        return "1.0";
+    }
     if (sel >= 0x10 && sel <= 0x1F) return f(m.kregs[sel & 3][(sel - 0x10) >> 2] / 255.0f);
     return "1.0";
 }
@@ -97,6 +110,45 @@ std::string chan_component(const std::string& vcol, const std::string& matc, con
     return "clamp(" + amb + " + " + d + ", 0.0, 1.0) * " + mat;
 }
 
+// Igual que chan_component pero con las luces de GX en uniformes (modo dinámico). mask_sel: componente de u_lmask.
+std::string chan_component_dyn(const std::string& vcol, const std::string& matc, const std::string& ambc,
+                               uint32_t ctrl, const char* sw, const char* mask_sel, bool normals) {
+    const std::string mat = (ctrl & 1) ? vcol + sw : matc + sw;
+    if (!(ctrl & 2)) return mat;
+    const std::string amb = (ctrl & 64) ? vcol + sw : ambc + sw;
+    const unsigned dfn = normals ? (ctrl >> 7) & 3 : 0;
+    const unsigned afn = ((ctrl >> 9) & 1) | (((ctrl >> 10) & 1) << 1);
+    return "clamp(" + amb + " + gx_lights(u_lmask." + mask_sel + ", " + std::to_string(dfn) + ", " +
+           std::to_string(afn) + ", n, v_pos)" + sw + ", 0.0, 1.0) * " + mat;
+}
+
+// Luces de GX (XF): por cada luz de la máscara, dirección hacia la luz, atenuación (ninguna, especular, foco) y la
+// función difusa. u_lpos.w = 0: direccional (xyz ya es la dirección hacia la luz, en vista).
+const char* kLightFn = R"(vec4 gx_lights(int mask, int dfn, int afn, vec3 n, vec3 p) {
+  vec4 acc = vec4(0.0);
+  for (int i = 0; i < 4; ++i) {
+    if ((mask & (1 << i)) == 0) continue;
+    bool dirl = u_lpos[i].w == 0.0;
+    vec3 lv = dirl ? u_lpos[i].xyz : u_lpos[i].xyz - p;
+    float d = dirl ? 1.0 : length(lv);
+    vec3 ldir = d > 0.0 ? lv / (dirl ? length(lv) : d) : n;
+    float attn = 1.0;
+    if (afn == 1) {
+      float a = dot(n, ldir) >= 0.0 ? max(0.0, dot(n, u_ldir[i].xyz)) : 0.0;
+      vec3 k = dfn == 0 ? u_ldist[i].xyz : normalize(u_ldist[i].xyz);
+      attn = max(0.0, dot(u_lcos[i].xyz, vec3(1.0, a, a * a))) / max(dot(k, vec3(1.0, a, a * a)), 1e-6);
+    } else if (afn == 3) {
+      float c = max(0.0, dot(ldir, u_ldir[i].xyz));
+      attn = max(0.0, u_lcos[i].x + u_lcos[i].y * c + u_lcos[i].z * c * c) /
+             max(dot(u_ldist[i].xyz, vec3(1.0, d, d * d)), 1e-6);
+    }
+    float diff = dfn == 0 ? 1.0 : (dfn == 1 ? dot(ldir, n) : max(dot(ldir, n), 0.0));
+    acc += attn * diff * u_lcol[i];
+  }
+  return acc;
+}
+)";
+
 }  // namespace
 
 const char* tev_vertex_source() {
@@ -145,6 +197,13 @@ std::string tev_fragment_source(const TevMaterialRec& m, const TevGenOptions& op
     s += "#version 300 es\nprecision highp float;\n";
     s += "in vec3 v_nrm;\nin vec3 v_pos;\nin vec4 v_col;\nin vec2 v_uv0;\nin vec4 v_clip;\nout vec4 color;\n";
     s += "uniform vec3 light;\n";
+    if (opt.dynamic) {
+        s += "uniform vec4 u_creg[4];\nuniform vec4 u_kreg[4];\nuniform vec4 u_chmat[2];\nuniform vec4 u_chamb[2];\n"
+             "uniform vec4 u_tm[16];\nuniform mat4 u_tgm[8];\n";
+        s += "uniform vec4 u_lpos[4];\nuniform vec4 u_ldir[4];\nuniform vec4 u_lcol[4];\nuniform vec4 u_lcos[4];\n"
+             "uniform vec4 u_ldist[4];\nuniform ivec4 u_lmask;\n";
+        s += kLightFn;
+    }
     bool used[8] = {};
     for (unsigned i = 0; i < stages; ++i)
         if (m.stages[i].tex_on) used[m.stages[i].texmap & 7] = true;
@@ -172,6 +231,17 @@ std::string tev_fragment_source(const TevMaterialRec& m, const TevGenOptions& op
             continue;
         }
         const std::string vc = c == 0 ? vcol : "vec4(1.0)";
+        if (opt.dynamic) {  // colores en uniformes (el render pone blanco/gris si el material no los trae)
+            const std::string matc = "u_chmat[" + std::to_string(c) + "]", ambc = "u_chamb[" + std::to_string(c) + "]";
+            s += "  vec4 " + r + " = vec4(" +
+                 chan_component_dyn(vc, matc, ambc, ch.flags & 16 ? ch.ctrl_color : 0, ".rgb", c ? "z" : "x",
+                                    opt.has_normals) +
+                 ", " +
+                 chan_component_dyn(vc, matc, ambc, ch.flags & 32 ? ch.ctrl_alpha : 0, ".a", c ? "w" : "y",
+                                    opt.has_normals) +
+                 ");\n";
+            continue;
+        }
         const uint8_t white[4] = {255, 255, 255, 255}, gray[4] = {102, 102, 102, 255};
         const std::string matc = rgba8(ch.flags & 3 ? ch.mat : white);
         const std::string ambc = rgba8(ch.flags & 12 ? ch.amb : gray);
@@ -181,8 +251,26 @@ std::string tev_fragment_source(const TevMaterialRec& m, const TevGenOptions& op
     const unsigned ntg = m.num_texgens > 8 ? 8 : m.num_texgens;
     for (unsigned i = 0; i < 8; ++i) {
         const unsigned mode = m.tex_mtx_mode[i];
-        const std::string base = i < ntg ? texgen_expr(m.texgen[i], mode ? mode - 1 : 0) : std::string("v_uv0");
         const std::string tc = "tc" + std::to_string(i);
+        const std::string is = std::to_string(i);
+        if (opt.dynamic && i < ntg) {
+            // Modos de entorno (1, 3, 4) y proyección (2): la matriz de la escena (con ref_camera / ref_light) la pone el
+            // render; después, la matriz de textura del material o de su animación SRT0 (identidad si no hay).
+            const unsigned mm = mode ? mode - 1 : 0;
+            std::string base;
+            if (mm == 2)
+                s += "  vec4 " + tc + "q = u_tgm[" + is + "] * vec4(v_pos, 1.0);\n",
+                    base = tc + "q.xy / (abs(" + tc + "q.z) > 1e-6 ? " + tc + "q.z : 1e-6)";
+            else if (mm == 1 || mm == 3 || mm == 4)
+                base = "(u_tgm[" + is + "] * vec4(n, 1.0)).xy";
+            else
+                base = texgen_expr(m.texgen[i], 0);
+            s += "  vec4 " + tc + "in = vec4(" + base + ", 1.0, 1.0);\n";
+            s += "  vec2 " + tc + " = vec2(dot(u_tm[" + std::to_string(2 * i) + "], " + tc + "in), dot(u_tm[" +
+                 std::to_string(2 * i + 1) + "], " + tc + "in));\n";
+            continue;
+        }
+        const std::string base = i < ntg ? texgen_expr(m.texgen[i], mode ? mode - 1 : 0) : std::string("v_uv0");
         if (mode && i < ntg) {  // matriz de textura del material (la matriz posterior que carga NW4R)
             s += "  vec4 " + tc + "in = vec4(" + base + ", 1.0, 1.0);\n";
             s += "  vec2 " + tc + " = vec2(dot(" + vec4f(m.tex_mtx[i][0]) + ", " + tc + "in), dot(" +
@@ -191,10 +279,14 @@ std::string tev_fragment_source(const TevMaterialRec& m, const TevGenOptions& op
             s += "  vec2 " + tc + " = " + base + ";\n";
         }
     }
-    s += "  vec4 prev = " + vec4c(m.cregs[0]) + ";\n";
-    s += "  vec4 c0 = " + vec4c(m.cregs[1]) + ";\n";
-    s += "  vec4 c1 = " + vec4c(m.cregs[2]) + ";\n";
-    s += "  vec4 c2 = " + vec4c(m.cregs[3]) + ";\n";
+    if (opt.dynamic) {
+        s += "  vec4 prev = u_creg[0];\n  vec4 c0 = u_creg[1];\n  vec4 c1 = u_creg[2];\n  vec4 c2 = u_creg[3];\n";
+    } else {
+        s += "  vec4 prev = " + vec4c(m.cregs[0]) + ";\n";
+        s += "  vec4 c0 = " + vec4c(m.cregs[1]) + ";\n";
+        s += "  vec4 c1 = " + vec4c(m.cregs[2]) + ";\n";
+        s += "  vec4 c2 = " + vec4c(m.cregs[3]) + ";\n";
+    }
     s += "  vec4 tex; vec4 ras; vec3 kc; float ka;\n";
 
     for (unsigned i = 0; i < stages; ++i) {
@@ -213,8 +305,8 @@ std::string tev_fragment_source(const TevMaterialRec& m, const TevGenOptions& op
             s += "  ras = ras" + std::to_string(st.ras) + swap_suffix(m, ae & 3) + ";\n";
         else
             s += "  ras = vec4(0.0);\n";
-        s += "  kc = " + konst_color(m, kcsel) + ";\n";
-        s += "  ka = " + konst_alpha(m, kasel) + ";\n";
+        s += "  kc = " + konst_color(m, kcsel, opt.dynamic) + ";\n";
+        s += "  ka = " + konst_alpha(m, kasel, opt.dynamic) + ";\n";
 
         // Color
         {
@@ -321,13 +413,32 @@ uint64_t tev_program_hash(const TevMaterialRec& m, const TevGenOptions& opt) {
     c.cull = 0;
     c.blend = 0;
     c.zmode = 0;
+    if (opt.dynamic) {  // lo que va en uniformes no separa programas
+        std::memset(c.cregs, 0, sizeof c.cregs);
+        std::memset(c.kregs, 0, sizeof c.kregs);
+        std::memset(c.tex_mtx, 0, sizeof c.tex_mtx);
+        for (ChanRec& ch : c.chans) {
+            std::memset(ch.mat, 0, 4);
+            std::memset(ch.amb, 0, 4);
+            ch.ctrl_color &= ~((0xFu << 2) | (0xFu << 11));  // máscara de luces: la da el conjunto de luces
+            ch.ctrl_alpha &= ~((0xFu << 2) | (0xFu << 11));
+        }
+        std::memset(c.cam_ref, 0, sizeof c.cam_ref);
+        std::memset(c.light_ref, 0, sizeof c.light_ref);
+        c.light_set = 0;
+        c.fog = 0;
+        c.ref_valid = 0;
+        // el modo de mapeo (entorno / proyección) sí es estructural; "sin matriz" y "coordenadas" son lo mismo aquí
+        for (uint8_t& md : c.tex_mtx_mode)
+            if (md == 1) md = 0;
+    }
     uint64_t h = 0xCBF29CE484222325ull;
     const auto* p = reinterpret_cast<const uint8_t*>(&c);
     for (size_t i = 0; i < sizeof c; ++i) {
         h ^= p[i];
         h *= 0x100000001B3ull;
     }
-    h ^= (opt.has_normals ? 1u : 0u) | (opt.has_vertex_color ? 2u : 0u);
+    h ^= (opt.has_normals ? 1u : 0u) | (opt.has_vertex_color ? 2u : 0u) | (opt.dynamic ? 4u : 0u);
     return h * 0x100000001B3ull;
 }
 

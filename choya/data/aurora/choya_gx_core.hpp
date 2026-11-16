@@ -150,8 +150,8 @@ struct Nucleos {
   int juego = -1, gx = -1, otros = 0;
 };
 Nucleos repartir_nucleos(int ncpu, bool conGx, bool gxSolo) noexcept;
-// Nice del hilo GX con el núcleo compartido (0.37.0; con mali-cmar desde la 0.40.0): CHOYA_GX_PRIORIDAD (-20..19), -10
-// por omisión (0.40.0; antes -6) o si no es válido.
+// Nice del hilo GX con el núcleo compartido (0.37.0; con mali-cmar desde la 0.40.0): CHOYA_GX_PRIORIDAD (-20..19), -3
+// por omisión (0.41.0; -10 en la 0.40.0, -6 antes) o si no es válido.
 int prioridad_gx() noexcept;
 // Tiempos de aurora fuera del motor (0.20.2), en ns, para el informe cada 10 s: 0 el juego esperando a que el hilo
 // de aurora suelte el cuadro anterior, 1 sellar, 2 codificar, 3 publicar, 4 esperar permiso para preparar, 5 preparar

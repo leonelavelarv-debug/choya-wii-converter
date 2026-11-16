@@ -15,7 +15,7 @@ def cmd_convert(a):
     if not os.path.isdir(a.src):
         sys.exit(f"no existe la carpeta {a.src}")
     engine.run(a.src, a.out, prof, jobs=a.jobs, preview=a.preview, measure=not a.no_psnr,
-               anims=not a.sin_animaciones)
+               anims=not a.sin_animaciones, sequences=not a.sin_secuencias)
     print(f"Reporte: {os.path.join(a.out, 'report.md')}")
 
 
@@ -267,6 +267,8 @@ def main(argv=None):
     c.add_argument("--no-psnr", action="store_true", help="no mide la calidad (más rápido)")
     c.add_argument("--sin-animaciones", action="store_true",
                    help="no hornea las animaciones CHR0 (el port del juego no las usa: paquete más chico)")
+    c.add_argument("--sin-secuencias", action="store_true",
+                   help="no prerenderizar las secuencias RSEQ de los BRSAR (más rápido; quedan en el disco)")
     c.set_defaults(fn=cmd_convert)
 
     s = sub.add_parser("scan", help="solo analiza el disco extraído")
@@ -326,6 +328,11 @@ def main(argv=None):
     pf.add_argument("--top", type=int, default=35, help="cuántas funciones listar")
     pf.add_argument("-o", "--salida", help="guardar el informe también en este archivo")
     pf.set_defaults(fn=cmd_perfil)
+
+    pe = sub.add_parser("prueba-etc", help="paquete sintético ETC2/EAC para verificar el códec en la consola")
+    pe.add_argument("carpeta", help="dónde escribir assets.wlpk y LEEME-prueba-etc.txt")
+    pe.add_argument("--semilla", type=int, default=20261115)
+    pe.set_defaults(fn=lambda a: sys.exit(__import__("choya.prueba_etc", fromlist=["main"]).main(a)))
 
     pr = sub.add_parser("profiles", help="lista los perfiles de optimización")
     pr.set_defaults(fn=cmd_profiles)

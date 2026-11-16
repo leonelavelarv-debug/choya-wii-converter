@@ -28,6 +28,8 @@ KIND_TEXTURE = 1
 KIND_AUDIO = 2
 KIND_MODEL = 3     # ver choya/model_pack.py
 KIND_ANIM = 4      # animación de huesos horneada para un modelo; ver choya/anim.py
+KIND_MATANIM = 5   # animación de material o visibilidad (SRT0/CLR0/PAT0/VIS0) para un modelo; ver choya/anim_mat.py
+KIND_SCENE = 6     # escena (SCN0: conjuntos de luces, luces, cámaras); ver choya/scn0.py
 
 AUDIO_PCM16 = 1
 AUDIO_DSPADPCM = 2   # ver audio.adpcm_payload; el runtime lo decodifica al vuelo

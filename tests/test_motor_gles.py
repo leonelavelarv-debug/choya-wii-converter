@@ -113,9 +113,9 @@ class TestMotorGles(unittest.TestCase):
                             "-o", nuc, "-ldl", "-lpthread"], check=True, capture_output=True)
             filas = subprocess.run([nuc], capture_output=True, text=True, check=True).stdout.split("\n")
             self.assertEqual(filas[:5], ["4 1 0 3 2 3", "4 1 1 3 2 2", "4 0 0 3 2 3", "3 0 0 2 1 2", "8 1 0 7 6 7"])
-            # 0.37.0: nice del hilo GX: -10 por omisión (0.40.0), el valor de CHOYA_GX_PRIORIDAD si es válido.
-            self.assertEqual(filas[5], "prioridad -10")
-            for valor, esperado in (("0", "0"), ("-6", "-6"), ("abc", "-10"), ("-30", "-10")):
+            # 0.37.0: nice del hilo GX: -3 por omisión (0.41.0), el valor de CHOYA_GX_PRIORIDAD si es válido.
+            self.assertEqual(filas[5], "prioridad -3")
+            for valor, esperado in (("0", "0"), ("-6", "-6"), ("abc", "-3"), ("-30", "-3")):
                 out = subprocess.run([nuc], env=dict(os.environ, CHOYA_GX_PRIORIDAD=valor), capture_output=True,
                                      text=True, check=True).stdout.split("\n")
                 self.assertEqual(out[5], "prioridad " + esperado, valor)

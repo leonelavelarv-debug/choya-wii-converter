@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import os
+import struct
 from dataclasses import dataclass, field
 
-from . import anim, audio, brsar, compress, containers, mdl0, u8
+import numpy as np
+
+from . import anim, anim_mat, audio, brsar, compress, containers, mdl0, rseq, scn0, u8
 from .gxtex import GXTexture
 
 
@@ -33,17 +36,51 @@ class AnimItem:
 
 
 @dataclass
+class MatAnimItem:
+    path: str          # ruta del BRRES dentro del disco
+    kind: int          # anim_mat.TYPE_SRT / CLR / PAT / VIS
+    name: str
+    offset: int
+    brres: bytes
+
+
+@dataclass
+class SceneItem:
+    path: str
+    name: str
+    offset: int
+    brres: bytes
+
+
+@dataclass
+class SeqReport:
+    path: str                  # "archivo.brsar/NOMBRE" (la misma clave que los efectos de onda)
+    seconds: float
+    loop: bool
+    ended: bool
+    interactive: bool
+    ops: dict
+    ignored: dict
+    stats: dict
+    error: str | None = None
+
+
+@dataclass
 class ScanResult:
     root: str
     textures: list[GXTexture] = field(default_factory=list)
     audio: list[AudioItem] = field(default_factory=list)
     models: list[ModelItem] = field(default_factory=list)
     anims: list[AnimItem] = field(default_factory=list)
+    mat_anims: list[MatAnimItem] = field(default_factory=list)
+    scenes: list[SceneItem] = field(default_factory=list)
+    sequences: list[SeqReport] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
     pending: list[str] = field(default_factory=list)     # tipos conocidos aún no convertidos
     errors: list[str] = field(default_factory=list)
     files: int = 0
     disc_bytes: int = 0
+    render_sequences: bool = True
 
     def bump(self, key: str, n: int = 1):
         self.counts[key] = self.counts.get(key, 0) + n
@@ -101,6 +138,43 @@ def game_id(path: str) -> str | None:
 MAX_DEPTH = 6
 
 
+SEQ_RATE = 32000          # salida del DSP del Wii
+
+
+def _render_sequences(res: ScanResult, path: str, raw: bytes, seqs: list):
+    """Ruta A: cada secuencia del BRSAR se prerenderiza con su banco (rseq.py) y entra al paquete como audio PCM con
+    su bucle, con la misma clave "archivo.brsar/NOMBRE". Los bancos y sus ondas se leen una vez por BRSAR."""
+    banks: dict = {}
+    failed = 0
+    for sq in seqs:
+        full = f"{path}/{sq.name}"
+        try:
+            if sq.seq is None:
+                raise rseq.SeqError("secuencia en un archivo externo")
+            bank = None
+            if sq.bank is not None:
+                if sq.bank not in banks:
+                    banks[sq.bank] = rseq.Bank(raw, sq.bank[0], sq.bank[1], sq.bank[2])
+                bank = banks[sq.bank]
+            base, end = rseq.seq_base(raw, sq.seq[0], sq.seq[1])
+            r = rseq.render(raw, base, end, sq.data_offset, bank, SEQ_RATE, sound_volume=sq.volume / 127.0)
+        except (rseq.SeqError, brsar.BrsarError, struct.error, IndexError, ValueError) as e:
+            res.sequences.append(SeqReport(full, 0.0, False, False, False, {}, {}, {}, str(e)))
+            res.bump("BRSAR:secuencias fallidas")
+            failed += 1
+            continue
+        res.sequences.append(SeqReport(full, len(r.samples) / SEQ_RATE, r.loop_start is not None, r.ended,
+                                       r.interactive, dict(r.ops), dict(r.ignored), dict(r.stats)))
+        if len(r.samples) == 0 or not np.any(r.samples):
+            res.bump("BRSAR:secuencias en silencio")
+            continue
+        res.audio.append(AudioItem(full, "brsar", b"", r.to_audio()))
+        res.bump("BRSAR:secuencias prerenderizadas")
+    if failed:
+        res.pending.append(f"{path}: {failed} sonidos de secuencia no se pudieron prerenderizar (ver la tabla de "
+                           "secuencias del reporte); siguen en el disco")
+
+
 def _visit(res: ScanResult, path: str, data: bytes, depth: int):
     if depth > MAX_DEPTH:
         return
@@ -126,6 +200,10 @@ def _visit(res: ScanResult, path: str, data: bytes, depth: int):
                 res.models.append(ModelItem(path, mname, moff, raw))
             for aname, aoff in anim.find_chr0(raw, secs):
                 res.anims.append(AnimItem(path, aname, aoff, raw))
+            for kind, aname, aoff in anim_mat.find(raw, secs):
+                res.mat_anims.append(MatAnimItem(path, kind, aname, aoff, raw))
+            for sname, soff in scn0.find(raw, secs):
+                res.scenes.append(SceneItem(path, sname, soff, raw))
             for folder, n in counts.items():
                 res.bump(folder, n)
         elif containers.is_tpl(raw):
@@ -145,9 +223,11 @@ def _visit(res: ScanResult, path: str, data: bytes, depth: int):
             for kind, n in br.counts.items():
                 res.bump(f"BRSAR:{kind}", n)
             res.errors.extend(f"{path}: {w}" for w in br.warnings)
-            if br.counts.get("secuencias"):
-                res.pending.append(f"{path}: {br.counts['secuencias']} sonidos de secuencia (RSEQ, como MIDI con "
-                                   "instrumentos) siguen en el disco; los de onda van al paquete")
+            if br.sequences and res.render_sequences:
+                _render_sequences(res, path, raw, br.sequences)
+            elif br.counts.get("secuencias"):
+                res.pending.append(f"{path}: {br.counts['secuencias']} sonidos de secuencia (RSEQ) no se "
+                                   "prerenderizaron (--sin-secuencias); siguen en el disco")
         elif raw[:4] in (b"RLYT", b"RLAN"):
             res.bump("layout")
         else:
@@ -156,9 +236,9 @@ def _visit(res: ScanResult, path: str, data: bytes, depth: int):
         res.errors.append(f"{path}: {type(e).__name__}: {e}")
 
 
-def scan(path: str, progress=None) -> ScanResult:
+def scan(path: str, progress=None, sequences: bool = True) -> ScanResult:
     root = find_files_root(path)
-    res = ScanResult(root=root)
+    res = ScanResult(root=root, render_sequences=sequences)
     all_files = []
     for d, _dirs, files in os.walk(root):
         for name in sorted(files):

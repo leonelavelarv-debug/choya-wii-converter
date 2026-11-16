@@ -556,7 +556,7 @@ def sphere(rings=12, segs=16, radius=1.0):
 
 def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0, 0.0), tev=None,
                extra_textures=(), mesh=None, tex_srt=None, srt_mode=0, chans=None, num_chans=1,
-               skeleton=None, obj_node=0, nodemix=None) -> bytes:
+               skeleton=None, obj_node=0, nodemix=None, tex_effect=None, light_set=0, mat_name="mat") -> bytes:
     """MDL0 v9 con un hueso, 4 vértices (tira de 2 triángulos), UV y un material con textura.
     tex_srt = {coordenada: (su, sv, giro, tu, tv)} (ResTexSrtData, modo srt_mode); chans = [(banderas, mat, amb,
     control del color, control del alfa)] (ResChanData); skeleton = [(nombre, padre, traslación)] reemplaza al hueso
@@ -593,6 +593,7 @@ def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0,
         worlds.append(w)
         m.put(">i", bone + 4, -bone)
         m.put(">ii", bone + 0x0C, bi, bi)
+        m.put(">I", bone + 0x14, 0x100)               # FLAG_VISIBLE
         m.put(">3f", bone + 0x20, 1, 1, 1)
         m.put(">3f", bone + 0x38, *tr)
         if parent >= 0:
@@ -640,13 +641,15 @@ def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0,
     m.put(">i", mat + 4, -mat)
     m.put(">ii", mat + 0x0C, 0, 0)
     m.b[mat + 0x14:mat + 0x18] = bytes([ntg, num_chans, nst, 0])
+    m.b[mat + 0x1D] = light_set & 0xFF
     if tex_srt:
         flag = 0
         for i, (su, sv, r, tu, tv) in tex_srt.items():
             flag |= 1 << (4 * i)
             m.put(">5f", mat + 0x1A4 + 8 + 0x14 * i, su, sv, r, tu, tv)
             eff = mat + 0x1A4 + 0xA8 + 0x34 * i
-            m.b[eff:eff + 4] = bytes([0xFF, 0xFF, 0, 1])           # sin cámara ni luz, mapeo normal, efecto identidad
+            cam, light, mapmode = (tex_effect or {}).get(i, (-1, -1, 0))
+            m.b[eff:eff + 4] = bytes([cam & 0xFF, light & 0xFF, mapmode, 1])   # por defecto: sin cámara ni luz
             m.put(">12f", eff + 4, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0)
         m.put(">II", mat + 0x1A4, flag, srt_mode)
     for c, (flags, matc, ambc, ctrl_c, ctrl_a) in enumerate(chans or []):
@@ -715,8 +718,8 @@ def build_mdl0(name: str = "box", texture: str = "tex_box", translate=(0.0, 1.0,
     groups = {
         "defs": group(defs), "bones": group([(sk[0], bo) for sk, bo in zip(skeleton, bone_offs)]),
         "verts": group([("pos", vb)]), "uvs": group([("uv", ub)]),
-        **({"norms": group([("nrm", nb)])} if nb else {}), "mats": group([("mat", mat)]),
-        "shaders": group([("mat", shader)]),
+        **({"norms": group([("nrm", nb)])} if nb else {}), "mats": group([(mat_name, mat)]),
+        "shaders": group([(mat_name, shader)]),
         "objs": group([("obj", obj)]), "texs": group(tex_links),
     }
     order = ["defs", "bones", "verts", "norms", "colors", "uvs", "mats", "shaders", "objs", "texs", "pals"]
@@ -818,3 +821,425 @@ def build_dol(code: dict, text_base=0x80004000, text_size=0x3000, entry=0x800061
     st.pack_into(">18I", hdr, 0x90, *sizes)
     st.pack_into(">3I", hdr, 0xD8, 0x80400000, 0x1000, entry)
     return bytes(hdr) + bytes(text) + data
+
+
+# --- animaciones de material, visibilidad y escena (0.42.0) ---------------------------------------------------
+
+class _Anm:
+    """Bloque NW4R con nombres y diccionarios (ResDic) para armar SRT0/CLR0/PAT0/VIS0/SCN0 de prueba."""
+
+    def __init__(self, magic: bytes, revision: int, head: int):
+        self.m = _Blob()
+        self.m.alloc(head)
+        self.m.b[0:4] = magic
+        self.m.put(">I", 8, revision)
+        self.strings = {}
+
+    def string(self, txt: str) -> int:
+        if txt not in self.strings:
+            off = self.m.alloc(4 + len(txt) + 1)
+            self.m.put(">I", off, len(txt))
+            self.m.b[off + 4:off + 4 + len(txt)] = txt.encode()
+            self.strings[txt] = off + 4
+        return self.strings[txt]
+
+    def dic(self, entries) -> int:          # entries = [(nombre, offset absoluto)]
+        g = self.m.alloc(8 + 16 * (len(entries) + 1))
+        self.m.put(">II", g, 8 + 16 * (len(entries) + 1), len(entries))
+        self.m.put(">HHHHii", g + 8, 0xFFFF, 0, 1, 0, 0, 0)
+        for i, (n, off) in enumerate(entries, 1):
+            self.m.put(">HHHHii", g + 8 + 16 * i, 0, 0, 0, 0, self.string(n) - g, off - g)
+        return g
+
+    def keys(self, keys) -> int:
+        kd = self.m.alloc(8 + 12 * len(keys))
+        self.m.put(">HHf", kd, len(keys), 0, 1.0 / max(1.0, keys[-1][0] - keys[0][0]))
+        for j, k in enumerate(keys):
+            self.m.put(">fff", kd + 8 + 12 * j, *k)
+        return kd
+
+    def anm_data(self, field_off: int, value):
+        """ResAnmData en field_off: constante (número) o cuadros clave (lista). Devuelve True si es constante."""
+        if isinstance(value, list):
+            self.m.put(">i", field_off, self.keys(value) - field_off)
+            return False
+        self.m.put(">f", field_off, float(value))
+        return True
+
+    def finish(self) -> bytes:
+        self.m.b.extend(b"\x00" * ((-len(self.m.b)) % 32))
+        self.m.put(">I", 4, len(self.m.b))
+        return bytes(self.m.b)
+
+
+def build_srt0(mats: dict, frames: int, loop: bool = True, mode: int = 0) -> bytes:
+    """mats = {material: {coordenada: (su, sv, giro, tu, tv)}}; cada valor, número o [(cuadro, valor, pendiente)]."""
+    a = _Anm(b"SRT0", 4, 0x28)
+    a.m.put(">HHII", 0x1C, frames, len(mats), mode, 1 if loop else 0)
+    entries = []
+    for mname, slots in mats.items():
+        md_ = a.m.alloc(0xC + 4 * len(slots))
+        flags = 0
+        for k, (slot, vals) in enumerate(sorted(slots.items())):
+            flags |= 1 << (4 * slot)
+            td = a.m.alloc(4 + 4 * 5)
+            tflags = 1
+            for i, (v, cbit) in enumerate(zip(vals, (5, 6, 7, 8, 9))):
+                if a.anm_data(td + 4 + 4 * i, v):
+                    tflags |= 1 << cbit
+            a.m.put(">I", td, tflags)
+            a.m.put(">i", md_ + 0xC + 4 * k, td - md_)
+        a.m.put(">iII", md_, a.string(mname) - md_, flags, 0)
+        entries.append((mname, md_))
+    a.m.put(">i", 0x10, a.dic(entries))
+    return a.finish()
+
+
+def build_clr0(mats: dict, frames: int, loop: bool = True) -> bytes:
+    """mats = {material: {objetivo: (máscara, color u32 constante o [u32] por cuadro (frames + 1))}}."""
+    a = _Anm(b"CLR0", 3, 0x24)
+    a.m.put(">HHI", 0x1C, frames, len(mats), 1 if loop else 0)
+    entries = []
+    for mname, tg in mats.items():
+        md_ = a.m.alloc(8 + 8 * len(tg))
+        flags = 0
+        for k, (target, (mask, colors)) in enumerate(sorted(tg.items())):
+            o = md_ + 8 + 8 * k
+            flags |= 1 << (2 * target)
+            a.m.put(">I", o, mask)
+            if isinstance(colors, list):
+                fd = a.m.alloc(4 * len(colors))
+                for j, c in enumerate(colors):
+                    a.m.put(">I", fd + 4 * j, c)
+                a.m.put(">i", o + 4, fd - (o + 4))
+            else:
+                flags |= 2 << (2 * target)
+                a.m.put(">I", o + 4, colors)
+        a.m.put(">iI", md_, a.string(mname) - md_, flags)
+        entries.append((mname, md_))
+    a.m.put(">i", 0x10, a.dic(entries))
+    return a.finish()
+
+
+def build_pat0(mats: dict, textures: list, frames: int, loop: bool = True) -> bytes:
+    """mats = {material: {unidad: índice de textura constante o [(cuadro, índice)]}}."""
+    a = _Anm(b"PAT0", 3, 0x38)
+    a.m.put(">HHHHI", 0x2C, frames, len(mats), len(textures), 0, 1 if loop else 0)
+    arr = a.m.alloc(4 * len(textures))
+    for i, t in enumerate(textures):
+        a.m.put(">i", arr + 4 * i, a.string(t) - arr)
+    a.m.put(">i", 0x14, arr)
+    entries = []
+    for mname, units in mats.items():
+        md_ = a.m.alloc(8 + 4 * len(units))
+        flags = 0
+        for k, (unit, v) in enumerate(sorted(units.items())):
+            o = md_ + 8 + 4 * k
+            if isinstance(v, list):
+                flags |= (1 | 4) << (4 * unit)
+                ad = a.m.alloc(8 + 8 * len(v))
+                a.m.put(">HHf", ad, len(v), 0, 1.0 / max(1.0, v[-1][0] - v[0][0]))
+                for j, (fr, ti) in enumerate(v):
+                    a.m.put(">fHH", ad + 8 + 8 * j, fr, ti, 0)
+                a.m.put(">i", o, ad - md_)
+            else:
+                flags |= (1 | 2 | 4) << (4 * unit)
+                a.m.put(">HH", o, v, 0)
+        a.m.put(">iI", md_, a.string(mname) - md_, flags)
+        entries.append((mname, md_))
+    a.m.put(">i", 0x10, a.dic(entries))
+    return a.finish()
+
+
+def build_vis0(nodes: dict, frames: int, loop: bool = True) -> bytes:
+    """nodes = {nodo: bool constante o [bool] por cuadro (frames + 1)}."""
+    a = _Anm(b"VIS0", 3, 0x24)
+    a.m.put(">HHI", 0x1C, frames, len(nodes), 1 if loop else 0)
+    entries = []
+    for nname, v in nodes.items():
+        words = frames // 32 + 1
+        nd = a.m.alloc(8 + 4 * words)
+        if isinstance(v, list):
+            flags = 0
+            for f, on in enumerate(v):
+                if on:
+                    w = nd + 8 + 4 * (f // 32)
+                    cur, = struct.unpack_from(">I", a.m.b, w)
+                    a.m.put(">I", w, cur | ((1 << 31) >> (f % 32)))
+        else:
+            flags = 2 | (1 if v else 0)
+        a.m.put(">iI", nd, a.string(nname) - nd, flags)
+        entries.append((nname, nd))
+    a.m.put(">i", 0x10, a.dic(entries))
+    return a.finish()
+
+
+def build_scn0(frames: int, lightsets=(), ambs=(), lights=(), cameras=(), loop: bool = True) -> bytes:
+    """lightsets = [(nombre, ref, ambiente o None, [luces])]; ambs = [(nombre, ref, color u32)];
+    lights = [dict(name, ref, type (0 punto, 1 direccional, 2 foco), pos, aim, color, cutoff, spot_fn, dist,
+                   bright, dist_fn, spec_ref=None, spec_color, shininess, enable=True)], valores numéricos o claves;
+    cameras = [dict(name, ref, type (0 rotate, 1 aim), pos, rot | aim, twist, fovy, aspect, near, far)]."""
+    a = _Anm(b"SCN0", 4, 0x44)
+    a.m.put(">HHIHHHHH", 0x30, frames, sum(1 for lt in lights if lt.get("spec_ref") is not None),
+            1 if loop else 0, len(lightsets), len(ambs), len(lights), 0, len(cameras))
+    top = []
+    sets = []
+    for name, ref, amb, names in lightsets:
+        ld = a.m.alloc(0x4C)
+        a.m.put(">I", ld, 0x4C)
+        a.m.put(">iII", ld + 8, a.string(name) - ld, 0, ref)
+        a.m.put(">i", ld + 0x14, (a.string(amb) - ld) if amb else 0)
+        a.m.put(">HB", ld + 0x18, 0xFFFF, len(names))
+        for i, n in enumerate(names):
+            a.m.put(">i", ld + 0x1C + 4 * i, a.string(n) - (ld + 0x1C))
+        for i in range(8):
+            a.m.put(">H", ld + 0x3C + 2 * i, 0xFFFF)
+        sets.append((name, ld))
+    if sets:
+        top.append(("LightSet(NW4R)", a.dic(sets)))
+    amb_e = []
+    for i, (name, ref, color) in enumerate(ambs):
+        ad = a.m.alloc(0x1C)
+        a.m.put(">IiiIII", ad, 0x1C, -ad, a.string(name) - ad, i, ref, 3 | (1 << 31))
+        a.m.put(">I", ad + 0x18, color)
+        amb_e.append((name, ad))
+    if amb_e:
+        top.append(("AmbLights(NW4R)", a.dic(amb_e)))
+    light_e = []
+    for i, lt in enumerate(lights):
+        ld = a.m.alloc(0x5C)
+        flags = lt.get("type", 1) | 0x30
+        if lt.get("enable", True):
+            flags |= 4
+        flags |= 1 << 23                                      # enable constante
+        spec = lt.get("spec_ref")
+        if spec is not None:
+            flags |= 8
+        for key, o, bit in (("px", 0x24, 19), ("py", 0x28, 20), ("pz", 0x2C, 21), ("ax", 0x34, 24),
+                            ("ay", 0x38, 25), ("az", 0x3C, 26), ("dist", 0x44, 28), ("bright", 0x48, 29),
+                            ("cutoff", 0x50, 27), ("shininess", 0x58, 31)):
+            src = {"px": lt.get("pos", (0, 0, 0))[0], "py": lt.get("pos", (0, 0, 0))[1],
+                   "pz": lt.get("pos", (0, 0, 0))[2], "ax": lt.get("aim", (0, 0, 0))[0],
+                   "ay": lt.get("aim", (0, 0, 0))[1], "az": lt.get("aim", (0, 0, 0))[2],
+                   "dist": lt.get("dist", 10.0), "bright": lt.get("bright", 0.5), "cutoff": lt.get("cutoff", 45.0),
+                   "shininess": lt.get("shininess", 16.0)}[key]
+            if a.anm_data(ld + o, src):
+                flags |= 1 << bit
+        color = lt.get("color", 0xFFFFFFFF)
+        if isinstance(color, list):
+            fd = a.m.alloc(4 * len(color))
+            for j, c in enumerate(color):
+                a.m.put(">I", fd + 4 * j, c)
+            a.m.put(">i", ld + 0x30, fd - (ld + 0x30))
+        else:
+            flags |= 1 << 22
+            a.m.put(">I", ld + 0x30, color)
+        flags |= 1 << 30
+        a.m.put(">I", ld + 0x54, lt.get("spec_color", 0xFFFFFFFF))
+        a.m.put(">IiiIIIiI", ld, 0x5C, -ld, a.string(lt["name"]) - ld, i, lt["ref"],
+                spec if spec is not None else 0, 0, flags)
+        a.m.put(">I", ld + 0x40, lt.get("dist_fn", 0))
+        a.m.put(">I", ld + 0x4C, lt.get("spot_fn", 0))
+        light_e.append((lt["name"], ld))
+    if light_e:
+        top.append(("Lights(NW4R)", a.dic(light_e)))
+    cam_e = []
+    for i, c in enumerate(cameras):
+        cd = a.m.alloc(0x5C)
+        flags = c.get("type", 0)
+        pos, rot, aim = c.get("pos", (0, 0, 10)), c.get("rot", (0, 0, 0)), c.get("aim", (0, 0, 0))
+        vals = [pos[0], pos[1], pos[2], c.get("aspect", 1.0), c.get("near", 1.0), c.get("far", 1000.0), rot[0], rot[1],
+                rot[2], aim[0], aim[1], aim[2], c.get("twist", 0.0), c.get("fovy", 45.0), 0.0]
+        bits = (17, 18, 19, 20, 21, 22, 29, 30, 31, 25, 26, 27, 28, 23, 24)
+        for k, (v, bit) in enumerate(zip(vals, bits)):
+            if a.anm_data(cd + 0x20 + 4 * k, v):
+                flags |= 1 << bit
+        a.m.put(">IiiIIIIi", cd, 0x5C, -cd, a.string(c["name"]) - cd, i, c["ref"], 0, flags, 0)
+        cam_e.append((c["name"], cd))
+    if cam_e:
+        top.append(("Cameras(NW4R)", a.dic(cam_e)))
+    a.m.put(">i", 0x10, a.dic(top))
+    return a.finish()
+
+
+# --- secuencias (RSEQ + RBNK) en un BRSAR (0.42.0) ---------------------------------------------------------------
+
+class Mml:
+    """Bytes del MML de NW4R (snd_MmlParser.h)."""
+
+    @staticmethod
+    def vlq(v: int) -> bytes:
+        out = [v & 0x7F]
+        v >>= 7
+        while v:
+            out.append(0x80 | (v & 0x7F))
+            v >>= 7
+        return bytes(reversed(out))
+
+    note = staticmethod(lambda key, vel, length: bytes([key, vel]) + Mml.vlq(length))
+    wait = staticmethod(lambda n: b"\x80" + Mml.vlq(n))
+    prg = staticmethod(lambda n: b"\x81" + Mml.vlq(n))
+    opentrack = staticmethod(lambda no, off: bytes([0x88, no]) + off.to_bytes(3, "big"))
+    jump = staticmethod(lambda off: b"\x89" + off.to_bytes(3, "big"))
+    call = staticmethod(lambda off: b"\x8A" + off.to_bytes(3, "big"))
+    u8 = staticmethod(lambda cmd, v: bytes([cmd, v & 0xFF]))
+    s16 = staticmethod(lambda cmd, v: bytes([cmd]) + (v & 0xFFFF).to_bytes(2, "big"))
+    tempo = staticmethod(lambda v: Mml.s16(0xE1, v))
+    loop_start = staticmethod(lambda n: bytes([0xD4, n]))
+    loop_end = b"\xFC"
+    ret = b"\xFD"
+    alloctrack = staticmethod(lambda mask: b"\xFE" + mask.to_bytes(2, "big"))
+    fin = b"\xFF"
+    ex = staticmethod(lambda op, var, v: bytes([0xF0, op, var]) + (v & 0xFFFF).to_bytes(2, "big"))
+    execif = staticmethod(lambda body: b"\xA2" + body)
+
+
+def _wave_info_pcm16(rate: int, n: int, loop_start, data_off: int) -> bytes:
+    info = bytearray(struct.pack(">BBBBHHII", 1, 0 if loop_start is None else 1, 1, 0, rate, 0,
+                                 loop_start or 0, n - 1))
+    info += struct.pack(">III", 0x1C, data_off, 0)
+    info += struct.pack(">I", 0x20)                         # tabla de canales: un canal en +0x20
+    info += struct.pack(">II5I", 0, 0, 0, 0, 0, 0, 0)
+    return bytes(info)
+
+
+def build_rbnk(insts: list, waves: list, version: int = 0x0101) -> tuple[bytes, bytes]:
+    """(RBNK, datos de ondas). insts[i] = dict(wave, key=60, a=127, d=127, s=127, r=127, vol=127, pan=64,
+    tune=1.0) o ("rango", [(tecla máxima, dict)]) o ("indice", min, [dict]); waves = [(pcm int16, frecuencia,
+    inicio de bucle o None)] en PCM16."""
+    ref = lambda dtype, off: struct.pack(">BBHI", 1, dtype, 0, off)
+    wave_data = bytearray()
+    infos = []
+    for pcm, rate, loop in waves:
+        wave_data.extend(b"\x00" * ((-len(wave_data)) % 32))
+        off = len(wave_data)
+        wave_data += np.asarray(pcm, ">i2").tobytes()
+        infos.append(_wave_info_pcm16(rate, len(pcm), loop, off))
+
+    def param(p):
+        return (struct.pack(">iBBBB4xBBB", p["wave"], p.get("a", 127), p.get("d", 127), p.get("s", 127),
+                            p.get("r", 127), p.get("key", 60), p.get("vol", 127), p.get("pan", 64)) + b"\x00" +
+                struct.pack(">f", p.get("tune", 1.0)) + b"\x00" * 8)
+
+    table = bytearray(struct.pack(">I", len(insts)) + b"\x00" * (8 * len(insts)))
+
+    def put(blob):
+        table.extend(b"\x00" * ((-len(table)) % 4))
+        o = len(table)
+        table.extend(blob)
+        return o
+    for i, spec in enumerate(insts):
+        if isinstance(spec, dict):
+            table[4 + 8 * i:12 + 8 * i] = ref(1, put(param(spec)))
+        elif spec[0] == "rango":
+            entries = spec[1]
+            n = len(entries)
+            start = (n + 1 + 3) & ~3
+            rt = bytearray(bytes([n]) + bytes(k for k, _ in entries))
+            rt += b"\x00" * (start - len(rt)) + b"\x00" * (8 * n)
+            rto = put(bytes(rt))
+            for k, (_key, p) in enumerate(entries):
+                po = put(param(p))
+                table[rto + start + 8 * k:rto + start + 8 * k + 8] = ref(1, po)
+            table[4 + 8 * i:12 + 8 * i] = ref(2, rto)
+        else:
+            _, lo, plist = spec
+            ito = put(bytes([lo, lo + len(plist) - 1, 0, 0]) + b"\x00" * (8 * len(plist)))
+            for k, p in enumerate(plist):
+                po = put(param(p))
+                table[ito + 4 + 8 * k:ito + 12 + 8 * k] = ref(1, po)
+            table[4 + 8 * i:12 + 8 * i] = ref(3, ito)
+    data_blk = b"DATA" + struct.pack(">I", 8 + len(table)) + bytes(table)
+    data_blk += b"\x00" * ((-len(data_blk)) % 32)
+    wtable = bytearray(struct.pack(">I", len(infos)) + b"\x00" * (8 * len(infos)))
+    for i, info in enumerate(infos):
+        wtable.extend(b"\x00" * ((-len(wtable)) % 4))
+        wtable[4 + 8 * i:12 + 8 * i] = ref(0, len(wtable))
+        wtable += info
+    wave_blk = b"WAVE" + struct.pack(">I", 8 + len(wtable)) + bytes(wtable)
+    out = bytearray(b"RBNK" + struct.pack(">HHIHH", 0xFEFF, version, 0, 0x20, 2))
+    out += struct.pack(">IIII", 0x20, len(data_blk), 0x20 + len(data_blk), len(wave_blk))
+    out += data_blk + wave_blk
+    out += b"\x00" * ((-len(out)) % 32)
+    struct.pack_into(">I", out, 8, len(out))
+    return bytes(out), bytes(wave_data)
+
+
+def build_rseq(mml: bytes) -> bytes:
+    data = b"DATA" + struct.pack(">II", 0x0C + len(mml), 0x0C) + mml
+    data += b"\x00" * ((-len(data)) % 4)
+    labl = b"LABL" + struct.pack(">II", 12, 0)
+    out = bytearray(b"RSEQ" + struct.pack(">HHIHH", 0xFEFF, 0x0100, 0, 0x20, 2))
+    out += struct.pack(">IIII", 0x20, len(data), 0x20 + len(data), len(labl))
+    out += data + labl
+    struct.pack_into(">I", out, 8, len(out))
+    return bytes(out)
+
+
+def build_brsar_seq(seqs: list, bank: tuple[bytes, bytes]) -> bytes:
+    """BRSAR con un RSEQ por secuencia y un banco: seqs = [(nombre, mml, volumen)]."""
+    ref = lambda off: struct.pack(">BBHI", 1, 0, 0, off)
+    rbnk, wave_data = bank
+    files = [build_rseq(m) for _n, m, _v in seqs] + [rbnk]
+    names = [n for n, *_ in seqs] + ["BANCO"]
+    symb_body = bytearray(struct.pack(">5I", 0x14, 0, 0, 0, 0))
+    table = len(symb_body)
+    symb_body += struct.pack(">I", len(names)) + b"\x00" * (4 * len(names))
+    for i, n in enumerate(names):
+        struct.pack_into(">I", symb_body, table + 4 + 4 * i, len(symb_body))
+        symb_body += n.encode() + b"\x00"
+    symb = b"SYMB" + struct.pack(">I", 8 + len(symb_body)) + bytes(symb_body)
+    symb += b"\x00" * ((-len(symb)) % 32)
+    info = bytearray(b"\x00" * 0x30)
+
+    def put(blob):
+        info.extend(b"\x00" * ((-len(info)) % 4))
+        off = len(info)
+        info.extend(blob)
+        return off
+    bank_file = len(seqs)
+    sound_offs = []
+    for i, (_n, _m, vol) in enumerate(seqs):
+        sub = put(struct.pack(">IIIBB2x", 0, 0, 1, 64, 0))         # SeqSoundInfo: inicio 0, banco 0, pista 0
+        common = bytearray(struct.pack(">III", i, i, 0) + b"\x00" * 8 + struct.pack(">BBBB", vol, 64, 1, 0))
+        common += ref(sub) + b"\x00" * 10
+        sound_offs.append(put(bytes(common)))
+    sound_tbl = put(struct.pack(">I", len(seqs)) + b"".join(ref(o) for o in sound_offs))
+    bank_info = put(struct.pack(">II", len(seqs), bank_file))
+    bank_tbl = put(struct.pack(">I", 1) + ref(bank_info))
+    finfos = []
+    for k, f in enumerate(files):
+        pos = put(struct.pack(">II", 0, k))
+        pos_tbl = put(struct.pack(">I", 1) + ref(pos))
+        finfos.append(put(struct.pack(">III", len(f), len(wave_data) if k == bank_file else 0, 1) + b"\x00" * 8 +
+                          ref(pos_tbl)))
+    file_tbl = put(struct.pack(">I", len(files)) + b"".join(ref(o) for o in finfos))
+    item_offs = []
+    cur = 0
+    for k, f in enumerate(files):
+        item_offs.append(put(struct.pack(">IIIII", k, cur, len(f), 0, len(wave_data) if k == bank_file else 0)))
+        cur += len(f)
+    item_tbl = put(struct.pack(">I", len(files)) + b"".join(ref(o) for o in item_offs))
+    group = put(struct.pack(">Ii", 0, 1) + b"\x00" * 8 + struct.pack(">IIII", 0, 0, 0, 0) + ref(item_tbl))
+    group_tbl = put(struct.pack(">I", 1) + ref(group))
+    info[0:8] = ref(sound_tbl)
+    info[8:16] = ref(bank_tbl)
+    info[0x18:0x20] = ref(file_tbl)
+    info[0x20:0x28] = ref(group_tbl)
+    info_blk = bytearray(b"INFO" + struct.pack(">I", 8 + len(info)) + bytes(info))
+    info_blk += b"\x00" * ((-len(info_blk)) % 32)
+    header_size = 0x40
+    file_blk_off = header_size + len(symb) + len(info_blk)
+    files_off = file_blk_off + 0x20
+    files_blob = b"".join(files)
+    wave_off = files_off + len(files_blob)
+    struct.pack_into(">IIII", info_blk, 8 + group + 0x10, files_off, len(files_blob), wave_off, len(wave_data))
+    file_blk = b"FILE" + struct.pack(">I", 0x20 + len(files_blob) + len(wave_data)) + b"\x00" * 0x18 + files_blob + \
+        wave_data
+    out = bytearray(b"RSAR" + struct.pack(">HHIHH", 0xFEFF, 0x0103, 0, header_size, 3))
+    out += struct.pack(">IIIIII", header_size, len(symb), header_size + len(symb), len(info_blk), file_blk_off,
+                       len(file_blk))
+    out += b"\x00" * (header_size - len(out))
+    out += symb + bytes(info_blk) + file_blk
+    struct.pack_into(">I", out, 8, len(out))
+    return bytes(out)

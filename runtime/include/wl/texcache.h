@@ -7,7 +7,9 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "wl/pack.h"
 
@@ -61,7 +63,38 @@ private:
 };
 
 #ifdef WL_WITH_GL
-// Implementación con OpenGL ES (gl_upload.cpp). gles3 = el contexto soporta ETC2 y swizzle.
+// Lo que el contexto GL actual ofrece para texturas (gl_query_caps requiere un contexto activo).
+struct GlCaps {
+    bool queried = false;
+    int major = 2, minor = 0;
+    bool es = true;
+    bool etc2 = false;          // se suben ETC2/EAC comprimidas (GLES 3 las exige en el núcleo)
+    bool swizzle = false;       // GL_TEXTURE_SWIZZLE_* (GLES 3)
+    bool force_decode = false;  // WL_SIN_ETC2=1: probar la ruta de respaldo en un equipo con ETC2
+    int max_texture_size = 0;
+    std::string vendor, renderer, version, glsl;
+    std::vector<uint32_t> compressed;  // GL_COMPRESSED_TEXTURE_FORMATS
+    bool lists(uint32_t gl_format) const;
+};
+GlCaps gl_query_caps();
+std::string gl_caps_report(const GlCaps& caps);
+
+enum class UploadRoute : uint8_t { Native, Decoded, Uncompressed, Failed };
+const char* upload_route_name(UploadRoute r);
+struct UploadResult {
+    uint32_t tex = 0;
+    UploadRoute route = UploadRoute::Failed;
+    int levels = 0;           // niveles subidos
+    uint32_t gl_error = 0;    // error de GL que obligó al respaldo (0 si no hubo)
+    size_t gpu_bytes = 0;     // lo que ocupa en la GPU
+    size_t temp_bytes = 0;    // búfer temporal usado (ya liberado)
+    const char* reason = "";
+};
+// Sube la textura por la ruta que el contexto permite; si ETC2/EAC no está (o el driver lo rechaza), descomprime cada
+// nivel en la CPU y lo sube sin comprimir.
+UploadResult gl_upload_ex(const PackEntry& e, const uint8_t* data, const GlCaps& caps);
+// Implementación con OpenGL ES (gl_upload.cpp). gles3 = el contexto soporta ETC2 y swizzle; si no, se usa el
+// respaldo.
 uint32_t gl_upload(const PackEntry& e, const uint8_t* data, bool gles3);
 void gl_delete(uint32_t tex);
 #endif

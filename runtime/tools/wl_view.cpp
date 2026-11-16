@@ -95,35 +95,45 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return 1;
     }
-    bool gles3 = (pack.flags() & wl::PACK_FLAG_GLES3) != 0;
+    // Se pide GLES 3 (ETC2/EAC en el núcleo); si el sistema no lo da, GLES 2 y las texturas comprimidas van por el
+    // respaldo (descomprimidas en la CPU).
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, gles3 ? 3 : 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
     SDL_Window* win = SDL_CreateWindow("wl_view", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 640, 480,
                                        SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN_DESKTOP);
     SDL_GLContext ctx = win ? SDL_GL_CreateContext(win) : nullptr;
-    if (!ctx && gles3) {
-        std::fprintf(stderr, "sin GLES 3: el paquete usa ETC2, conviértelo con el perfil gles2\n");
-        return 1;
+    if (!ctx && win) {
+        std::fprintf(stderr, "sin GLES 3 (%s): se intenta GLES 2 con el respaldo para ETC2/EAC\n", SDL_GetError());
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+        ctx = SDL_GL_CreateContext(win);
     }
     if (!ctx) {
         std::fprintf(stderr, "GL: %s\n", SDL_GetError());
         return 1;
     }
+    if (verify && !(glGetString(GL_VERSION) && std::strstr(reinterpret_cast<const char*>(glGetString(GL_VERSION)),
+                                                            "ES 3"))) {
+        std::printf("%sla verificación necesita GLES 3 (texelFetch)\nVERIFICACION CON PROBLEMAS\n",
+                    wl::gl_caps_report(wl::gl_query_caps()).c_str());
+        return 1;
+    }
     SDL_GL_SetSwapInterval(1);
     if (verify) {
+        // Diagnóstico reproducible: qué ofrece el contexto, qué ruta toma cada formato y si la GPU lee cada nivel
+        // igual que el decodificador de la CPU (nativa y respaldo). Todo va a log.txt en el port.
         std::string rep;
         const wl::GpuCheckResult r = wl::gpu_check_textures(pack, 0, &rep);
-        std::printf("GL_RENDERER: %s\ntexturas comprimidas: %d revisadas, %d idénticas, %d a 1 de diferencia "
-                    "(11 bits), %d con diferencias, %d sin revisar\n%s",
-                    glGetString(GL_RENDERER), r.checked, r.exact, r.close, r.failed, r.skipped, rep.c_str());
+        std::printf("%stexturas comprimidas: %d revisadas, %d idénticas, %d a 1 de diferencia (11 bits), %d con "
+                    "diferencias, %d sin revisar\n",
+                    rep.c_str(), r.checked, r.exact, r.close, r.failed, r.skipped);
         if (!r.first_problem.empty()) std::printf("primera diferencia: %s\n", r.first_problem.c_str());
-        std::printf("%s\n", r.failed == 0 && r.checked > 0 ? "VERIFICACION OK" : "VERIFICACION CON PROBLEMAS");
+        std::printf("%s\n", r.ok() ? "VERIFICACION OK" : "VERIFICACION CON PROBLEMAS");
         std::fflush(stdout);
         SDL_GL_DeleteContext(ctx);
         SDL_DestroyWindow(win);
         SDL_Quit();
-        return r.failed == 0 && r.checked > 0 ? 0 : 1;
+        return r.ok() ? 0 : 1;
     }
     // En PortMaster, gptokeyb también convierte la cruceta en flechas del teclado. Si hay mando,
     // se ignoran las teclas (salvo Escape) para que cada pulsación avance una sola textura.
@@ -133,7 +143,9 @@ int main(int argc, char** argv) {
 
     int sw = 640, sh = 480;
     SDL_GL_GetDrawableSize(win, &sw, &sh);
-    std::printf("GL_RENDERER: %s\nGL_VERSION: %s\n", glGetString(GL_RENDERER), glGetString(GL_VERSION));
+    const wl::GlCaps caps = wl::gl_query_caps();
+    const bool gles3 = caps.major >= 3;
+    std::printf("%s", wl::gl_caps_report(caps).c_str());
 
     GLuint prog = glCreateProgram();
     glAttachShader(prog, compile(GL_VERTEX_SHADER, gles3 ? VS3 : VS2));
@@ -146,17 +158,26 @@ int main(int argc, char** argv) {
 
     // Cargar todas las texturas: así se mide el tiempo de subida y la memoria real.
     std::vector<GLuint> ids(textures.size(), 0);
-    uint64_t bytes = 0;
-    int failed = 0;
+    std::vector<wl::UploadRoute> routes(textures.size(), wl::UploadRoute::Failed);
+    uint64_t bytes = 0, gpu_bytes = 0;
+    int failed = 0, decoded = 0;
     const uint32_t t0 = SDL_GetTicks();
     for (size_t i = 0; i < textures.size(); ++i) {
         const wl::PackEntry& e = pack.entry(textures[i]);
-        ids[i] = wl::gl_upload(e, pack.data(e), gles3);
-        if (!ids[i]) ++failed;
+        const wl::UploadResult up = wl::gl_upload_ex(e, pack.data(e), caps);
+        ids[i] = up.tex;
+        routes[i] = up.route;
+        if (!up.tex) {
+            ++failed;
+            if (failed <= 5) std::printf("  sin subir: %s (%s)\n", pack.name(e), up.reason);
+        }
+        if (up.route == wl::UploadRoute::Decoded) ++decoded;
         bytes += e.data_size;
+        gpu_bytes += up.gpu_bytes;
     }
-    std::printf("%zu texturas subidas en %u ms (%.2f MiB), %d con error\n", textures.size(), SDL_GetTicks() - t0,
-                bytes / 1048576.0, failed);
+    std::printf("%zu texturas subidas en %u ms (%.2f MiB en el paquete, %.2f MiB en la GPU), %d por el respaldo, "
+                "%d con error\n",
+                textures.size(), SDL_GetTicks() - t0, bytes / 1048576.0, gpu_bytes / 1048576.0, decoded, failed);
 
     size_t cur = 0;
     bool fit = true, running = true, dirty = true;
@@ -214,8 +235,9 @@ int main(int argc, char** argv) {
         glEnableVertexAttribArray(1);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         SDL_GL_SwapWindow(win);
-        std::printf("[%zu/%zu] %s  %s %ux%u m%u\n", cur + 1, textures.size(), pack.name(e),
-                    wl::out_format_name(wl::OutFormat(e.format)), e.width, e.height, e.count);
+        std::printf("[%zu/%zu] %s  %s %ux%u m%u  ruta %s\n", cur + 1, textures.size(), pack.name(e),
+                    wl::out_format_name(wl::OutFormat(e.format)), e.width, e.height, e.count,
+                    wl::upload_route_name(routes[cur]));
         std::fflush(stdout);
     }
     for (GLuint id : ids)

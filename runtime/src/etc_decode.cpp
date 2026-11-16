@@ -1,7 +1,10 @@
-// Decodificador ETC2/EAC de referencia (en la CPU) para comprobar lo que devuelve la GPU (wl_view --verificar,
-// choya_render --verificar). Cubre lo que produce el conversor (choya/etc.py): ETC1 individual y diferencial sin
-// desbordes, EAC de 8 bits (alfa de RGBA8_EAC), EAC de 11 bits (R11/RG11) y el alfa de 1 bit (RGB8A1) en modo
-// diferencial. Un bloque en modo T, H o planar devuelve false: el conversor nunca los escribe.
+// Decodificador ETC2/EAC completo en la CPU (Khronos, OpenGL ES 3.0, anexo C). Sirve para dos cosas:
+//   - comprobar lo que devuelve la GPU (wl_view --verificar, choya_render --verificar);
+//   - el respaldo de gl_upload: si el contexto no acepta ETC2/EAC (GLES 2, driver que rechaza el formato o
+//     WL_SIN_ETC2=1), cada nivel se descomprime aquí y se sube sin comprimir.
+// Cubre ETC1 individual y diferencial, los modos T, H y planar de ETC2, el alfa de 1 bit (RGB8A1, también en T y H),
+// EAC de 8 bits (alfa de RGBA8_EAC) y EAC de 11 bits sin signo (R11/RG11). Las variantes con signo y sRGB no las
+// escribe el conversor y devuelven false.
 #include <cstring>
 
 #include "wl/format.h"
@@ -27,23 +30,103 @@ uint64_t be64(const uint8_t* p) {
 }
 int clamp255(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
 
-// Color de un bloque ETC1/ETC2 (16 píxeles en orden de filas: out[y*4+x]). punch: formato RGB8A1.
+const int kEtc2Dist[8] = {3, 6, 11, 16, 23, 32, 41, 64};
+
+int ext4(int v) { return (v << 4) | v; }
+int ext5(int v) { return (v << 3) | (v >> 2); }
+int ext6(int v) { return (v << 2) | (v >> 4); }
+int ext7(int v) { return (v << 1) | (v >> 6); }
+
+// Índice de 2 bits del píxel (x, y) del bloque: bit menos significativo en j, el más significativo en j + 16.
+int pixel_index(uint32_t lo, int x, int y) {
+    const int j = x * 4 + y;
+    return int((((lo >> (j + 16)) & 1) << 1) | ((lo >> j) & 1));
+}
+
+// Modos T y H: cuatro colores de pintura; con alfa de 1 bit y "opaco" en 0, el índice 2 es negro transparente.
+void paint_block(const int paint[4][3], uint32_t lo, bool opaque, uint8_t out[16][4]) {
+    for (int x = 0; x < 4; ++x)
+        for (int y = 0; y < 4; ++y) {
+            const int idx = pixel_index(lo, x, y);
+            uint8_t* px = out[y * 4 + x];
+            if (!opaque && idx == 2) {
+                px[0] = px[1] = px[2] = px[3] = 0;
+                continue;
+            }
+            for (int c = 0; c < 3; ++c) px[c] = uint8_t(clamp255(paint[idx][c]));
+            px[3] = 255;
+        }
+}
+
+// Color de un bloque ETC1/ETC2 (16 píxeles en orden de filas: out[y*4+x]). punch: formato RGB8A1 (el bit
+// diferencial pasa a ser "opaco" y siempre se usa el modo diferencial o T/H/planar).
 bool color_block(uint64_t w, bool punch, uint8_t out[16][4]) {
     const uint32_t hi = uint32_t(w >> 32), lo = uint32_t(w);
-    const bool diff = (hi >> 1) & 1;  // en RGB8A1, "opaco"
+    const bool diff = punch || ((hi >> 1) & 1);
+    const bool opaque = !punch || ((hi >> 1) & 1);
     const bool flip = hi & 1;
     const int t[2] = {int((hi >> 5) & 7), int((hi >> 2) & 7)};
     int base[2][3];
-    if (punch || diff) {
+    if (diff) {
+        int r5[3], d3[3];
         for (int c = 0; c < 3; ++c) {
             const int s5 = 27 - 8 * c;
-            const int r5 = int((hi >> s5) & 31);
-            int dd = int((hi >> (s5 - 3)) & 7);
-            if (dd >= 4) dd -= 8;
-            const int r5b = r5 + dd;
-            if (r5b < 0 || r5b > 31) return false;  // modo T/H/planar
-            base[0][c] = (r5 << 3) | (r5 >> 2);
-            base[1][c] = (r5b << 3) | (r5b >> 2);
+            r5[c] = int((hi >> s5) & 31);
+            d3[c] = int((hi >> (s5 - 3)) & 7);
+            if (d3[c] >= 4) d3[c] -= 8;
+        }
+        const bool over_r = r5[0] + d3[0] < 0 || r5[0] + d3[0] > 31;
+        const bool over_g = r5[1] + d3[1] < 0 || r5[1] + d3[1] > 31;
+        const bool over_b = r5[2] + d3[2] < 0 || r5[2] + d3[2] > 31;
+        if (over_r) {  // modo T
+            const int c1[3] = {ext4(int(((w >> 59) & 3) << 2 | ((w >> 56) & 3))), ext4(int((w >> 52) & 15)),
+                               ext4(int((w >> 48) & 15))};
+            const int c2[3] = {ext4(int((w >> 44) & 15)), ext4(int((w >> 40) & 15)), ext4(int((w >> 36) & 15))};
+            const int d = kEtc2Dist[((w >> 34) & 3) << 1 | ((w >> 32) & 1)];
+            int paint[4][3];
+            for (int c = 0; c < 3; ++c) {
+                paint[0][c] = c1[c];
+                paint[1][c] = c2[c] + d;
+                paint[2][c] = c2[c];
+                paint[3][c] = c2[c] - d;
+            }
+            paint_block(paint, lo, opaque, out);
+            return true;
+        }
+        if (over_g) {  // modo H
+            const int c1[3] = {ext4(int((w >> 59) & 15)), ext4(int(((w >> 56) & 7) << 1 | ((w >> 52) & 1))),
+                               ext4(int(((w >> 51) & 1) << 3 | ((w >> 47) & 7)))};
+            const int c2[3] = {ext4(int((w >> 43) & 15)), ext4(int((w >> 39) & 15)), ext4(int((w >> 35) & 15))};
+            const int v1 = (c1[0] << 16) | (c1[1] << 8) | c1[2], v2 = (c2[0] << 16) | (c2[1] << 8) | c2[2];
+            const int d = kEtc2Dist[((w >> 34) & 1) << 2 | ((w >> 32) & 1) << 1 | (v1 >= v2 ? 1 : 0)];
+            int paint[4][3];
+            for (int c = 0; c < 3; ++c) {
+                paint[0][c] = c1[c] + d;
+                paint[1][c] = c1[c] - d;
+                paint[2][c] = c2[c] + d;
+                paint[3][c] = c2[c] - d;
+            }
+            paint_block(paint, lo, opaque, out);
+            return true;
+        }
+        if (over_b) {  // modo planar (siempre opaco)
+            const int o[3] = {ext6(int((w >> 57) & 63)), ext7(int(((w >> 56) & 1) << 6 | ((w >> 49) & 63))),
+                              ext6(int(((w >> 48) & 1) << 5 | ((w >> 43) & 3) << 3 | ((w >> 39) & 7)))};
+            const int hh[3] = {ext6(int(((w >> 34) & 31) << 1 | ((w >> 32) & 1))), ext7(int((w >> 25) & 127)),
+                               ext6(int((w >> 19) & 63))};
+            const int v[3] = {ext6(int((w >> 13) & 63)), ext7(int((w >> 6) & 127)), ext6(int(w & 63))};
+            for (int y = 0; y < 4; ++y)
+                for (int x = 0; x < 4; ++x) {
+                    uint8_t* px = out[y * 4 + x];
+                    for (int c = 0; c < 3; ++c)
+                        px[c] = uint8_t(clamp255((x * (hh[c] - o[c]) + y * (v[c] - o[c]) + 4 * o[c] + 2) >> 2));
+                    px[3] = 255;
+                }
+            return true;
+        }
+        for (int c = 0; c < 3; ++c) {
+            base[0][c] = ext5(r5[c]);
+            base[1][c] = ext5(r5[c] + d3[c]);
         }
     } else {
         for (int c = 0; c < 3; ++c) {
@@ -51,11 +134,9 @@ bool color_block(uint64_t w, bool punch, uint8_t out[16][4]) {
             base[1][c] = int((hi >> (24 - 8 * c)) & 15) * 17;
         }
     }
-    const bool opaque = !punch || diff;
     for (int x = 0; x < 4; ++x) {
         for (int y = 0; y < 4; ++y) {
-            const int j = x * 4 + y;
-            const int idx = int((((lo >> (j + 16)) & 1) << 1) | ((lo >> j) & 1));
+            const int idx = pixel_index(lo, x, y);
             const int sub = flip ? (y >= 2) : (x >= 2);
             const int a = kEtc1[t[sub]][0], b = kEtc1[t[sub]][1];
             uint8_t* px = out[y * 4 + x];

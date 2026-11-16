@@ -37,6 +37,7 @@ python -m choya convert C:\wii\RSPE01 C:\wii\salida --preview
 - `salida/assets.wlpk` es el paquete para la consola.
 - `salida/report.md` compara memoria antes y después, muestra los formatos usados y las texturas con menor calidad (PSNR).
 - `--preview` guarda PNG y WAV del resultado para revisarlos en la PC.
+- Desde la 0.42.0, las **secuencias** de los BRSAR (RSEQ con instrumentos de un RBNK) se prerenderizan a PCM con su bucle y entran al paquete con la misma clave que los efectos (`archivo.brsar/NOMBRE`). `--sin-secuencias` las deja en el disco (más rápido). El reporte tiene una sección "Secuencias" con lo que se ejecutó, lo que no se aplica (efectos, filtro) y cuáles son interactivas.
 
 ### Perfiles (`-p`)
 
@@ -103,7 +104,8 @@ python -m choya package C:\wii\ports --title "Choya Modelos" --folder choyamodel
 | X | Activar o desactivar el descarte de caras traseras |
 | Y | Material TEV / sombreado simple |
 | Select | Texturas sí / no (modo simple) |
-| R2 / L2 (teclado: N) | Animación siguiente / anterior (después de la última, la pose de reposo) |
+| R2 / L2 (teclado: N) | Grupo de animaciones siguiente / anterior: la CHR0 y las SRT0/CLR0/PAT0/VIS0 del mismo nombre, con un solo reloj (después del último, la pose y los materiales de reposo) |
+| L3 (teclado: E) | Escena SCN0 siguiente (luces por conjunto, cámaras de `ref_camera`); después de la última, la luz y la cámara del visor |
 | Start | Salir |
 
 Desde la 0.3, cada material se dibuja con su **TEV** traducido a GLSL ES 3.00: etapas, texturas por unidad, coordenadas de reflejo calculadas desde la normal, registros de color y konstantes, tablas de intercambio, prueba de alfa, mezcla y profundidad. El botón Y alterna entre TEV y el sombreado simple para comparar. Desde la 0.21, cada material lleva también sus **matrices de textura** (la SRT de `ResTexSrtData` por la matriz de efecto, como `LoadResTexSrt` de NW4R: escala, giro y traslación de UV, también sobre los mapas de entorno) y sus **canales de luz** (`ResChanData`: color de material y ambiente, del registro o del vértice, con la luz encendida o apagada y la función difusa del canal, como el XF de GX; la luz es una direccional blanca desde el visor). Los modelos con **piel** guardan hasta 4 huesos por vértice (los objetos atados a un hueso y las mezclas de `NodeMix`), y las animaciones **CHR0** del disco se hornean para cada modelo que tiene todos sus huesos (cuadros clave de Hermite FVS32/48/96 y valores por cuadro CV8/16/32, la pose como `CalcWorld` con la compensación de escala de Maya); el vértice las aplica en la GPU.
@@ -118,11 +120,40 @@ mkdir -p /mnt/c/wii/render
 runtime/build-pc/choya_render /mnt/c/wii/salida/assets.wlpk /mnt/c/wii/render bwg_pin --max 5
 ```
 
-Agrega `--simple` para ver el sombreado simple y `--size 1024` para imágenes más grandes. `--cuadro 20` guarda además cada modelo con huesos en el cuadro 20 de cada una de sus animaciones (`modelo@animación.png`), `--doble` dibuja también las caras traseras y `--verificar` compara cada textura ETC2/EAC como la lee la GPU con el decodificador de la CPU.
+Agrega `--simple` para ver el sombreado simple y `--size 1024` para imágenes más grandes. `--cuadro 20` guarda además cada modelo en el cuadro 20 de cada grupo de animaciones (`modelo@grupo.png`: CHR0 y SRT0/CLR0/PAT0/VIS0 del mismo nombre), `--escena` (o `--escena texto`) usa las luces y cámaras de una escena SCN0 del paquete y escribe el diagnóstico (`[escena] ...`), `--doble` dibuja también las caras traseras y `--verificar` compara cada textura ETC2/EAC como la lee la GPU con el decodificador de la CPU. `WL_SIN_ETC2=1` fuerza la ruta de respaldo (texturas descomprimidas en la CPU) y `WL_TEV_CONSTANTES=1` vuelve al shader de constantes de la 0.41 (sin animaciones de material ni escena), para comparar.
+
+Sin el paquete de desarrollo de GLES (`libgles-dev`), las cabeceras de `tests/stubs` alcanzan para compilar contra la `libGLESv2.so.2` de Mesa:
+
+```sh
+cmake -S runtime -B runtime/build -DWL_WITH_GL=OFF -DWL_BUILD_RENDER=ON -DCMAKE_CXX_FLAGS="-I$PWD/tests/stubs" \
+  -DEGL_LIB=/usr/lib/x86_64-linux-gnu/libEGL.so.1 -DGLES_LIB2=/usr/lib/x86_64-linux-gnu/libGLESv2.so.2
+cmake --build runtime/build
+```
 
 ### Confirmar el códec ETC2/EAC en la Mali-G31
 
-Arma el port de `wl_view` (sección 5) y crea un archivo vacío llamado `verificar` en la carpeta del port. Al abrirlo, `wl_view` sube cada textura ETC2/EAC del paquete, la dibuja tal cual (`texelFetch` del nivel 0), la lee de vuelta y la compara con su decodificador de la CPU; escribe en `log.txt` cuántas revisó por formato, cuántas salieron idénticas y la primera diferencia, termina con `VERIFICACION OK` o `VERIFICACION CON PROBLEMAS` y sale. En la PC, con Mesa, la misma prueba sale idéntica en todos los formatos (`tests/test_etc_gpu.py`). R11/RG11 pasan por 11 bits y pueden diferir en 1 al pasar a 8.
+Arma el port de `wl_view` (sección 5) y crea un archivo vacío llamado `verificar` en la carpeta del port. Al abrirlo, `wl_view` escribe en `log.txt` y sale:
+
+- **Lo que ofrece el contexto:** `GL_VENDOR`, `GL_RENDERER`, `GL_VERSION`, `GL_SHADING_LANGUAGE_VERSION`, `GL_MAX_TEXTURE_SIZE`, cuáles de los cinco formatos ETC2/EAC anuncia el driver y qué ruta se usará: nativa (`glCompressedTexImage2D`) o respaldo.
+- **Cada textura ETC2/EAC del paquete, en todos sus niveles de mipmap:**
+  - **Ruta nativa:** se sube comprimida, se lee con `texelFetch` y se compara con el decodificador de la CPU (ETC1, diferencial, T, H y planar; alfa de 1 bit; EAC de 8 y 11 bits).
+  - **Ruta de respaldo:** se descomprime en la CPU y se sube sin comprimir; debe dar lo mismo.
+  - **RGB8A1:** se dibuja con descarte por alfa y deben quedar justo los píxeles opacos.
+- **Resultado:** cuántas texturas revisó por formato, la primera diferencia y al final `VERIFICACION OK` o `VERIFICACION CON PROBLEMAS`. R11/RG11 pasan por 11 bits y pueden diferir en 1 al pasar a 8.
+
+Para probar sin tus datos, `python -m choya prueba-etc C:\wii\prueba-etc` escribe un paquete sintético y `LEEME-prueba-etc.txt` con los pasos y el resultado esperado. El paquete tiene:
+
+- bloques al azar de los cinco formatos, que cubren todos los modos;
+- tamaños que no son múltiplo de 4, con la cadena completa de mipmaps;
+- cuatro imágenes para mirar: un círculo transparente en RGB8A1, un degradado de alfa, intensidad, e intensidad con alfa.
+
+Si el contexto no tiene ETC2/EAC (GLES 2, o un formato que el driver rechaza) o se exporta `WL_SIN_ETC2=1`, `gl_upload` descomprime cada nivel en la CPU, en un búfer temporal que se libera al terminar la textura, y la sube sin comprimir:
+
+- RGB8 se sube como RGB;
+- RGBA8 y RGB8A1 como RGBA;
+- R11 y RG11 con intensidad como luminancia/alfa (8 bits).
+
+En la PC, con Mesa, `tests/test_etc2_completo.py` hace la misma revisión contra el decodificador ETC2 de Mesa, que es una referencia independiente. **En la RG35XX H sigue pendiente:** hace falta el `log.txt` de la consola.
 
 ## 7. Conectar con la capa GX del juego
 
@@ -289,6 +320,29 @@ En la consola los gráficos los dibuja el motor GLES de Choya en vez de Dawn. au
 - **0.33.0: resolución interna elegible.** Medido en la consola con la 0.32.0 y PGO: el juego va a 22–25 cuadros por segundo pero la pantalla a ~17, porque la GPU tarda 48–66 ms por cuadro: ~25 ms en dibujos y ~27 ms en las 10 copias del EFB (en cada una la Mali guarda el EFB entero de 674x556 y lo vuelve a leer). El lanzador ahora elige la resolución interna de WiiCompiled (`resolution_multiplier`, 480 líneas por 1): archivo vacío `resolucion-075` (0.75, EFB de ~506x417, 44 % menos píxeles en los dibujos y en cada copia) o `resolucion-05` (0.5); `CHOYA_RESOLUCION=1|0.75|0.5` manda sobre los archivos. Sin archivo sigue en 1. El resumen dice cuál se usó y el tamaño del EFB. Además, el contador "líneas/puntos" del motor separa tres causas: líneas o puntos de verdad, dibujos con "cull todo" (en GX no pintan nada: saltarlos es lo correcto) e instanciados.
 - **0.34.0: vuelta al EFB perezosa.** Medido con la 0.33.0 a resolución 0.75 en tenis: la GPU ya solo tarda ~30 ms por cuadro, pero el hilo de la pantalla tarda ~50 porque en cada una de las 19 copias del EFB espera ~1.3 ms dentro del driver (rotar las copias o no invalidar el EFB no lo cambian: 23–27 ms de copias por cuadro en las tres pruebas). Ahora una copia deja enlazada su textura y el EFB se vuelve a enlazar solo cuando algo lo usa (dibujo, borrado, pase, paleta, pantalla): las copias seguidas, sin dibujos en medio, ya no van y vuelven. El informe separa cuántas copias fueron seguidas y, del cambio a la textura, cuánto es enlazarla y cuánto invalidarla, para saber dónde espera el driver. El archivo vacío `sin-vuelta-perezosa` (`CHOYA_GX_VUELTA_PEREZOSA=0`) vuelve a lo de antes.
 - **0.35.0: `CHOYA_OPT=pgo-lto`.** El perfil del hilo del juego con nombres (`choya perfil --exe`, tenis, 0.33.0) dice que de ~51 ms por cuadro, ~31 son código traducido del juego (ya con PGO), ~9 el GX del runtime y aurora en el hilo del juego, y ~3 el hilo de sonido; hay funciones pequeñas del juego llamadas miles de veces por cuadro (`fn_8029653C`, ~17 000). El nuevo modo compila el código traducido con PGO y ThinLTO (`-flto=thin`): lld lo optimiza junto al enlazar y puede integrar funciones de un archivo en otro, cosa que la compilación por archivos no puede. Va en su propia carpeta (`build-wiisports-arm64-pgolto`), usa el mismo perfil que `pgo`, el enlace tarda más (los mismos trabajos a la vez que la compilación) y guarda una caché ThinLTO para la próxima vez.
+- **0.42.0: animaciones de material, escenas, secuencias y ETC2 completo.** Lo que estaba en "Pendiente":
+  - **ETC2/EAC:**
+    - El decodificador de la CPU cubre todos los modos (T, H, planar y el alfa de 1 bit en ellos).
+    - `gl_upload` tiene una ruta de respaldo que descomprime y sube sin comprimir cuando el contexto no tiene ETC2 o el driver rechaza un formato.
+    - Una cadena de mipmaps cortada ya no deja la textura incompleta.
+    - `wl_view --verificar` informa versión y extensiones de GL, la ruta de cada formato, todos los niveles, la ruta de respaldo y el descarte de RGB8A1.
+    - `choya prueba-etc` arma un paquete de prueba sin datos del juego.
+  - **SRT0/CLR0/PAT0/VIS0** (`choya/anim_mat.py`):
+    - Se leen como ogws y se hornean para cada modelo: los nombres pasan a índices, las texturas de PAT0 a claves del paquete, las matrices se recalculan como `LoadResTexSrt` y los colores salen con la máscara de `ApplyClrAnmResult`.
+    - Van en entradas nuevas `CMAN` (tipo 5).
+    - En el runtime, el TEV pasa colores, konstantes, matrices de textura y luces a uniformes, así que una animación nunca recompila.
+    - `choya_model` y `choya_render` reproducen juntas la CHR0 y las de material del mismo nombre, con un solo reloj y el estado base restaurado en cada cuadro.
+  - **Escenas SCN0** (`choya/scn0.py`, entradas `CSCN` tipo 6):
+    - Se leen conjuntos de luces, ambientes, luces (punto, direccional, foco, especular, con los coeficientes de `GXInitLightSpot` y `GXInitLightDistAttn`) y cámaras (ROTATE/AIM como `Camera::UpdateCameraMtx`).
+    - Los materiales usan las luces de su `light_set_idx`, hasta 4 por material.
+    - `ref_camera` y `ref_light` siguen a `ScnDependentMtxFunc` de `g3d_state.cpp`.
+    - Sin escena se usan la luz y la cámara del visor, y el diagnóstico lo dice.
+    - `CMDL` 4 guarda `light_set_idx`, `ref_camera`/`ref_light` y la visibilidad por nodo, en bytes que la versión 3 dejaba en cero; los paquetes viejos se dibujan igual.
+  - **Secuencias** (`choya/rseq.py`):
+    - Intérprete del MML de NW4R (notas, esperas, pistas, saltos, llamadas, bucles con contador, variables, aleatorios, ejecución condicional) y sintetizador con bancos RBNK (rangos e índices, envolvente ADSR, LFO, barrido, portamento, afinación).
+    - El bucle de la música se detecta y se renderiza con dos vueltas para que no corte notas.
+    - Lo que no se puede reproducir (efectos, `userproc`, variables que cambia el juego) se cuenta en el reporte.
+- **0.41.0: prioridad del hilo GX ajustable, -3 por omisión.** Medido con la 0.40.0 (mali-cmar en el núcleo 2 y el hilo GX con nice -10): el juego volvió a ~32.5–34 cuadros/s (el hilo GX esperó turno 1–2 % y el juego solo lo esperó ~0.25 ms por cuadro), pero ahora `mali-cmar` esperó turno 29–30 % y la pantalla volvió a ~19–20 cuadros/s. Con nice 0 (prueba de la 0.39.0) fue al revés: pantalla ~24, juego ~30.5. En ese núcleo los dos hilos se reparten el turno: el que va delante gana y el otro espera. Ahora la prioridad por omisión es -3 (punto medio por medir) y un archivo `prioridad-gx` con un número (por ejemplo `-6`) la cambia sin recompilar.
 - **0.40.0: el hilo de la Mali que manda el trabajo a la GPU va al núcleo del hilo GX.** Lo que mostró la sonda de la 0.39.0 en el tenis: el hilo de la pantalla casi no duerme dentro del driver (80–84 % corre o espera turno, 16–19 % en un futex esperando a otro hilo de la Mali), y ese otro hilo, `mali-cmar-backe`, esperaba turno 34–43 % del tiempo en los núcleos 0–1 y pasa ~20–26 % dentro de `sunxi_fb_pan_display` (el cambio de imagen en la pantalla espera al vsync). Con la prueba `mali-con-hilo-gx` (ese hilo en el núcleo 2, que el hilo GX deja ~60 % libre): espera al enlazar las copias de ~17 a ~11 ms por cuadro, hilo de la pantalla de ~51 a ~41 ms por cuadro y **pantalla de ~19 a ~24 cuadros/s**; a cambio el hilo GX esperó turno 17 % (antes 5 %) y el juego bajó de ~32.5 a ~30.5 cuadros/s. Ahora va ahí por omisión y el hilo GX pasa delante en ese núcleo con nice -10 (`CHOYA_GX_PRIORIDAD`, antes -6), para que el juego no lo espere. Archivos: `mali-sin-hilo-gx` (`CHOYA_GX_MALI_CON_GX=0`) lo deja en los núcleos 0–1; `sin-prioridad-gx` quita la prioridad. La sonda gasta ~6 % de CPU en los núcleos 0–1: ahora va apagada (`con-sonda`, `CHOYA_GX_SONDA_ESPERAS=1`).
 - **0.39.0: sonda de esperas.** Medido con la 0.38.0 (tenis): las 12 copias de las sombras ya van en su zona (1 carga, ninguna devolución) y las sombras se ven bien, pero el hilo de la pantalla siguió en ~50 ms por cuadro, con ~18 ms dentro de `glBindFramebuffer` al ir a la textura de cada copia (~0.8 ms por copia, ahora también en la zona chica) y la GPU en ~17 ms por cuadro. O sea que lo caro no es guardar y cargar el EFB (ancho de banda) sino algo del driver en cada cambio de framebuffer. Para saber qué, un hilo aparte mira cada 2 ms (2 s de cada 10) el hilo de la pantalla y los de la Mali en `/proc`: si corren o en qué llamada al sistema y en qué función del núcleo duermen (`wchan`). Las líneas "motor: esperas de" del log y del resumen; `CHOYA_GX_SONDA_ESPERAS=0` (archivo `sin-sonda`) la apaga. Prueba aparte, apagada: `CHOYA_GX_MALI_CON_GX=1` (archivo `mali-con-hilo-gx`) pone el hilo `mali-cmar-backe`, que manda el trabajo a la GPU y esperaba turno ~40 % del tiempo en los núcleos 0–1, en el núcleo del hilo GX. Las zonas de trabajo se quedan: no cuestan y quitan del EFB 12 de sus 25 pases.
 - **0.38.0: zonas de trabajo, núcleo del hilo GX solo otra vez y una línea de la pantalla.** Con un volcado del tenis (MENU + R1) dibujado en la PC se vio cómo arma el cuadro Wii Sports: 12 de las 23 copias por cuadro son las sombras de los 4 jugadores, cada una dibujada en la esquina 0,0 101x101 del EFB, copiada, difuminada dos veces (un dibujo que lee la copia anterior y otra copia) y al final esa esquina se borra; otras 8 son el brillo (bloom) en la esquina 253x180, que el juego guarda antes y repone después. En la Mali cada copia guarda en memoria el EFB entero (color y profundidad) y lo vuelve a cargar al volver (~1 ms de GPU por copia; el hilo de la pantalla lo espera).
@@ -345,7 +399,7 @@ Casi todo lo que se hizo para que Wii Sports corra fluido no depende de Wii Spor
 | Sonda de esperas del hilo de la pantalla y de los de la Mali (`/proc`, 2 s de cada 10) | motor GLES | apagada desde la 0.40.0; `CHOYA_GX_SONDA_ESPERAS=1` (archivo `con-sonda`) la prende |
 | Hilo `mali-cmar` en el núcleo del hilo GX, con el hilo GX delante (nice -10) | motor GLES | encendido desde la 0.40.0; `CHOYA_GX_MALI_CON_GX=0` (archivo `mali-sin-hilo-gx`) lo apaga |
 | Zonas de trabajo: cadenas de copias en una zona chica del EFB dibujadas en un framebuffer de su tamaño | motor GLES | encendidas; `CHOYA_GX_ZONAS=0` (archivo `sin-zonas`) las apaga |
-| Prioridad alta (nice -10 desde la 0.40.0; antes -6) del hilo GX en su núcleo compartido | motor GLES | encendida; `CHOYA_GX_PRIORIDAD=0` (archivo `sin-prioridad-gx`) la quita |
+| Prioridad del hilo GX en su núcleo compartido (nice -3 desde la 0.41.0; -10 en la 0.40.0, -6 antes) | motor GLES | encendida; `CHOYA_GX_PRIORIDAD=0` (archivo `sin-prioridad-gx`) la quita; archivo `prioridad-gx` con un número la cambia |
 | Núcleo del hilo GX compartido con los demás hilos (el juego sigue solo en el suyo) | motor GLES | apagado desde la 0.38.0; `CHOYA_GX_NUCLEO_SOLO=0` (archivo `hilo-gx-compartido`) lo comparte |
 | Vuelta al EFB perezosa tras las copias (las copias seguidas no van y vuelven) | motor GLES | encendida; `CHOYA_GX_VUELTA_PEREZOSA=0` la apaga |
 | Copias del EFB, paletas sobre copias, copias tras DCFlush | motor GLES y parches del runtime | siempre |
@@ -368,14 +422,39 @@ Little-endian, alineado a 16 bytes: cabecera de 64 bytes, tabla de entradas de 4
 python -m unittest discover tests
 ```
 
-134 pruebas con datos sintéticos (algunas necesitan el runtime compilado, Mesa, el WiiCompiled real o PowerShell): Yaz0/LZ77, U8, BRRES, TPL, los 11 formatos GX, ETC2/EAC (calidad y que nunca desborde el modo diferencial), DSP-ADPCM, BRSTM con bloques entrelazados, respaldo por calidad, audio ADPCM con bucle decodificado en C++, modelos MDL0, TEV con la configuración de materiales reales compilado y dibujado en OpenGL ES por software (Mesa llvmpipe) con revisión de píxeles, conversión de punta a punta, una prueba cruzada donde el runtime C++ lee el paquete de Python (claves, caché y audio idénticos), la lectura de `main.dol` y del arranque para WiiCompiled, el cambio de direcciones del runtime de WiiCompiled y la vigilancia de la memoria del juego (montones de MEM falsos). Desde la 0.32.0 también la fiabilidad de la compilación (`tests/test_fiabilidad.py`) y `build-wiisports-arm64.sh` de punta a punta con un Docker falso (`tests/test_script_compilacion.py`): parche obligatorio que detiene, parches que se vuelven a aplicar, merge PGO fallido sin usar el perfil viejo, recurso cambiado que invalida el paquete, empaquetado fallido que conserva el port anterior y verificación (Python y `copiar-a-consola.ps1`) que detecta un archivo alterado.
+187 pruebas con datos sintéticos (algunas necesitan el runtime compilado, Mesa, el WiiCompiled real o PowerShell): Yaz0/LZ77, U8, BRRES, TPL, los 11 formatos GX, ETC2/EAC (calidad y que nunca desborde el modo diferencial), DSP-ADPCM, BRSTM con bloques entrelazados, respaldo por calidad, audio ADPCM con bucle decodificado en C++, modelos MDL0, TEV con la configuración de materiales reales compilado y dibujado en OpenGL ES por software (Mesa llvmpipe) con revisión de píxeles, conversión de punta a punta, una prueba cruzada donde el runtime C++ lee el paquete de Python (claves, caché y audio idénticos), la lectura de `main.dol` y del arranque para WiiCompiled, el cambio de direcciones del runtime de WiiCompiled y la vigilancia de la memoria del juego (montones de MEM falsos). Desde la 0.32.0 también la fiabilidad de la compilación (`tests/test_fiabilidad.py`) y `build-wiisports-arm64.sh` de punta a punta con un Docker falso (`tests/test_script_compilacion.py`): parche obligatorio que detiene, parches que se vuelven a aplicar, merge PGO fallido sin usar el perfil viejo, recurso cambiado que invalida el paquete, empaquetado fallido que conserva el port anterior y verificación (Python y `copiar-a-consola.ps1`) que detecta un archivo alterado.
+
+Desde la 0.42.0:
+
+- **`test_etc2_completo`:** todos los modos ETC2, todos los niveles, tamaños que no son múltiplo de 4, la ruta de respaldo y el descarte de RGB8A1, contra el decodificador de Mesa.
+- **`test_anim_material`:** SRT0/CLR0/PAT0/VIS0/SCN0 leídos, horneados y empaquetados; entradas cortadas, offsets malos y versiones no soportadas dan un error claro.
+- **`test_render_anim`:** el runtime dibuja las animaciones solas y con la CHR0, las luces de la escena y `ref_camera`. También comprueba que el modo con uniformes da lo mismo que el de constantes, que un CMDL 3 se dibuja igual y que el respaldo sin ETC2 sale igual.
+- **`test_rseq`:**
+  - tono, duración y tempo;
+  - instrumentos por rango e índice, afinación, envolvente, volumen, pan y pitch bend;
+  - llamadas, bucles, variables y ejecución condicional;
+  - pistas paralelas y bucle de la música;
+  - tope de duración y entradas dañadas;
+  - paso al paquete con su bucle.
 
 ## Pendiente
 
-- **Confirmar en la consola** lo que se probó en la PC con Mesa: el códec ETC2/EAC (incluido RGB8A1) en la Mali-G31 con `wl_view` y el archivo `verificar`, y las animaciones en `choya_model`.
-- **Secuencias del BRSAR** (RSEQ, música y efectos hechos como MIDI con instrumentos de un RBNK): no son audio grabado; seguirían en el disco hasta tener un secuenciador.
-- **Luces de la escena:** los modelos se iluminan con una luz direccional del visor; las luces de cada escena (`LightSet`, `SCN0`) no se leen todavía. Los modos de mapeo de NW4R por cámara o luz (`ref_camera`, `ref_light`) usan la cámara del visor.
-- **Animaciones de material** (SRT0 de texturas, CLR0 de colores, PAT0 de cambio de textura, VIS0 de visibilidad) no se leen; solo las de huesos (CHR0).
+- **Confirmar en la consola** lo que se probó en la PC con Mesa:
+  - el códec ETC2/EAC (incluido RGB8A1 y la ruta de respaldo) con `wl_view`, el archivo `verificar` y el paquete de `choya prueba-etc`;
+  - las animaciones (CHR0 con SRT0/CLR0/PAT0/VIS0), las escenas SCN0 y `ref_camera`/`ref_light` en `choya_model`, con sus FPS;
+  - las secuencias prerenderizadas al oído.
+- **Escenas:**
+  - `AnmScnRes::GetLight` (de la animación de luz a `LightObj`) no está descompilado en ogws; se reconstruyó y el reporte lo dice.
+  - La niebla (`Fogs`) se cuenta pero no se aplica.
+  - El visor dibuja hasta 4 luces por material; si hay más, el diagnóstico lo cuenta.
+- **Animaciones de material:**
+  - Las matrices indirectas de SRT0 y las paletas animadas de PAT0 se cuentan pero no se aplican.
+  - Si la matriz de efecto no es la identidad, en los modos de entorno y proyección la composición se aproxima.
+- **Secuencias:**
+  - El remuestreo es lineal y el pan usa la curva de raíz cuadrada.
+  - Faltan los efectos (reverb, coro), el filtro pasabajos, el sonido envolvente y `userproc`.
+  - La música interactiva queda en el camino que dan las variables iniciales.
+  - En el port, el juego usa su propio secuenciador de NW4R con el AX emulado; el prerender es para el paquete y el visor.
 
 ## Legal
 
