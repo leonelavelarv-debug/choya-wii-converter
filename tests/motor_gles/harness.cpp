@@ -518,6 +518,70 @@ static int census_test() {
   return 0;
 }
 
+// harness zonas N (0.38.0): una cadena de copias en la esquina 0,0 64x64 (como las sombras de Wii Sports), que el motor
+// dibuja en una zona de trabajo. Bit 0 de N: la esquina no se borra al final (hay que devolverla al EFB y se ve en la
+// pantalla); bit 1: la cadena empieza con un dibujo y no con un borrado (hay que cargar la esquina del EFB). 305 cuadros
+// (para el informe de cada 300). Imprime píxeles de la pantalla: tienen que ser iguales con las zonas encendidas y apagadas (CHOYA_GX_ZONAS=0).
+static int zones_test(int variante) {
+  const bool devolver = (variante & 1) != 0, cargar = (variante & 2) != 0;
+  gx::PipelineDesc p4 = base_desc();
+  p4.vtxStride = 20;
+  p4.attrs[GX_VA_POS] = {GX_DIRECT, 3, GX_F32, 0, 0, 0, 0, 0};
+  p4.attrs[GX_VA_TEX0] = {GX_DIRECT, 2, GX_F32, 12, 0, 0, 0, 0};
+  p4.sampledChannels = 0; p4.offChanMat[0] = 0; p4.offChanMatA[0] = 0;
+  p4.numTexGens = 1; p4.sampledTexCoords = 1;
+  p4.texgens[0] = {GX_TG_MTX2x4, GX_TG_TEX0, 0xFF, 0};
+  p4.stages[0].cd = GX_CC_TEXC; p4.stages[0].ad = GX_CA_TEXA; p4.stages[0].texCoord = 0; p4.stages[0].texMap = 0;
+  p4.offTexScale[0] = 48; p4.offTexSize[0] = 52;
+  gx::register_pipeline(4, p4);
+  gx::register_clear(500, gx::ClearDesc{1, 1, 1, 0});
+  gx::BindDesc bd{};
+  bd.samp[0] = {0, 0, 0, 0, 0, {0, 0, 0}, 0.f, 0.f};
+  bd.tex[0] = 920;
+  gx::register_bind_group(95, bd);
+  bd.tex[0] = 922;
+  gx::register_bind_group(94, bd);
+  bd.tex[0] = 0;
+  gx::register_bind_group(96, bd);
+  std::vector<uint8_t> v4;
+  float q[4][5] = {{-1,1,.5f,0,0},{1,1,.5f,1,0},{-1,-1,.5f,0,1},{1,-1,.5f,1,1}};
+  for (auto& v : q) for (float x : v) put_be_f32(v4, x);
+  std::vector<uint8_t> u4(256, 0);
+  for (int r = 0; r < 4; ++r) put_f(u4, 20 + r * 4 + r, 1.f);
+  for (int r = 0; r < 3; ++r) put_f(u4, 36 + r * 4 + r, 1.f);
+  put_f(u4, 48, 1.f); put_f(u4, 49, 1.f);
+  put_f(u4, 52, 1.f); put_f(u4, 53, 1.f);
+  std::vector<uint16_t> i4 = {0, 1, 2, 2, 1, 3};
+  const float black[4] = {0, 0, 0, 1}, blue[4] = {0, 0, 1, 1}, red[4] = {1, 0, 0, 1}, green[4] = {0, 1, 0, 1};
+  for (int n = 0; n < 305; ++n) {
+    gx::capture_begin(v4.data(), v4.size(), u4.data(), u4.size(), (const uint8_t*)i4.data(), 12, nullptr, 0);
+    gx::capture_pass(640, 480, true, true, black, 1.f, true, gx::Rect{0, 0, 640, 480});
+    gx::capture_viewport(gx::Viewport{0, 0, 64, 64, 0, 1});
+    gx::capture_scissor(gx::Rect{0, 0, 64, 64});
+    if (cargar) gx::capture_draw(4, 0, 6, 1, 0, UINT32_MAX, 96);  // blanco en toda la esquina
+    else gx::capture_clear(500, blue, 1.f, true, gx::Rect{0, 0, 64, 64});
+    gx::capture_clear(500, red, 1.f, true, gx::Rect{0, 0, 32, 64});
+    gx::capture_copy(920, gx::Rect{0, 0, 64, 64}, 64, 64, 0x6, true);
+    gx::capture_clear(500, green, 1.f, true, gx::Rect{32, 0, 32, 64});
+    gx::capture_copy(921, gx::Rect{0, 0, 64, 64}, 64, 64, 0x6, true);
+    gx::capture_draw(4, 0, 6, 1, 0, UINT32_MAX, 95);  // la esquina vuelve a ser la 920
+    gx::capture_copy(922, gx::Rect{0, 0, 64, 64}, 64, 64, 0x6, true);
+    gx::capture_viewport(gx::Viewport{0, 0, 640, 480, 0, 1});
+    if (devolver) {
+      gx::capture_scissor(gx::Rect{64, 0, 576, 480});
+    } else {
+      gx::capture_scissor(gx::Rect{0, 0, 640, 480});
+      gx::capture_clear(500, black, 1.f, true, gx::Rect{0, 0, 64, 64});
+    }
+    gx::capture_draw(4, 0, 6, 1, 0, UINT32_MAX, 94);  // la 922 estirada a la pantalla
+    gx::capture_end(true);
+    if (!gx::draw_frame(640, 480)) { std::puts("no dibujó"); return 1; }
+  }
+  std::printf("zonas %06X %06X %06X %06X %06X %06X\n", pixel(16, 16), pixel(48, 16), pixel(16, 470), pixel(48, 470),
+              pixel(160, 240), pixel(480, 240));
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (!init_egl(640, 480)) { std::puts("sin contexto GLES"); return 2; }
   if (argc >= 2 && std::strcmp(argv[1], "borrado") == 0) return clear_test();
@@ -525,6 +589,11 @@ int main(int argc, char** argv) {
   if (argc >= 3 && std::strcmp(argv[1], "paleta") == 0) return palette_test(std::atoi(argv[2]));
   if (argc >= 2 && std::strcmp(argv[1], "cola") == 0) return queue_test();
   if (argc >= 2 && std::strcmp(argv[1], "censo") == 0) return census_test();
+  if (argc >= 3 && std::strcmp(argv[1], "zonas") == 0) return zones_test(std::atoi(argv[2]));
+  if (argc >= 3 && std::strcmp(argv[1], "estructura") == 0) {  // harness estructura cuadro.bin
+    if (!gx::load_frame(argv[2])) { std::printf("no pude leer %s\n", argv[2]); return 1; }
+    return gx::describe_frame([](const char* l) { std::puts(l); }) ? 0 : 1;
+  }
   if (argc >= 3 && std::strcmp(argv[1], "tev") == 0) return tev_test(std::atoi(argv[2]));
   if (argc >= 3 && std::strcmp(argv[1], "copia-vieja") == 0) return old_copy_test(argv[2]);
   if (argc >= 5 && std::strcmp(argv[1], "sonda") == 0) return probe(argc, argv);

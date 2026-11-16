@@ -230,6 +230,34 @@ class TestMotorGles(unittest.TestCase):
             pix = raw[raw.index(b"255\n") + 4:]
             self.assertEqual(tuple(pix[(240 * 640 + 320) * 3:(240 * 640 + 320) * 3 + 3]), (255, 0, 0))
 
+            # 0.38.0: estructura de un volcado (una línea por operación).
+            out = subprocess.run([exe, "estructura", vieja], env=env, capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertRegex(out.stdout, r"\b0 pase 0 640x480 borra color 1 profundidad 1")
+            self.assertRegex(out.stdout, r"dibujo 6 índices x1; mezcla modo \d+")
+
+            # 0.38.0: zonas de trabajo. La cadena de 3 copias en la esquina 64x64 va a una zona (con o sin cargar y
+            # devolver la esquina) y la pantalla sale igual que sin zonas.
+            esperado = {0: (0.0, 0.0), 1: (0.0, 1.0), 2: (1.0, 0.0), 3: (1.0, 1.0)}
+            for variante, (cargas, devoluciones) in esperado.items():
+                con = subprocess.run([exe, "zonas", str(variante)], env=env, capture_output=True, text=True)
+                sin = subprocess.run([exe, "zonas", str(variante)], env=dict(env, CHOYA_GX_ZONAS="0"),
+                                     capture_output=True, text=True)
+                pc = re.search(r"^zonas (.*)$", con.stdout, re.M)
+                ps = re.search(r"^zonas (.*)$", sin.stdout, re.M)
+                self.assertIsNotNone(pc, con.stdout + con.stderr)
+                self.assertIsNotNone(ps, sin.stdout + sin.stderr)
+                self.assertEqual(pc.group(1), ps.group(1), variante)
+                self.assertNotIn("000000 000000 000000", pc.group(1))
+                m = re.search(r"zonas de trabajo \(por cuadro\): ([\d.]+) zonas con ([\d.]+) copias dentro .*?; "
+                              r"([\d.]+) cargas y ([\d.]+) devoluciones al EFB; la más grande 64x64", con.stdout)
+                self.assertIsNotNone(m, con.stdout)
+                self.assertEqual([float(x) for x in m.groups()], [1.0, 3.0, cargas, devoluciones], variante)
+                self.assertIn("zonas de trabajo: apagadas", sin.stdout)
+            # La esquina devuelta se ve en la pantalla (rojo y azul arriba a la izquierda).
+            una = subprocess.run([exe, "zonas", "1"], env=env, capture_output=True, text=True).stdout
+            self.assertIn("zonas 000000 000000 FF0000 0000FF FF0000 0000FF", una)
+
 
 if __name__ == "__main__":
     unittest.main()

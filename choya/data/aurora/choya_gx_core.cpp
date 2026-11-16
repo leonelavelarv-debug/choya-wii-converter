@@ -2815,6 +2815,10 @@ struct Efb {
   GLuint fbo = 0, color = 0, depth = 0;  // depth: textura (las copias del EFB de profundidad la leen)
   int width = 0, height = 0;
 } g_efb;
+// 0.38.0: dibujando en una zona de trabajo (g_efb es entonces el framebuffer de la zona; ver planear_zonas): las
+// coordenadas del EFB van relativas a la esquina de la zona.
+bool g_enZona = false;
+int g_zonaX = 0, g_zonaY = 0;
 bool g_efbFuera = false;  // 0.34.0: la última copia dejó enlazada su textura y falta volver al EFB (vuelta perezosa)
 
 void enlazar_efb() {
@@ -3226,8 +3230,9 @@ void run_copy_desde(const Item& it, GLuint srcColor, int srcW, int srcH, float r
 
 void run_copy(const Item& it) {
   const auto& c = it.copy;
-  run_copy_desde(it, g_efb.color, g_efb.width, g_efb.height, static_cast<float>(c.rect.x),
-                 static_cast<float>(c.rect.y), static_cast<float>(c.rect.width), static_cast<float>(c.rect.height));
+  run_copy_desde(it, g_efb.color, g_efb.width, g_efb.height, static_cast<float>(c.rect.x - g_zonaX),
+                 static_cast<float>(c.rect.y - g_zonaY), static_cast<float>(c.rect.width),
+                 static_cast<float>(c.rect.height));
   copia_hecha(c.tex);
 }
 
@@ -3328,6 +3333,7 @@ void intermedias_cuadro() {
 bool copia_directa_sirve(const Item& it) {
   const auto& c = it.copy;
   if (!copia_directa_activa() || (c.fmt & 0x10) != 0) return false;  // la profundidad no se copia así
+  if (g_enZona) return false;  // 0.38.0: dentro de una zona de trabajo, copia normal
   if (c.texW == 0 || c.texH == 0 || c.texW > 4096 || c.texH > 4096) return false;
   if (c.rect.x < 0 || c.rect.y < 0 || c.rect.width <= 0 || c.rect.height <= 0) return false;
   if (c.rect.x + c.rect.width > g_efb.width || c.rect.y + c.rect.height > g_efb.height) return false;
@@ -3497,6 +3503,201 @@ struct TramoCenso {
     nuevo();
   }
 };
+
+// --- Zonas de trabajo (0.38.0) ------------------------------------------------------------------------------------
+// Un volcado del tenis (0.37.0, EFB de 505x417) mostró que 12 de las 23 copias por cuadro son las sombras de los
+// jugadores: el juego dibuja cada sombra en la esquina 0,0 101x101 del EFB, la copia, la difumina dos veces (un dibujo
+// que lee la copia anterior y otra copia) y al final borra esa esquina. Cada copia cierra el pase del EFB entero: la
+// Mali guarda en memoria los 505x417 de color y profundidad y al volver los carga otra vez (~1 ms de GPU por copia,
+// ~20 ms por cuadro; el hilo de la pantalla lo espera). Ahora el motor busca tramos así antes de dibujar: seguidos,
+// que solo tocan (dibujan, borran o copian) una zona chica del EFB y hacen al menos 3 copias. Ese tramo se dibuja en un
+// framebuffer del tamaño de la zona: entra copiando la zona del EFB (si lo primero no la borra entera) y sale
+// devolviéndola (si lo siguiente que la toca no la borra entera). Cuesta lo de una copia; las demás ya no tocan el EFB.
+// CHOYA_GX_ZONAS=0 (archivo sin-zonas) lo apaga.
+bool zonas_activas() {
+  static const bool on = [] {
+    const char* e = std::getenv("CHOYA_GX_ZONAS");
+    return e == nullptr || std::strcmp(e, "0") != 0;
+  }();
+  return on;
+}
+// Caja del EFB que de verdad pinta un viewport o recorte (x, y arriba a la izquierda) en un framebuffer de alto H,
+// con el mismo redondeo que to_gl_rect en draw_frame_locked.
+int gl_y(float y, float h, int H) { return static_cast<int>(std::lround(static_cast<float>(H) - y - h)); }
+Caja caja_gl(float x, float y, float w, float h, int H) {
+  const int gx = static_cast<int>(x), gw = static_cast<int>(w + 0.5f), gh = static_cast<int>(h + 0.5f);
+  const int gy = gl_y(y, h, H);
+  return Caja{gx, H - gy - gh, gx + gw, H - gy};
+}
+long area_de(const Caja& c) { return c.vacia() ? 0 : static_cast<long>(c.x1 - c.x0) * (c.y1 - c.y0); }
+
+struct Zona {
+  size_t ini = 0, fin = 0;  // operaciones [ini, fin) del cuadro
+  Caja r;
+  bool cargar = true, devolver = true;
+  int copias = 0;
+};
+constexpr int kZonaCopiasMin = 3;
+
+void planear_zonas(const Frame& f, int efbW, int efbH, int H, std::vector<Zona>& out) {
+  out.clear();
+  if (!zonas_activas()) return;
+  const size_t n = f.items.size();
+  // Sin reservar memoria en cada cuadro (solo el hilo de la pantalla llama a esto).
+  static std::vector<Caja> caja;            // lo que toca del EFB cada operación (vacía: nada)
+  static std::vector<uint8_t> tapa, corta, esCopia;  // borrado de color, alfa y profundidad de toda su caja; pase que
+                                                     // borra o que cierra uno que va a la pantalla; copia
+  caja.assign(n, Caja{});
+  tapa.assign(n, 0);
+  corta.assign(n, 0);
+  esCopia.assign(n, 0);
+  Caja vp = caja_de(0, 0, efbW, efbH), sc = vp;
+  bool abiertoVaAPantalla = false;
+  for (size_t i = 0; i < n; ++i) {
+    const Item& it = f.items[i];
+    switch (it.op) {
+    case Op::Pass: {
+      const int pw = it.pass.width ? static_cast<int>(it.pass.width) : efbW;
+      const int ph = it.pass.height ? static_cast<int>(it.pass.height) : efbH;
+      vp = sc = caja_de(0, 0, pw, ph);
+      if (it.pass.clearColor || it.pass.clearDepth) {
+        caja[i] = vp;
+        tapa[i] = it.pass.clearColor && it.pass.clearDepth;
+      }
+      corta[i] = it.pass.clearColor || it.pass.clearDepth || abiertoVaAPantalla;
+      abiertoVaAPantalla = it.pass.hasResolve != 0;
+    } break;
+    case Op::Viewport:
+      vp = caja_gl(it.viewport.left, it.viewport.top, it.viewport.width, it.viewport.height, H);
+      break;
+    case Op::Scissor:
+      sc = caja_gl(static_cast<float>(it.scissor.x), static_cast<float>(it.scissor.y),
+                   static_cast<float>(it.scissor.width), static_cast<float>(it.scissor.height), H);
+      break;
+    case Op::Draw:
+      caja[i] = cruce(vp, sc);
+      break;
+    case Op::Clear: {
+      ClearDesc cc{};
+      if (!find_clear(it.clear.pipeline, cc)) break;
+      caja[i] = it.clear.useScissor ? caja_gl(static_cast<float>(it.clear.scissor.x),
+                                              static_cast<float>(it.clear.scissor.y),
+                                              static_cast<float>(it.clear.scissor.width),
+                                              static_cast<float>(it.clear.scissor.height), H)
+                                    : sc;
+      tapa[i] = cc.color && cc.alpha && cc.depth;
+    } break;
+    case Op::Copy:
+      caja[i] = caja_de(it.copy.rect.x, it.copy.rect.y, it.copy.rect.width, it.copy.rect.height);
+      esCopia[i] = 1;
+      break;
+    case Op::PaletteConv:
+      break;
+    }
+  }
+  const long maxA = static_cast<long>(efbW) * efbH / 3;
+  bool activa = false;
+  Zona z;
+  Caja r, rCopia;
+  int copias = 0;
+  size_t finCopia = 0;
+  auto cerrar = [&]() {
+    if (activa && copias >= kZonaCopiasMin) {
+      z.fin = finCopia;
+      z.r = rCopia;
+      z.copias = copias;
+      out.push_back(z);
+    }
+    activa = false;
+  };
+  for (size_t i = 0; i < n; ++i) {
+    if (f.items[i].op == Op::Pass && corta[i]) {
+      cerrar();
+      continue;
+    }
+    if (f.items[i].op == Op::Pass || caja[i].vacia()) continue;
+    const Caja& b = caja[i];
+    if (activa) {
+      const Caja u = unir(r, b);
+      if (area_de(u) <= maxA && area_de(u) * 2 <= 3 * std::max(area_de(r), area_de(b))) {
+        r = u;
+        if (esCopia[i]) {
+          ++copias;
+          finCopia = i + 1;
+          rCopia = r;
+        }
+        continue;
+      }
+      cerrar();
+    }
+    if (area_de(b) <= maxA) {
+      activa = true;
+      z = Zona{};
+      z.ini = i;
+      r = b;
+      copias = 0;
+      if (esCopia[i]) {
+        copias = 1;
+        finCopia = i + 1;
+        rCopia = r;
+      }
+    }
+  }
+  cerrar();
+  for (Zona& zn : out) {
+    // Si lo primero que toca la zona es un borrado entero, no hace falta traer lo que tenía el EFB.
+    zn.cargar = !(f.items[zn.ini].op == Op::Clear && tapa[zn.ini] && contiene(caja[zn.ini], zn.r));
+    // Si lo siguiente que la toca la borra entera, no hace falta devolverla al EFB.
+    zn.devolver = true;
+    for (size_t j = zn.fin; j < n; ++j) {
+      if (f.items[j].op == Op::Pass && corta[j] && !tapa[j]) break;  // lee la pantalla o borra a medias: devolver
+      if (caja[j].vacia() || !se_tocan(caja[j], zn.r)) continue;
+      zn.devolver = !(tapa[j] && contiene(caja[j], zn.r));
+      break;
+    }
+  }
+}
+
+// Framebuffer de las zonas (crece al tamaño más grande pedido) y el EFB de verdad mientras se dibuja en una zona.
+Efb g_zonaFb;
+Efb g_efbPrincipal;
+struct ZonasStats {
+  uint64_t cuadros = 0, zonas = 0, copias = 0, cargas = 0, devoluciones = 0;
+  int maxW = 0, maxH = 0;
+} g_zonasSt;
+
+bool asegurar_zona(int w, int h) {
+  if (g_zonaFb.fbo != 0 && w <= g_zonaFb.width && h <= g_zonaFb.height) return true;
+  if (g_zonaFb.fbo != 0) {
+    gl.DeleteFramebuffers(1, &g_zonaFb.fbo);
+    gl.DeleteTextures(1, &g_zonaFb.color);
+    gl.DeleteTextures(1, &g_zonaFb.depth);
+  }
+  g_zonaFb.width = std::max(w, g_zonaFb.width);
+  g_zonaFb.height = std::max(h, g_zonaFb.height);
+  gl.GenTextures(1, &g_zonaFb.color);
+  gl.BindTexture(kTexture2D, g_zonaFb.color);
+  gl.TexStorage2D(kTexture2D, 1, kRgba8, g_zonaFb.width, g_zonaFb.height);
+  gl.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
+  gl.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
+  gl.GenTextures(1, &g_zonaFb.depth);
+  gl.BindTexture(kTexture2D, g_zonaFb.depth);
+  gl.TexStorage2D(kTexture2D, 1, kDepth24Stencil8, g_zonaFb.width, g_zonaFb.height);
+  gl.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
+  gl.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
+  gl.GenFramebuffers(1, &g_zonaFb.fbo);
+  gl.BindFramebuffer(kFramebuffer, g_zonaFb.fbo);
+  gl.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, g_zonaFb.color, 0);
+  gl.FramebufferTexture2D(kFramebuffer, kDepthStencilAttachment, kTexture2D, g_zonaFb.depth, 0);
+  const GLenum status = gl.CheckFramebufferStatus(kFramebuffer);
+  if (status != kFramebufferComplete) {
+    log_line("motor: el framebuffer de las zonas (%dx%d) no está completo (0x%04X); sin zonas", g_zonaFb.width,
+             g_zonaFb.height, status);
+    return false;
+  }
+  log_line("motor: framebuffer de las zonas de trabajo de %dx%d", g_zonaFb.width, g_zonaFb.height);
+  return true;
+}
 
 // El grupo de texturas cambió: qué copias del censo lee (ids de aurora, como grupo_lee_pendiente).
 void censo_grupo(uint64_t bindGroup) {
@@ -3915,10 +4116,12 @@ void pin_game_thread(int gameTid, int gxTid) noexcept {
   const bool conGx = gxTid > 0 && gxTid != self && ncpu >= 4;
   // 0.36.0: el hilo GX usa ~37 % de su núcleo y el hilo de la pantalla, con los hilos de la Mali, esperaba turno
   // 14-20 % del tiempo en los otros dos. Ahora los demás hilos también pueden usar el núcleo del hilo GX (él sigue
-  // fijo ahí); CHOYA_GX_NUCLEO_SOLO=1 (archivo hilo-gx-solo) se lo vuelve a dejar solo, como antes.
+  // fijo ahí). 0.38.0: medido en la consola, así el juego bajó de ~33-34 a ~29-30 cuadros por segundo (su CPU por
+  // cuadro subió ~10 %, aun con el hilo GX en prioridad alta) y la pantalla solo ganó ~1. Vuelve a ser solo para el
+  // hilo GX; CHOYA_GX_NUCLEO_SOLO=0 (archivo hilo-gx-compartido) lo comparte.
   static const bool gxSolo = [] {
     const char* e = std::getenv("CHOYA_GX_NUCLEO_SOLO");
-    return e != nullptr && std::strcmp(e, "1") == 0;
+    return e == nullptr || std::strcmp(e, "0") != 0;
   }();
   const Nucleos rep = repartir_nucleos(static_cast<int>(ncpu), conGx, gxSolo);
   const int gameCpu = rep.juego;
@@ -4391,6 +4594,81 @@ bool load_frame(const char* path) noexcept {
   return true;
 }
 
+// 0.38.0: lista de lo que hace el último cuadro en cola (normalmente uno cargado con load_frame): pases, viewports,
+// recortes, borrados, dibujos (con su estado de mezcla, escritura y profundidad y qué texturas lee) y copias. Para
+// estudiar en la PC cómo arma el cuadro un juego (choya estructura / harness estructura) sin tocar nada.
+bool describe_frame(LogFn out) noexcept {
+  if (out == nullptr) return false;
+  std::lock_guard lock(g_frameMutex);
+  if (g_queue.empty() || g_queue.back().frames.empty()) return false;
+  const Frame& f = g_queue.back().frames.back();
+  char buf[512];
+  int pase = -1;
+  for (size_t i = 0; i < f.items.size(); ++i) {
+    const Item& it = f.items[i];
+    switch (it.op) {
+    case Op::Pass:
+      ++pase;
+      std::snprintf(buf, sizeof buf, "%zu pase %d %ux%u borra color %u profundidad %u color %.2f %.2f %.2f %.2f "
+                    "resolve %u copia a pantalla %d,%d %dx%d", i, pase, it.pass.width, it.pass.height,
+                    it.pass.clearColor, it.pass.clearDepth, it.pass.rgba[0], it.pass.rgba[1], it.pass.rgba[2],
+                    it.pass.rgba[3], it.pass.hasResolve, it.pass.copy.x, it.pass.copy.y, it.pass.copy.width,
+                    it.pass.copy.height);
+      break;
+    case Op::Viewport:
+      std::snprintf(buf, sizeof buf, "%zu viewport %.1f,%.1f %.1fx%.1f z %.3f-%.3f", i, it.viewport.left,
+                    it.viewport.top, it.viewport.width, it.viewport.height, it.viewport.znear, it.viewport.zfar);
+      break;
+    case Op::Scissor:
+      std::snprintf(buf, sizeof buf, "%zu recorte %d,%d %dx%d", i, it.scissor.x, it.scissor.y, it.scissor.width,
+                    it.scissor.height);
+      break;
+    case Op::Clear: {
+      ClearDesc cc{};
+      const bool hay = find_clear(it.clear.pipeline, cc);
+      std::snprintf(buf, sizeof buf, "%zu borrado %s color %u alfa %u profundidad %u valor %.2f %.2f %.2f %.2f z %.3f "
+                    "%s %d,%d %dx%d", i, hay ? "" : "(sin config)", cc.color, cc.alpha, cc.depth, it.clear.rgba[0],
+                    it.clear.rgba[1], it.clear.rgba[2], it.clear.rgba[3], it.clear.depth,
+                    it.clear.useScissor ? "zona" : "recorte actual", it.clear.scissor.x, it.clear.scissor.y,
+                    it.clear.scissor.width, it.clear.scissor.height);
+    } break;
+    case Op::Draw: {
+      PipelineDesc d{};
+      const bool hay = find_pipeline(it.draw.pipeline, d);
+      BindDesc bd{};
+      const bool grupo = it.draw.bindGroup != 0 && find_bind_group(it.draw.bindGroup, bd);
+      char tex[160] = "";
+      size_t n = 0;
+      for (int k = 0; grupo && k < 8 && n + 24 < sizeof tex; ++k) {
+        if (bd.tex[k] != 0) {
+          n += static_cast<size_t>(std::snprintf(tex + n, sizeof tex - n, " t%d=%llx", k,
+                                                 static_cast<unsigned long long>(bd.tex[k])));
+        }
+      }
+      std::snprintf(buf, sizeof buf, "%zu dibujo %s%u índices x%u; mezcla modo %u %u->%u op %u; escribe color %u alfa "
+                    "%u z %u; prueba z %u func %u; cull %u; etapas %u texgen %u; alfa %u/%u %u %u/%u; lineMode %u;%s",
+                    i, hay ? "" : "(sin config) ", it.draw.indexCount, it.draw.instanceCount, d.blendMode, d.blendSrc,
+                    d.blendDst, d.blendOp, d.colorUpdate, d.alphaUpdate, d.depthUpdate, d.depthCompare, d.depthFunc,
+                    d.cullMode, d.tevStageCount, d.numTexGens, d.alphaComp0, d.alphaRef0, d.alphaOp, d.alphaComp1,
+                    d.alphaRef1, d.lineMode, tex);
+    } break;
+    case Op::Copy:
+      std::snprintf(buf, sizeof buf, "%zu copia -> %llx zona %d,%d %dx%d textura %ux%u formato %u opaca %u", i,
+                    static_cast<unsigned long long>(it.copy.tex), it.copy.rect.x, it.copy.rect.y,
+                    it.copy.rect.width, it.copy.rect.height, it.copy.texW, it.copy.texH, it.copy.fmt, it.copy.opaque);
+      break;
+    case Op::PaletteConv:
+      std::snprintf(buf, sizeof buf, "%zu paleta %llx -> %llx (%ux%u, variante %u)", i,
+                    static_cast<unsigned long long>(it.conv.src),
+                    static_cast<unsigned long long>(it.conv.dst), it.conv.dstW, it.conv.dstH,
+                    it.conv.variant);
+      break;
+    }
+    out(buf);
+  }
+  return true;
+}
+
 bool draw_frame(int screenWidth, int screenHeight) noexcept {
   if (g_glFailed || g_loader == nullptr) return false;
   if (!g_glReady) {
@@ -4713,6 +4991,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   gpu_cuadro_empezar();
   ++g_censoCuadro;
   ++g_censoCuadros;
+  ++g_zonasSt.cuadros;
   uint64_t censoGrupo = ~0ull;  // grupo de texturas para el que se calculó g_censoGrupo
   TramoCenso tramo;             // 0.37.0
   Caja vpCaja, scCaja;          // viewport y recorte en coordenadas del EFB (para el tramo)
@@ -4837,12 +5116,18 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
   // Coordenadas del pase (origen arriba a la izquierda) -> GL (origen abajo) dentro del EFB.
   int passW = efbW, passH = efbH;
   Rect passCopy{0, 0, efbW, efbH};
+  // 0.38.0: el borde de abajo se redondea (antes se truncaba: un viewport de 360.1 líneas arriba del todo quedaba una
+  // línea más abajo, y la de arriba de la pantalla salía sin dibujar). Dentro de una zona de trabajo, relativo a ella.
   auto to_gl_rect = [&](float x, float y, float w, float h, GLint out[4]) {
+    x -= static_cast<float>(g_zonaX);
+    y -= static_cast<float>(g_zonaY);
     out[0] = static_cast<GLint>(x);
-    out[1] = static_cast<GLint>(static_cast<float>(g_efb.height) - y - h);
+    out[1] = static_cast<GLint>(gl_y(y, h, g_efb.height));
     out[2] = static_cast<GLint>(w + 0.5f);
     out[3] = static_cast<GLint>(h + 0.5f);
   };
+  Viewport vpActual{0, 0, static_cast<float>(efbW), static_cast<float>(efbH), 0, 1};
+  Rect scActual{0, 0, efbW, efbH};
   GLint scissorRect[4] = {0, g_efb.height - efbH, efbW, efbH};
   GLint viewportRect[4] = {0, g_efb.height - efbH, efbW, efbH};
   bool presented = false;
@@ -4874,11 +5159,78 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     gl.BindVertexArray(g_vao);
     lastBindGroup = ~0ull;  // las texturas de copia pudieron rehacerse
   };
+  // 0.38.0: zonas de trabajo (ver planear_zonas).
+  constexpr GLbitfield kTodo = kColorBufferBit | kDepthBufferBit | 0x0400 /*GL_STENCIL_BUFFER_BIT*/;
+  auto recalcular_rects = [&]() {
+    to_gl_rect(vpActual.left, vpActual.top, vpActual.width, vpActual.height, viewportRect);
+    to_gl_rect(static_cast<float>(scActual.x), static_cast<float>(scActual.y), static_cast<float>(scActual.width),
+               static_cast<float>(scActual.height), scissorRect);
+  };
+  const Zona* zonaAct = nullptr;
+  auto entrar_zona = [&](const Zona& z) -> bool {
+    const int w = z.r.x1 - z.r.x0, h = z.r.y1 - z.r.y0;
+    mali_mark(kMaliDibujos);
+    if (!asegurar_zona(w, h)) return false;
+    set_enable(kScissorTest, S.scissorOn, false);
+    const int H = g_efb.height, Hz = g_zonaFb.height;
+    if (z.cargar) {
+      gl.BindFramebuffer(kReadFramebuffer, g_efb.fbo);
+      gl.BindFramebuffer(kDrawFramebuffer, g_zonaFb.fbo);
+      gl.BlitFramebuffer(z.r.x0, H - z.r.y1, z.r.x1, H - z.r.y0, 0, Hz - h, w, Hz, kTodo, kNearest);
+      ++g_zonasSt.cargas;
+    } else {
+      gl.BindFramebuffer(kFramebuffer, g_zonaFb.fbo);
+      const GLenum att[2] = {kColorAttachment0, kDepthStencilAttachment};
+      gl.InvalidateFramebuffer(kFramebuffer, 2, att);
+    }
+    g_efbPrincipal = g_efb;
+    g_efb = g_zonaFb;
+    g_zonaX = z.r.x0;
+    g_zonaY = z.r.y0;
+    g_enZona = true;
+    enlazar_efb();
+    recalcular_rects();
+    reponer_tras_copia();
+    ++g_zonasSt.zonas;
+    g_zonasSt.copias += static_cast<uint64_t>(z.copias);
+    g_zonasSt.maxW = std::max(g_zonasSt.maxW, w);
+    g_zonasSt.maxH = std::max(g_zonasSt.maxH, h);
+    zonaAct = &z;
+    return true;
+  };
+  auto salir_zona = [&]() {
+    const Zona& z = *zonaAct;
+    const int w = z.r.x1 - z.r.x0, h = z.r.y1 - z.r.y0;
+    mali_mark(kMaliDibujos);
+    set_enable(kScissorTest, S.scissorOn, false);
+    const int Hz = g_zonaFb.height, H = g_efbPrincipal.height;
+    if (z.devolver) {
+      gl.BindFramebuffer(kReadFramebuffer, g_zonaFb.fbo);
+      gl.BindFramebuffer(kDrawFramebuffer, g_efbPrincipal.fbo);
+      gl.BlitFramebuffer(0, Hz - h, w, Hz, z.r.x0, H - z.r.y1, z.r.x1, H - z.r.y0, kTodo, kNearest);
+      ++g_zonasSt.devoluciones;
+    }
+    g_efb = g_efbPrincipal;
+    g_zonaX = g_zonaY = 0;
+    g_enZona = false;
+    zonaAct = nullptr;
+    enlazar_efb();
+    recalcular_rects();
+    reponer_tras_copia();
+  };
+  static std::vector<Zona> zonas;
+  planear_zonas(f, efbW, efbH, g_efb.height, zonas);
+  size_t zonaSig = 0;
   static std::vector<uint8_t> plan;
   planear_invalidaciones(f, plan);
   ++g_inval.cuadros;
   for (size_t itemIndex = 0; itemIndex < f.items.size(); ++itemIndex) {
     const Item& it = f.items[itemIndex];
+    if (zonaAct != nullptr && itemIndex == zonaAct->fin) salir_zona();
+    if (zonaAct == nullptr && zonaSig < zonas.size() && itemIndex == zonas[zonaSig].ini) {
+      if (!entrar_zona(zonas[zonaSig])) zonas.clear();  // sin framebuffer de zonas: como antes
+      ++zonaSig;
+    }
     // 0.34.0: tras una copia el EFB se vuelve a enlazar solo cuando algo lo usa; otra copia, el viewport o el recorte
     // no (los dos se vuelven a poner al volver).
     if (g_efbFuera && it.op != Op::Copy && it.op != Op::Viewport && it.op != Op::Scissor) reponer_tras_copia();
@@ -4898,10 +5250,9 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
         tramo.nuevo();
         if (it.pass.clearColor && it.pass.clearDepth) tramo.borrar(vpCaja);
       }
-      viewportRect[0] = 0;
-      viewportRect[1] = g_efb.height - passH;
-      viewportRect[2] = passW;
-      viewportRect[3] = passH;
+      vpActual = Viewport{0, 0, static_cast<float>(passW), static_cast<float>(passH), vpActual.znear, vpActual.zfar};
+      scActual = Rect{0, 0, passW, passH};
+      recalcular_rects();
       set_viewport(viewportRect);
       set_enable(kScissorTest, S.scissorOn, false);
       GLbitfield bits = 0;
@@ -4925,21 +5276,17 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
         in.borra = static_cast<uint8_t>((it.pass.clearColor ? 1 : 0) | (it.pass.clearDepth ? 2 : 0));
       }
       set_enable(kScissorTest, S.scissorOn, true);
-      scissorRect[0] = 0;
-      scissorRect[1] = g_efb.height - passH;
-      scissorRect[2] = passW;
-      scissorRect[3] = passH;
       set_scissor(scissorRect);
     } break;
     case Op::Viewport: {
       GLint r[4];
       to_gl_rect(it.viewport.left, it.viewport.top, it.viewport.width, it.viewport.height, r);
+      vpActual = it.viewport;
       set_viewport(r);
       std::memcpy(viewportRect, r, sizeof(r));
       if (censo_activo()) {
-        vpCaja = Caja{static_cast<int>(std::floor(it.viewport.left)), static_cast<int>(std::floor(it.viewport.top)),
-                      static_cast<int>(std::ceil(it.viewport.left + it.viewport.width)),
-                      static_cast<int>(std::ceil(it.viewport.top + it.viewport.height))};
+        vpCaja = caja_gl(it.viewport.left, it.viewport.top, it.viewport.width, it.viewport.height,
+                         g_enZona ? g_efbPrincipal.height : g_efb.height);
       }
       const float minDepth = g_reversedZ ? 1.0f - it.viewport.zfar : it.viewport.znear;
       const float maxDepth = g_reversedZ ? 1.0f - it.viewport.znear : it.viewport.zfar;
@@ -4948,6 +5295,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     case Op::Scissor: {
       to_gl_rect(static_cast<float>(it.scissor.x), static_cast<float>(it.scissor.y),
                      static_cast<float>(it.scissor.width), static_cast<float>(it.scissor.height), scissorRect);
+      scActual = it.scissor;
       set_scissor(scissorRect);
       if (censo_activo()) scCaja = caja_de(it.scissor.x, it.scissor.y, it.scissor.width, it.scissor.height);
     } break;
@@ -5016,7 +5364,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
       {  // 0.25.0: el driver no recarga lo que este borrado va a tapar (ver planear_invalidaciones)
         GLenum att[2];
         GLsizei na = 0;
-        const uint8_t pl = plan[itemIndex];
+        const uint8_t pl = g_enZona ? 0 : plan[itemIndex];  // el plan es para el EFB entero
         if ((pl & 1) && cc.color && cc.alpha) {
           att[na++] = kColorAttachment0;
           ++g_inval.color;
@@ -5142,6 +5490,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
     } break;
     }
   }
+  if (zonaAct != nullptr) salir_zona();
   if (g_efbFuera) reponer_tras_copia();  // 0.34.0: el cuadro terminó con una copia
   end_pass();
   mali_mark(kMaliDibujos);
@@ -5285,6 +5634,19 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
           log_line("motor: copias directas: apagadas (%s); cada copia dibuja leyendo el EFB",
                    gl.CopyTexSubImage2D == nullptr ? "el driver no da glCopyTexSubImage2D" : "CHOYA_GX_COPIA_DIRECTA=1 las prende");
         }
+      }
+      if (g_zonasSt.cuadros > 0) {  // 0.38.0
+        const double n = static_cast<double>(g_zonasSt.cuadros);
+        if (!zonas_activas()) {
+          log_line("motor: zonas de trabajo: apagadas (CHOYA_GX_ZONAS=0)");
+        } else {
+          log_line("motor: zonas de trabajo (por cuadro): %.1f zonas con %.1f copias dentro (sin guardar ni recargar el EFB "
+                   "entero en cada una); %.1f cargas y %.1f devoluciones al EFB; la más grande %dx%d (CHOYA_GX_ZONAS=0 "
+                   "las apaga)", static_cast<double>(g_zonasSt.zonas) / n, static_cast<double>(g_zonasSt.copias) / n,
+                   static_cast<double>(g_zonasSt.cargas) / n, static_cast<double>(g_zonasSt.devoluciones) / n,
+                   g_zonasSt.maxW, g_zonasSt.maxH);
+        }
+        g_zonasSt = ZonasStats{};
       }
       if (censo_activo() && g_censoCuadros > 0 && !g_censo.empty()) {  // 0.36.0
         const double n = static_cast<double>(g_censoCuadros);

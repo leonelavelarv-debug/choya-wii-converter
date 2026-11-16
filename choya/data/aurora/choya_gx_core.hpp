@@ -189,6 +189,8 @@ bool draw_frame(int screenWidth, int screenHeight) noexcept;
 
 // Volcado del último cuadro (datos + pipelines que usa) y su lectura en la PC.
 bool dump_last_frame(const char* path) noexcept;
+// Lista una línea por cada operación del último cuadro en cola (0.38.0; ver choya estructura).
+bool describe_frame(LogFn out) noexcept;
 bool load_frame(const char* path) noexcept;
 
 } // namespace choya::gx
