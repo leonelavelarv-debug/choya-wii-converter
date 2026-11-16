@@ -113,9 +113,9 @@ class TestMotorGles(unittest.TestCase):
                             "-o", nuc, "-ldl", "-lpthread"], check=True, capture_output=True)
             filas = subprocess.run([nuc], capture_output=True, text=True, check=True).stdout.split("\n")
             self.assertEqual(filas[:5], ["4 1 0 3 2 3", "4 1 1 3 2 2", "4 0 0 3 2 3", "3 0 0 2 1 2", "8 1 0 7 6 7"])
-            # 0.37.0: nice del hilo GX: -6 por omisión, el valor de CHOYA_GX_PRIORIDAD si es válido.
-            self.assertEqual(filas[5], "prioridad -6")
-            for valor, esperado in (("0", "0"), ("-10", "-10"), ("abc", "-6"), ("-30", "-6")):
+            # 0.37.0: nice del hilo GX: -10 por omisión (0.40.0), el valor de CHOYA_GX_PRIORIDAD si es válido.
+            self.assertEqual(filas[5], "prioridad -10")
+            for valor, esperado in (("0", "0"), ("-6", "-6"), ("abc", "-10"), ("-30", "-10")):
                 out = subprocess.run([nuc], env=dict(os.environ, CHOYA_GX_PRIORIDAD=valor), capture_output=True,
                                      text=True, check=True).stdout.split("\n")
                 self.assertEqual(out[5], "prioridad " + esperado, valor)
@@ -258,12 +258,13 @@ class TestMotorGles(unittest.TestCase):
             una = subprocess.run([exe, "zonas", "1"], env=env, capture_output=True, text=True).stdout
             self.assertIn("zonas 000000 000000 FF0000 0000FF FF0000 0000FF", una)
 
-            # 0.39.0: sonda de esperas del hilo de la pantalla (sin pausa entre tandas para la prueba).
+            # 0.39.0: sonda de esperas del hilo de la pantalla (sin pausa entre tandas para la prueba); desde la 0.40.0
+            # apagada salvo CHOYA_GX_SONDA_ESPERAS=1.
+            r = subprocess.run([exe, "zonas", "0"], env=dict(env, CHOYA_GX_SONDA_PAUSA_MS="0", CHOYA_GX_SONDA_ESPERAS="1"),
+                               capture_output=True, text=True)
+            self.assertRegex(r.stdout, r"motor: esperas de pantalla \(\d+\), \d+ muestras: corre o espera turno \d+ %")
             r = subprocess.run([exe, "zonas", "0"], env=dict(env, CHOYA_GX_SONDA_PAUSA_MS="0"), capture_output=True,
                                text=True)
-            self.assertRegex(r.stdout, r"motor: esperas de pantalla \(\d+\), \d+ muestras: corre o espera turno \d+ %")
-            r = subprocess.run([exe, "zonas", "0"], env=dict(env, CHOYA_GX_SONDA_PAUSA_MS="0",
-                                                              CHOYA_GX_SONDA_ESPERAS="0"), capture_output=True, text=True)
             self.assertNotIn("motor: esperas de pantalla", r.stdout)
 
 

@@ -3873,11 +3873,16 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
 // ~18 de ellos dentro de glBindFramebuffer (0.8 ms por copia) y solo la mitad con CPU: no es el ancho de banda del
 // EFB. Para ver en qué espera el driver, un hilo aparte mira cada 2 ms (2 s de cada 10) el estado del hilo de la
 // pantalla y de los hilos de la Mali en /proc: si corren, o en qué llamada al sistema duermen y en qué función del
-// núcleo (wchan: ioctl dentro del driver de la Mali, futex esperando a otro hilo...). CHOYA_GX_SONDA_ESPERAS=0 la apaga.
+// núcleo (wchan: ioctl dentro del driver de la Mali, futex esperando a otro hilo...).
+// 0.40.0: lo que mostró en la consola: el hilo de la pantalla casi nunca duerme en el driver (80-84 % corre o espera
+// turno; 16-19 % en un futex esperando a otro hilo de la Mali) y el hilo mali-cmar-backe, el que manda el trabajo a la
+// GPU, pasa ~20-26 % de su tiempo dentro de sunxi_fb_pan_display (el cambio de imagen en la pantalla espera al vsync) y
+// el resto esperando turno o en ppoll. Como la sonda gasta ~6 % de CPU en los núcleos 0-1, ahora va apagada:
+// CHOYA_GX_SONDA_ESPERAS=1 (archivo con-sonda) la prende.
 bool sonda_activa() {
   static const bool on = [] {
     const char* e = std::getenv("CHOYA_GX_SONDA_ESPERAS");
-    return e == nullptr || std::strcmp(e, "0") != 0;
+    return e != nullptr && std::strcmp(e, "1") == 0;
   }();
   return on;
 }
@@ -4227,10 +4232,10 @@ void texture_packed_data(uint64_t id, uint32_t width, uint32_t height, uint32_t 
 // apaga.
 int prioridad_gx() noexcept {
   const char* e = std::getenv("CHOYA_GX_PRIORIDAD");
-  if (e == nullptr || *e == '\0') return -6;
+  if (e == nullptr || *e == '\0') return -10;
   char* fin = nullptr;
   const long v = std::strtol(e, &fin, 10);
-  if (fin == e || *fin != '\0' || v < -20 || v > 19) return -6;
+  if (fin == e || *fin != '\0' || v < -20 || v > 19) return -10;
   return static_cast<int>(v);
 }
 
@@ -4259,6 +4264,16 @@ void pin_game_thread(int gameTid, int gxTid) noexcept {
     const char* e = std::getenv("CHOYA_GX_NUCLEO_SOLO");
     return e == nullptr || std::strcmp(e, "0") != 0;
   }();
+  // 0.39.0: el hilo que manda el trabajo de la Mali a la GPU ("mali-cmar-backe", ~20 % de CPU) esperaba turno 34-43 %
+  // del tiempo en los núcleos 0-1, y el hilo de la pantalla lo espera en cada cambio de framebuffer. Probado en la
+  // consola en el núcleo del hilo GX (que deja libre ~60 %): la espera al enlazar las copias bajó de ~17 a ~11 ms por
+  // cuadro y la pantalla subió de ~19 a ~24 cuadros/s, pero el hilo GX esperó turno 17 % (antes 5 %) y el juego bajó
+  // ~2 cuadros/s. 0.40.0: va ahí por omisión y el hilo GX pasa delante en ese núcleo (prioridad_gx, nice -10).
+  // CHOYA_GX_MALI_CON_GX=0 (archivo mali-sin-hilo-gx) lo deja en los núcleos 0-1.
+  static const bool maliConGx = [] {
+    const char* e = std::getenv("CHOYA_GX_MALI_CON_GX");
+    return e == nullptr || std::strcmp(e, "0") != 0;
+  }();
   const Nucleos rep = repartir_nucleos(static_cast<int>(ncpu), conGx, gxSolo);
   const int gameCpu = rep.juego;
   const int gxCpu = rep.gx;
@@ -4282,17 +4297,10 @@ void pin_game_thread(int gameTid, int gxTid) noexcept {
   // CHOYA_GX_PRIORIDAD, -6 por omisión: ~4 veces el peso de un hilo normal; 0 lo deja igual). Hace falta root (KNULLI).
   int gxNice = 0;
   bool gxNiceOk = true;
-  if (conGx && !gxSolo) {
+  if (conGx && (!gxSolo || maliConGx)) {  // 0.40.0: también cuando comparte el núcleo con mali-cmar
     gxNice = prioridad_gx();
     if (gxNice != 0) gxNiceOk = setpriority(PRIO_PROCESS, static_cast<id_t>(gxTid), gxNice) == 0;
   }
-  // 0.39.0 (prueba): el hilo que manda el trabajo de la Mali al núcleo ("mali-cmar-backe", ~19 % de CPU) esperaba
-  // turno 37-43 % del tiempo en los núcleos 0-1. Con CHOYA_GX_MALI_CON_GX=1 (archivo mali-con-hilo-gx) va al núcleo
-  // del hilo GX, que deja libre ~60 %.
-  static const bool maliConGx = [] {
-    const char* e = std::getenv("CHOYA_GX_MALI_CON_GX");
-    return e != nullptr && std::strcmp(e, "1") == 0;
-  }();
   int moved = 0, maliMovidos = 0;
   if (DIR* d = ::opendir("/proc/self/task")) {
     while (const dirent* e = ::readdir(d)) {
@@ -4311,13 +4319,13 @@ void pin_game_thread(int gameTid, int gxTid) noexcept {
     }
     ::closedir(d);
   }
-  if (maliConGx) {
-    log_line("motor: %d hilos mali-cmar en el núcleo del hilo GX (CHOYA_GX_MALI_CON_GX=1, archivo mali-con-hilo-gx)",
-             maliMovidos);
+  if (conGx && maliConGx) {
+    log_line("motor: %d hilos mali-cmar en el núcleo del hilo GX (CHOYA_GX_MALI_CON_GX=0, archivo mali-sin-hilo-gx, los "
+             "deja en los núcleos 0-%d)", maliMovidos, otros - 1);
   }
   if (conGx) {
     char prio[96] = "";
-    if (!gxSolo && gxNice != 0) {
+    if ((!gxSolo || maliConGx) && gxNice != 0) {
       std::snprintf(prio, sizeof prio, gxNiceOk ? ", prioridad nice %d" : ", sin prioridad (nice %d no se pudo)", gxNice);
     }
     log_line("motor: hilo del juego %d solo en el núcleo %d; hilo GX %d en el núcleo %d%s%s; %d hilos más en los "
