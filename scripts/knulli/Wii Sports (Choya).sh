@@ -4,7 +4,7 @@
 # Modo diagnóstico (3 min, perfil, volcados de cuadros; MENU + R1 vuelca el cuadro que se ve): "Wii Sports (Choya) - diagnostico.sh" o CHOYA_MODO=diagnostico.
 # Deja run.log y resumen.txt en la carpeta wiisports-choya.
 
-LANZADOR_VERSION="0.42.0"  # sube con cada versión de Choya (tests/test_opt_traducido.py lo revisa)
+LANZADOR_VERSION="0.42.1"  # sube con cada versión de Choya (tests/test_opt_traducido.py lo revisa)
 DIR="$(cd "$(dirname "$0")" && pwd)/wiisports-choya"
 cd "$DIR" || exit 1
 rm -f "$DIR/resumen.txt"  # que nunca quede uno viejo de otra corrida
@@ -164,6 +164,15 @@ if [ -f "$DIR/prioridad-gx" ] && [ ! -f "$DIR/sin-prioridad-gx" ]; then
     *) echo "prioridad-gx: \"$PRIO_GX\" no es un número de -20 a 19; uso la de omisión" ;;
   esac
 fi
+# 0.42.1 (prueba, apagada): un archivo "mali-utility-con-gx" con 1 o 2 manda ese número de hilos "mali-utility-wo"
+# de la Mali al núcleo del hilo GX, para aliviar los núcleos 0-1 (la pantalla espera turno ahí). Vacío cuenta como 1.
+if [ -f "$DIR/mali-utility-con-gx" ]; then
+  UTIL_GX="$(tr -d ' \r\n' < "$DIR/mali-utility-con-gx" 2>/dev/null)"
+  case "${UTIL_GX:-1}" in
+    1|2) export CHOYA_GX_MALI_UTILIDAD="${UTIL_GX:-1}" ;;
+    *) echo "mali-utility-con-gx: \"$UTIL_GX\" no es 1 ni 2; no muevo ninguno" ;;
+  esac
+fi
 # Recursos convertidos por el conversor de Choya (assets.wlpk junto al juego): texturas en ETC2/EAC ya reducidas.
 # CHOYA_PAQUETE=0 usa solo las del disco.
 if [ "${CHOYA_PAQUETE:-}" != "0" ] && [ -f "$DIR/assets.wlpk" ]; then
@@ -195,6 +204,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "copias del EFB rotadas en 3 texturas: $([ "${CHOYA_GX_ROTAR_COPIAS:-0}" = 1 ] && echo "sí (archivo rotar-copias)" || echo "no (para probarlas: archivo vacío rotar-copias)")"
   echo "vuelta al EFB tras las copias: $([ "${CHOYA_GX_VUELTA_PEREZOSA:-1}" = 0 ] && echo "después de cada copia (archivo sin-vuelta-perezosa)" || echo "perezosa, solo cuando algo usa el EFB (para apagarla: archivo vacío sin-vuelta-perezosa)")"
   echo "hilo mali-cmar: $([ "${CHOYA_GX_MALI_CON_GX:-1}" != 0 ] && echo "en el núcleo del hilo GX, el hilo GX delante con nice ${CHOYA_GX_PRIORIDAD:--3} (otra: archivo prioridad-gx con el número; para dejarlo en los núcleos 0-1: archivo vacío mali-sin-hilo-gx; sin prioridad: archivo vacío sin-prioridad-gx)" || echo "con los demás en los núcleos 0-1 (archivo mali-sin-hilo-gx)")"
+  echo "hilos mali-utility: $([ -n "${CHOYA_GX_MALI_UTILIDAD:-}" ] && echo "$CHOYA_GX_MALI_UTILIDAD en el núcleo del hilo GX (archivo mali-utility-con-gx)" || echo "en los núcleos 0-1 (para mover 1 o 2 al núcleo del hilo GX: archivo mali-utility-con-gx con el número)")"
   echo "sonda de esperas: $([ "${CHOYA_GX_SONDA_ESPERAS:-0}" = 1 ] && echo "prendida (archivo con-sonda)" || echo "apagada (para prenderla: archivo vacío con-sonda)")"
   echo "zonas de trabajo (cadenas de copias en una esquina del EFB): $([ "${CHOYA_GX_ZONAS:-1}" = 0 ] && echo "apagadas (archivo sin-zonas)" || echo "encendidas (para apagarlas: archivo vacío sin-zonas)")"
   echo "núcleo del hilo GX: $([ "${CHOYA_GX_NUCLEO_SOLO:-1}" != 0 ] && echo "solo para él (para compartirlo: archivo vacío hilo-gx-compartido)" || echo "compartido con la pantalla y la Mali (para dejarlo solo: archivo vacío hilo-gx-solo); prioridad del hilo GX: $([ "${CHOYA_GX_PRIORIDAD:-}" = 0 ] && echo "normal (archivo sin-prioridad-gx)" || echo "alta, nice ${CHOYA_GX_PRIORIDAD:--3} (para quitarla: archivo vacío sin-prioridad-gx)")")"

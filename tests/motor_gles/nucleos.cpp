@@ -9,5 +9,6 @@ int main() {
     std::printf("%d %d %d %d %d %d\n", c.n, c.gx, c.solo, r.juego, r.gx, r.otros);
   }
   std::printf("prioridad %d\n", choya::gx::prioridad_gx());
+  std::printf("utilidad %d\n", choya::gx::mali_utilidad_con_gx());
   return 0;
 }

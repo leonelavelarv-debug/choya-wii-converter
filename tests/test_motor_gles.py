@@ -119,6 +119,12 @@ class TestMotorGles(unittest.TestCase):
                 out = subprocess.run([nuc], env=dict(os.environ, CHOYA_GX_PRIORIDAD=valor), capture_output=True,
                                      text=True, check=True).stdout.split("\n")
                 self.assertEqual(out[5], "prioridad " + esperado, valor)
+            # 0.42.1: hilos mali-utility al núcleo del hilo GX: ninguno por omisión, 1 o 2 si se piden, 0 si no sirve.
+            self.assertEqual(filas[6], "utilidad 0")
+            for valor, esperado in (("1", "1"), ("2", "2"), ("0", "0"), ("3", "0"), ("-1", "0"), ("x", "0"), ("1x", "0")):
+                out = subprocess.run([nuc], env=dict(os.environ, CHOYA_GX_MALI_UTILIDAD=valor), capture_output=True,
+                                     text=True, check=True).stdout.split("\n")
+                self.assertEqual(out[6], "utilidad " + esperado, valor)
             # Caché de programas en disco: la primera vez compila y guarda, la segunda carga los binarios y dibuja igual.
             cache = os.path.join(d, "cache")
             env_cache = dict(env, CHOYA_GX_CACHE=cache)

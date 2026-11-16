@@ -4242,6 +4242,15 @@ int prioridad_gx() noexcept {
   return static_cast<int>(v);
 }
 
+int mali_utilidad_con_gx() noexcept {
+  const char* e = std::getenv("CHOYA_GX_MALI_UTILIDAD");
+  if (e == nullptr || *e == '\0') return 0;
+  char* fin = nullptr;
+  const long v = std::strtol(e, &fin, 10);
+  if (fin == e || *fin != '\0' || v < 0 || v > 2) return 0;
+  return static_cast<int>(v);
+}
+
 Nucleos repartir_nucleos(int ncpu, bool conGx, bool gxSolo) noexcept {
   Nucleos r;
   r.juego = ncpu - 1;
@@ -4277,6 +4286,11 @@ void pin_game_thread(int gameTid, int gxTid) noexcept {
     const char* e = std::getenv("CHOYA_GX_MALI_CON_GX");
     return e == nullptr || std::strcmp(e, "0") != 0;
   }();
+  // 0.42.1: con mali-cmar en el núcleo del hilo GX ese núcleo quedó ~69 % ocupado, y en los núcleos 0-1 la pantalla
+  // esperó turno ~15 % y los dos "mali-utility-wo" de la Mali (~28 % de CPU cada uno) 17-21 %. CHOYA_GX_MALI_UTILIDAD=N
+  // (archivo mali-utility-con-gx, con 1 o 2) manda N de esos hilos también al núcleo del hilo GX. Apagado por omisión:
+  // es una prueba (el núcleo del hilo GX puede pasar del 95 % y el juego esperar al hilo GX).
+  static const int maliUtilidad = mali_utilidad_con_gx();
   const Nucleos rep = repartir_nucleos(static_cast<int>(ncpu), conGx, gxSolo);
   const int gameCpu = rep.juego;
   const int gxCpu = rep.gx;
@@ -4304,23 +4318,33 @@ void pin_game_thread(int gameTid, int gxTid) noexcept {
     gxNice = prioridad_gx();
     if (gxNice != 0) gxNiceOk = setpriority(PRIO_PROCESS, static_cast<id_t>(gxTid), gxNice) == 0;
   }
-  int moved = 0, maliMovidos = 0;
+  int moved = 0, maliMovidos = 0, utilMovidos = 0;
   if (DIR* d = ::opendir("/proc/self/task")) {
     while (const dirent* e = ::readdir(d)) {
       const pid_t tid = static_cast<pid_t>(std::atoi(e->d_name));
       if (tid <= 0 || tid == self || (conGx && tid == static_cast<pid_t>(gxTid))) continue;
-      if (conGx && maliConGx) {
+      if (conGx && (maliConGx || maliUtilidad > 0)) {
         char path[64], comm[64];
         std::snprintf(path, sizeof path, "/proc/self/task/%d/comm", static_cast<int>(tid));
-        if (leer_archivo(path, comm, sizeof comm) && std::strncmp(comm, "mali-cmar", 9) == 0 &&
+        const bool leido = leer_archivo(path, comm, sizeof comm);
+        if (leido && maliConGx && std::strncmp(comm, "mali-cmar", 9) == 0 &&
             sched_setaffinity(tid, sizeof(gx), &gx) == 0) {
           ++maliMovidos;
+          continue;
+        }
+        if (leido && utilMovidos < maliUtilidad && std::strncmp(comm, "mali-utility", 12) == 0 &&
+            sched_setaffinity(tid, sizeof(gx), &gx) == 0) {
+          ++utilMovidos;
           continue;
         }
       }
       if (sched_setaffinity(tid, sizeof(others), &others) == 0) ++moved;
     }
     ::closedir(d);
+  }
+  if (conGx && maliUtilidad > 0) {
+    log_line("motor: %d hilos mali-utility en el núcleo del hilo GX (pedidos %d: CHOYA_GX_MALI_UTILIDAD, archivo "
+             "mali-utility-con-gx)", utilMovidos, maliUtilidad);
   }
   if (conGx && maliConGx) {
     log_line("motor: %d hilos mali-cmar en el núcleo del hilo GX (CHOYA_GX_MALI_CON_GX=0, archivo mali-sin-hilo-gx, los "
