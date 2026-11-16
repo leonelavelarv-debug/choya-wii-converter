@@ -4,7 +4,7 @@
 # Modo diagnóstico (3 min, perfil, volcados de cuadros; MENU + R1 vuelca el cuadro que se ve): "Wii Sports (Choya) - diagnostico.sh" o CHOYA_MODO=diagnostico.
 # Deja run.log y resumen.txt en la carpeta wiisports-choya.
 
-LANZADOR_VERSION="0.38.0"  # sube con cada versión de Choya (tests/test_opt_traducido.py lo revisa)
+LANZADOR_VERSION="0.39.0"  # sube con cada versión de Choya (tests/test_opt_traducido.py lo revisa)
 DIR="$(cd "$(dirname "$0")" && pwd)/wiisports-choya"
 cd "$DIR" || exit 1
 rm -f "$DIR/resumen.txt"  # que nunca quede uno viejo de otra corrida
@@ -147,6 +147,11 @@ if [ -f "$DIR/hilo-gx-compartido" ] && [ ! -f "$DIR/hilo-gx-solo" ]; then export
 # Zonas de trabajo (0.38.0): las cadenas de copias en una esquina del EFB (las sombras) se dibujan en un framebuffer
 # chico, sin guardar y recargar el EFB entero en cada copia. Un archivo vacío "sin-zonas" lo apaga.
 if [ -f "$DIR/sin-zonas" ]; then export CHOYA_GX_ZONAS=0; fi
+# 0.39.0: sonda de esperas (en qué duerme el hilo de la pantalla y los de la Mali). Un archivo vacío "sin-sonda" la
+# apaga. Prueba: un archivo vacío "mali-con-hilo-gx" pone el hilo mali-cmar (el que manda el trabajo a la GPU) en el
+# núcleo del hilo GX.
+if [ -f "$DIR/sin-sonda" ]; then export CHOYA_GX_SONDA_ESPERAS=0; fi
+if [ -f "$DIR/mali-con-hilo-gx" ]; then export CHOYA_GX_MALI_CON_GX=1; fi
 # Prioridad del hilo GX en su núcleo compartido (0.37.0): nice -6 para que la pantalla y la Mali no lo retrasen (el
 # juego lo espera). Un archivo vacío "sin-prioridad-gx" lo deja con la prioridad normal.
 if [ -f "$DIR/sin-prioridad-gx" ]; then export CHOYA_GX_PRIORIDAD=0; fi
@@ -180,6 +185,7 @@ CPUF=/sys/devices/system/cpu/cpu0/cpufreq
   echo "copias del EFB directas (sin salir del EFB): $([ "${CHOYA_GX_COPIA_DIRECTA:-0}" = 1 ] && echo "sí (archivo copias-directas)" || echo "no (para probarlas: archivo vacío copias-directas)")"
   echo "copias del EFB rotadas en 3 texturas: $([ "${CHOYA_GX_ROTAR_COPIAS:-0}" = 1 ] && echo "sí (archivo rotar-copias)" || echo "no (para probarlas: archivo vacío rotar-copias)")"
   echo "vuelta al EFB tras las copias: $([ "${CHOYA_GX_VUELTA_PEREZOSA:-1}" = 0 ] && echo "después de cada copia (archivo sin-vuelta-perezosa)" || echo "perezosa, solo cuando algo usa el EFB (para apagarla: archivo vacío sin-vuelta-perezosa)")"
+  echo "hilo mali-cmar: $([ "${CHOYA_GX_MALI_CON_GX:-0}" = 1 ] && echo "en el núcleo del hilo GX (archivo mali-con-hilo-gx)" || echo "con los demás en los núcleos 0-1 (para probarlo en el del hilo GX: archivo vacío mali-con-hilo-gx)")"
   echo "zonas de trabajo (cadenas de copias en una esquina del EFB): $([ "${CHOYA_GX_ZONAS:-1}" = 0 ] && echo "apagadas (archivo sin-zonas)" || echo "encendidas (para apagarlas: archivo vacío sin-zonas)")"
   echo "núcleo del hilo GX: $([ "${CHOYA_GX_NUCLEO_SOLO:-1}" != 0 ] && echo "solo para él (para compartirlo: archivo vacío hilo-gx-compartido)" || echo "compartido con la pantalla y la Mali (para dejarlo solo: archivo vacío hilo-gx-solo); prioridad del hilo GX: $([ "${CHOYA_GX_PRIORIDAD:-}" = 0 ] && echo "normal (archivo sin-prioridad-gx)" || echo "alta, nice -6 (para quitarla: archivo vacío sin-prioridad-gx)")")"
   echo "resolución interna: $CHOYA_RESOLUCION ($(awk -v r="$CHOYA_RESOLUCION" 'BEGIN{printf "%d", 480*r}') líneas)$([ "$CHOYA_RESOLUCION" = 1 ] && echo " (para probar menos: archivo vacío resolucion-075 o resolucion-05)" || echo " (archivo resolucion-075 o resolucion-05; bórralo para volver a 1)")"
@@ -230,6 +236,8 @@ escribir_resumen() {
     grep -h "motor: GPU por pase" "$DIR/choya-gles.txt" 2>/dev/null | tail -3
     echo "--- censo de copias del EFB (0.36.0: cuáles se leen, cuándo y cuáles se rehacen sin leerse; 0.37.0: tramos aislables)"
     grep -h "motor: censo de" "$DIR/choya-gles.txt" 2>/dev/null | tail -6
+    echo "--- esperas del hilo de la pantalla y de la Mali (0.39.0: en qué duermen; muestras cada 2 ms)"
+    grep -h "motor: esperas de\|hilos mali-cmar" "$DIR/choya-gles.txt" 2>/dev/null | tail -12
     echo "--- zonas de trabajo (0.38.0: cadenas de copias dibujadas en un framebuffer chico)"
     grep -h "motor: zonas de trabajo\|motor: framebuffer de las zonas" "$DIR/choya-gles.txt" 2>/dev/null | tail -3
     grep -hE "pgo: " "$DIR/run.log" "$DIR/choya-gles.txt" 2>/dev/null | sort -u | tail -3

@@ -34,6 +34,9 @@
 #include <malloc.h>
 #endif
 #include <dirent.h>
+#include <sys/prctl.h>
+#include <thread>
+#include <map>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -3865,6 +3868,139 @@ void run_palette_conv(const Item& it) {
 
 bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present);
 
+// --- Sonda de esperas (0.39.0) -------------------------------------------------------------------------------------
+// Con la 0.38.0 las 12 copias de las sombras ya no tocan el EFB y el hilo de la pantalla siguió en ~50 ms por cuadro,
+// ~18 de ellos dentro de glBindFramebuffer (0.8 ms por copia) y solo la mitad con CPU: no es el ancho de banda del
+// EFB. Para ver en qué espera el driver, un hilo aparte mira cada 2 ms (2 s de cada 10) el estado del hilo de la
+// pantalla y de los hilos de la Mali en /proc: si corren, o en qué llamada al sistema duermen y en qué función del
+// núcleo (wchan: ioctl dentro del driver de la Mali, futex esperando a otro hilo...). CHOYA_GX_SONDA_ESPERAS=0 la apaga.
+bool sonda_activa() {
+  static const bool on = [] {
+    const char* e = std::getenv("CHOYA_GX_SONDA_ESPERAS");
+    return e == nullptr || std::strcmp(e, "0") != 0;
+  }();
+  return on;
+}
+std::atomic<int> g_tidPantalla{0};
+struct EsperaHilo {
+  std::string nombre;
+  uint64_t muestras = 0, corre = 0;
+  std::unordered_map<std::string, uint64_t> donde;
+};
+std::mutex g_sondaMutex;
+std::map<int, EsperaHilo> g_sonda;
+
+const char* nombre_llamada(long nr) {
+  switch (nr) {  // aarch64
+  case 98: return "futex";
+  case 29: return "ioctl";
+  case 73: return "ppoll";
+  case 22: return "epoll_pwait";
+  case 63: return "read";
+  case 64: return "write";
+  case 101: return "nanosleep";
+  case 115: return "clock_nanosleep";
+  case 124: return "sched_yield";
+  case -1: return "fallo de página";
+  default: return nullptr;
+  }
+}
+bool leer_archivo(const char* path, char* buf, size_t n) {
+  const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  const ssize_t m = ::read(fd, buf, n - 1);
+  ::close(fd);
+  if (m <= 0) return false;
+  buf[m] = 0;
+  return true;
+}
+void sonda_muestra(int tid, const std::string& nombre) {
+  char path[64], buf[256];
+  std::snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
+  if (!leer_archivo(path, buf, sizeof buf)) return;
+  const char* paren = std::strrchr(buf, ')');
+  const char estado = paren && paren[1] ? paren[2] : '?';
+  std::string donde;
+  if (estado != 'R') {
+    std::snprintf(path, sizeof path, "/proc/self/task/%d/syscall", tid);
+    long nr = -2;
+    if (leer_archivo(path, buf, sizeof buf) && std::strncmp(buf, "running", 7) != 0) nr = std::strtol(buf, nullptr, 10);
+    const char* llamada = nombre_llamada(nr);
+    char num[24];
+    if (llamada == nullptr) {
+      std::snprintf(num, sizeof num, nr == -2 ? "?" : "llamada %ld", nr);
+      llamada = num;
+    }
+    std::snprintf(path, sizeof path, "/proc/self/task/%d/wchan", tid);
+    donde = llamada;
+    if (leer_archivo(path, buf, sizeof buf) && buf[0] != '0' && buf[0] != 0) {
+      donde += " en ";
+      donde += buf;
+    }
+    donde += estado == 'D' ? " (sin interrumpir)" : "";
+  }
+  std::lock_guard lock(g_sondaMutex);
+  EsperaHilo& h = g_sonda[tid];
+  h.nombre = nombre;
+  ++h.muestras;
+  if (estado == 'R') ++h.corre;
+  else ++h.donde[donde];
+}
+void sonda_bucle() {
+  ::prctl(PR_SET_NAME, "choya-sonda", 0, 0, 0);
+  static const int pausaMs = [] {  // CHOYA_GX_SONDA_PAUSA_MS: entre tandas (las pruebas usan 0)
+    const char* e = std::getenv("CHOYA_GX_SONDA_PAUSA_MS");
+    const int v = e ? std::atoi(e) : 8000;
+    return v >= 0 && v <= 60000 ? v : 8000;
+  }();
+  for (;;) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(pausaMs));
+    // Hilos a mirar: la pantalla y los de la Mali (cambian poco; se buscan en cada tanda).
+    std::vector<std::pair<int, std::string>> hilos;
+    const int pant = g_tidPantalla.load(std::memory_order_relaxed);
+    if (pant > 0) hilos.emplace_back(pant, "pantalla");
+    if (DIR* d = ::opendir("/proc/self/task")) {
+      while (const dirent* e = ::readdir(d)) {
+        const int tid = std::atoi(e->d_name);
+        if (tid <= 0 || tid == pant) continue;
+        char path[64], comm[64];
+        std::snprintf(path, sizeof path, "/proc/self/task/%d/comm", tid);
+        if (!leer_archivo(path, comm, sizeof comm)) continue;
+        if (char* nl = std::strchr(comm, '\n')) *nl = 0;
+        if (std::strncmp(comm, "mali-", 5) == 0) hilos.emplace_back(tid, comm);
+      }
+      ::closedir(d);
+    }
+    const auto fin = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    auto sig = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() < fin) {
+      for (const auto& [tid, nombre] : hilos) sonda_muestra(tid, nombre);
+      sig += std::chrono::milliseconds(2);
+      std::this_thread::sleep_until(sig);
+    }
+  }
+}
+void sonda_informe() {
+  std::lock_guard lock(g_sondaMutex);
+  for (auto& [tid, h] : g_sonda) {
+    if (h.muestras == 0) continue;
+    std::vector<std::pair<uint64_t, std::string>> orden;
+    for (const auto& [k, v] : h.donde) orden.emplace_back(v, k);
+    std::sort(orden.begin(), orden.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string lista;
+    char buf[200];
+    for (size_t k = 0; k < orden.size() && k < 5; ++k) {
+      std::snprintf(buf, sizeof buf, "; %s %.0f %%", orden[k].second.c_str(),
+                    100.0 * static_cast<double>(orden[k].first) / static_cast<double>(h.muestras));
+      lista += buf;
+    }
+    log_line("motor: esperas de %s (%d), %llu muestras: corre o espera turno %.0f %%%s (CHOYA_GX_SONDA_ESPERAS=0 la "
+             "apaga)", h.nombre.c_str(), tid, static_cast<unsigned long long>(h.muestras),
+             100.0 * static_cast<double>(h.corre) / static_cast<double>(h.muestras), lista.c_str());
+    h = EsperaHilo{};
+  }
+}
+
 } // namespace
 
 void set_logger(LogFn fn) noexcept { g_logger = fn; }
@@ -4150,14 +4286,34 @@ void pin_game_thread(int gameTid, int gxTid) noexcept {
     gxNice = prioridad_gx();
     if (gxNice != 0) gxNiceOk = setpriority(PRIO_PROCESS, static_cast<id_t>(gxTid), gxNice) == 0;
   }
-  int moved = 0;
+  // 0.39.0 (prueba): el hilo que manda el trabajo de la Mali al núcleo ("mali-cmar-backe", ~19 % de CPU) esperaba
+  // turno 37-43 % del tiempo en los núcleos 0-1. Con CHOYA_GX_MALI_CON_GX=1 (archivo mali-con-hilo-gx) va al núcleo
+  // del hilo GX, que deja libre ~60 %.
+  static const bool maliConGx = [] {
+    const char* e = std::getenv("CHOYA_GX_MALI_CON_GX");
+    return e != nullptr && std::strcmp(e, "1") == 0;
+  }();
+  int moved = 0, maliMovidos = 0;
   if (DIR* d = ::opendir("/proc/self/task")) {
     while (const dirent* e = ::readdir(d)) {
       const pid_t tid = static_cast<pid_t>(std::atoi(e->d_name));
       if (tid <= 0 || tid == self || (conGx && tid == static_cast<pid_t>(gxTid))) continue;
+      if (conGx && maliConGx) {
+        char path[64], comm[64];
+        std::snprintf(path, sizeof path, "/proc/self/task/%d/comm", static_cast<int>(tid));
+        if (leer_archivo(path, comm, sizeof comm) && std::strncmp(comm, "mali-cmar", 9) == 0 &&
+            sched_setaffinity(tid, sizeof(gx), &gx) == 0) {
+          ++maliMovidos;
+          continue;
+        }
+      }
       if (sched_setaffinity(tid, sizeof(others), &others) == 0) ++moved;
     }
     ::closedir(d);
+  }
+  if (maliConGx) {
+    log_line("motor: %d hilos mali-cmar en el núcleo del hilo GX (CHOYA_GX_MALI_CON_GX=1, archivo mali-con-hilo-gx)",
+             maliMovidos);
   }
   if (conGx) {
     char prio[96] = "";
@@ -4984,6 +5140,10 @@ void low_memory_relief() {
 }
 
 bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present) {
+  if (g_tidPantalla.load(std::memory_order_relaxed) == 0) {  // 0.39.0: la sonda de esperas mira este hilo
+    g_tidPantalla.store(static_cast<int>(syscall(SYS_gettid)), std::memory_order_relaxed);
+    if (sonda_activa()) std::thread(sonda_bucle).detach();
+  }
   present = present && f.present;
   const auto cpuStart = std::chrono::steady_clock::now();
   g_tMarca = cpuStart;
@@ -5635,6 +5795,7 @@ bool draw_frame_locked(Frame& f, int screenWidth, int screenHeight, bool present
                    gl.CopyTexSubImage2D == nullptr ? "el driver no da glCopyTexSubImage2D" : "CHOYA_GX_COPIA_DIRECTA=1 las prende");
         }
       }
+      if (sonda_activa()) sonda_informe();  // 0.39.0
       if (g_zonasSt.cuadros > 0) {  // 0.38.0
         const double n = static_cast<double>(g_zonasSt.cuadros);
         if (!zonas_activas()) {

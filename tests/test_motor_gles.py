@@ -258,6 +258,14 @@ class TestMotorGles(unittest.TestCase):
             una = subprocess.run([exe, "zonas", "1"], env=env, capture_output=True, text=True).stdout
             self.assertIn("zonas 000000 000000 FF0000 0000FF FF0000 0000FF", una)
 
+            # 0.39.0: sonda de esperas del hilo de la pantalla (sin pausa entre tandas para la prueba).
+            r = subprocess.run([exe, "zonas", "0"], env=dict(env, CHOYA_GX_SONDA_PAUSA_MS="0"), capture_output=True,
+                               text=True)
+            self.assertRegex(r.stdout, r"motor: esperas de pantalla \(\d+\), \d+ muestras: corre o espera turno \d+ %")
+            r = subprocess.run([exe, "zonas", "0"], env=dict(env, CHOYA_GX_SONDA_PAUSA_MS="0",
+                                                              CHOYA_GX_SONDA_ESPERAS="0"), capture_output=True, text=True)
+            self.assertNotIn("motor: esperas de pantalla", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
